@@ -119,7 +119,15 @@ struct Row {
 ///   measurable; measuring it identified every tag that was arriving; and with
 ///   the identified ones argued and set aside, what remained could be refused.
 ///   Raise-then-retire is the intended path, not an embarrassment.
-const EXECUTED_MODIFIED_CEILING: usize = 7;
+/// * `WrapperUpperHalf` — the type is **gone**, and so is the arm it guarded.
+///   Its `why` named the retirement as "learning what the upper half selects";
+///   what static RE established instead is that the word is not an opcode at
+///   all and the wrapper command does not exist, so there was no upper half to
+///   learn. `ROOT_OP_SETUP_SHARED_STATE` carries the finding. A deletion is
+///   normally the wrong way to move this number — the doc above says so — and
+///   this is the exception the rule needs stated: the entry is removed because
+///   the *code path* is, not because the verdict was inconvenient.
+const EXECUTED_MODIFIED_CEILING: usize = 6;
 
 /// Every `impl Decline`/`impl Refusal` in the crate, and what its worst arm
 /// costs the guest.
@@ -635,15 +643,6 @@ const ROWS: &[Row] = &[
         loss: Loss::Ordering,
         why: "which of walk/envelope/unknown a segment is. Only `Unknown` is a \
               refusal, and it stops that segment alone",
-    },
-    Row {
-        file: "crates/reims-vgpu/src/runtime/drain/mod.rs",
-        ty: "WrapperUpperHalf",
-        loss: Loss::ExecutedModified,
-        why: "the wrapper word's upper half is non-zero and the dispatch uses \
-              the lower half regardless, so a record is executed as an opcode \
-              the guest did not name. Retired by learning what the upper half \
-              selects, or by refusing the packet until it is known",
     },
     Row {
         file: "crates/reims-vgpu/src/runtime/draw/metal_icb.rs",

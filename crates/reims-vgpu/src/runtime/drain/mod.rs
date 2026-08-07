@@ -125,6 +125,58 @@ fn packet_site(channel: Option<u32>) -> String {
 /// directory. A short payload is not refused: the live shape is a 12-byte header
 /// with a 4-byte id, and a packet carrying none names task 0 — which is the
 /// kernel task, so the length is reported on the line rather than guessed at.
+/// `CmdDisplaySetSharedStatePage`: the display pipe hands the device the guest
+/// page its shared state lives on.
+///
+/// Reachable from both dispatch tables because it is one command in one flat
+/// opcode space — see [`crate::model::regs::ROOT_OP_SETUP_SHARED_STATE`], which
+/// carries what established that and what the root arm used to do instead.
+/// `channel` is `None` for the root channel, matching `apply_delete_task` and
+/// the other handlers both tables share.
+fn apply_setup_shared_state<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    payload: &[u8],
+    channel: Option<u32>,
+) {
+    // A short SETUP_SHARED_STATE drops display registration:
+    // shared_gpa/index never latch, so the display NEVER onlines and the
+    // boot wedges on a blank/console frame. The loudest of this class.
+    if packet_short(
+        "setup_shared_state",
+        channel,
+        payload.len(),
+        CHILD_SHARED_STATE_LEN,
+    ) {
+        return;
+    }
+    let index = ld32(&payload[CHILD_SHARED_STATE_INDEX..]);
+    let pfn = ld32(&payload[CHILD_SHARED_STATE_PFN..]);
+    // reinit=1 means the guest tears down + re-registers the display
+    // shared page while it was already ONLINE — the AppleParavirtDisplayPipe
+    // setupSharedState/teardownSharedState re-init that makes WindowServer
+    // rebuild display attributes (signalDisplay bit2 → process_online).
+    // A reinit AFTER present_converge is the smoking gun for the intermittent
+    // post-converge boot-progress overlay. Rare
+    // event → always-on so a bad boot leaves a display-lifecycle timeline.
+    let reinit = state.display.online_acked as u8;
+    state.display.display_index = index;
+    state.display.shared_gpa = state.pfn_gpa(pfn);
+    state.display.online_acked = false;
+    state.display.online_tries = 0;
+    state.display.poll_ctr = 0;
+    crate::observe::fail(format!(
+        "display_shared_state_setup index={index} gpa={:#x} reinit={reinit} ch={}",
+        state.display.shared_gpa,
+        channel.map_or_else(|| "root".to_string(), |c| c.to_string())
+    ));
+    // Archive apple_pv_gpu_display_setup: fill descriptor + modes
+    // before completion so createDisplayAttributes sees TimingElements.
+    // Do **not** pulse ONLINE here — enable() has not set +0x104 yet
+    // (archive poll waits for mask bit 2, then pending+IRQ).
+    fill_display_descriptor(host, state.display.shared_gpa, index, state.page_size());
+}
+
 fn apply_delete_task(state: &mut DeviceState, payload: &[u8], channel: Option<u32>) {
     let task_id = if payload.len() >= 4 {
         ld32(&payload[0..])
@@ -1121,119 +1173,12 @@ fn reply_heap_texture_size_and_align<H: HostMemory + HostOps>(
     true
 }
 
-/// The opcode a `ROOT_OP_WRAPPER` packet carries in its first payload word.
-///
-/// # What is established, and what is not
-///
-/// **Established:** the framing opcode is a `u16` at `PACKET_OPCODE` with
-/// `PACKET_STAMP_COUNT` immediately after it at `+0x02`, so the header's own
-/// opcode field is 16 bits wide.
-///
-/// **Not established:** whether this payload word is one 32-bit opcode or a
-/// nested copy of that 16-bit header. The two readings disagree about the upper
-/// half — a nested header would put a stamp count there, which must be
-/// discarded, while a 32-bit opcode with a high bit set would be an opcode this
-/// device is silently renaming. Nothing in the tree settles it: the arm has no
-/// test, no doc, and arrived with the initial import.
-///
-/// A third reading is possible and makes the first two harder to believe. The
-/// handlers below read `packet.payload` from offset 0, and
-/// `DEVICE_INFO_TAHOE_KEY_TABLE_LEN` *is* 0 — so on a wrapped device-info packet
-/// this word would be read twice, once as the opcode and once as the guest's
-/// key-table length. Those cannot both be right for the same bytes.
-///
-/// So the low half is taken, which is what this device has always done, and the
-/// upper half is **reported rather than assumed**. Refusing on a non-zero upper
-/// half would break a guest that really is sending a nested header, and reading
-/// it as part of the opcode would break the other case; a reading is what
-/// decides which.
-///
-/// # The reading, and what it does and does not settle
-///
-/// A driven x86/PCI/Vulkan boot to the desktop, with the web-content probe
-/// driving Safari through ten captures, emitted **neither line — not the alarm
-/// and not the census** — against 6 869 `OFF` records on the same run, so the
-/// channel was working and this arm simply never ran. The guest on that pathway
-/// does not wrap.
-///
-/// That settles the *cost*: the ambiguity below loses no guest work on x86
-/// today, so it is not a bug waiting to bite this pathway. It settles nothing
-/// about the *encoding* — an arm that never runs cannot say which reading of its
-/// word is right, and the two remain live for any guest that does wrap. Leave
-/// both emissions in place; they are the only thing that will report the first
-/// one that does.
-///
-/// `fail_once` is keyed on the whole word, so a wrapper that carries the same
-/// inner opcode every time says so once.
-fn wrapper_inner_opcode(packet: &Packet) -> u16 {
-    let word = ld32(&packet.payload[0..]);
-    let low = word as u16;
-    if word >> 16 != 0 {
-        crate::observe::Emit::decline(
-            "root_wrapper_upper_half",
-            &WrapperUpperHalf {
-                word,
-                dispatched: low,
-            },
-        )
-        .field("payload_len", packet.payload.len())
-        .field("total_size", packet.total_size)
-        .fail_once(u64::from(word));
-    } else {
-        crate::observe::off(format!(
-            "root_wrapper inner=0x{low:04x} payload_len={} total_size={}",
-            packet.payload.len(),
-            packet.total_size
-        ));
-    }
-    low
-}
-
-/// A wrapper packet whose first payload word does not fit the opcode this
-/// device dispatches on.
-///
-/// A healthy-zero alarm on purpose: whichever of the two readings in
-/// [`wrapper_inner_opcode`] is right, a firing is the interesting case. If the
-/// word is a nested packet header then the upper half is a stamp count and this
-/// names the first guest seen to use one; if it is a 32-bit opcode then this
-/// device just dispatched the wrong command.
-#[derive(Debug, Clone, Copy)]
-struct WrapperUpperHalf {
-    word: u32,
-    dispatched: u16,
-}
-
-impl crate::observe::Decline for WrapperUpperHalf {
-    fn slug(&self) -> &'static str {
-        "root_wrapper_upper_half_set"
-    }
-
-    fn fields(&self) -> Vec<(&'static str, String)> {
-        vec![
-            ("word", format!("0x{:08x}", self.word)),
-            ("dispatched", format!("0x{:04x}", self.dispatched)),
-            ("discarded", format!("0x{:04x}", self.word >> 16)),
-        ]
-    }
-}
-
 fn process_root_packet<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     packet: &Packet,
 ) {
-    let op = packet.opcode;
-    let effective = if op == ROOT_OP_WRAPPER {
-        if packet.payload.len() >= 4 {
-            wrapper_inner_opcode(packet)
-        } else {
-            op
-        }
-    } else {
-        op
-    };
-
-    match effective {
+    match packet.opcode {
         ROOT_OP_DEVICE_INFO_TAHOE => {
             if !packet_short(
                 "device_info_tahoe",
@@ -1308,9 +1253,15 @@ fn process_root_packet<H: HostMemory + HostOps>(
         ROOT_OP_DEFINE_TASK2 => apply_define_task2(state, host, &packet.payload, None),
         ROOT_OP_SET_OBJECT_LIST => apply_set_object_list(state, &packet.payload, None),
         ROOT_OP_DELETE_TASK => apply_delete_task(state, &packet.payload, None),
+        // One command in one flat opcode space, not a wrapper. See
+        // `ROOT_OP_SETUP_SHARED_STATE` for what this arm used to do with the
+        // payload's first word, and why nothing here ever caught it.
+        ROOT_OP_SETUP_SHARED_STATE => {
+            apply_setup_shared_state(state, host, &packet.payload, None);
+        }
         _ => {
             state.record_fail(FailEvent::UnknownRootOpcode {
-                opcode: effective,
+                opcode: packet.opcode,
                 total_size: packet.total_size,
             });
         }
@@ -2316,40 +2267,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
             apply_delete_task(state, &packet.payload, Some(channel_id));
         }
         CHILD_OP_SETUP_SHARED_STATE => {
-            // A short SETUP_SHARED_STATE drops display registration:
-            // shared_gpa/index never latch, so the display NEVER onlines and the
-            // boot wedges on a blank/console frame. The loudest of this class.
-            if !packet_short(
-                "setup_shared_state",
-                Some(channel_id),
-                packet.payload.len(),
-                CHILD_SHARED_STATE_LEN,
-            ) {
-                let index = ld32(&packet.payload[CHILD_SHARED_STATE_INDEX..]);
-                let pfn = ld32(&packet.payload[CHILD_SHARED_STATE_PFN..]);
-                // reinit=1 means the guest tears down + re-registers the display
-                // shared page while it was already ONLINE — the AppleParavirtDisplayPipe
-                // setupSharedState/teardownSharedState re-init that makes WindowServer
-                // rebuild display attributes (signalDisplay bit2 → process_online).
-                // A reinit AFTER present_converge is the smoking gun for the intermittent
-                // post-converge boot-progress overlay. Rare
-                // event → always-on so a bad boot leaves a display-lifecycle timeline.
-                let reinit = state.display.online_acked as u8;
-                state.display.display_index = index;
-                state.display.shared_gpa = state.pfn_gpa(pfn);
-                state.display.online_acked = false;
-                state.display.online_tries = 0;
-                state.display.poll_ctr = 0;
-                crate::observe::fail(format!(
-                    "display_shared_state_setup index={index} gpa={:#x} reinit={reinit}",
-                    state.display.shared_gpa
-                ));
-                // Archive apple_pv_gpu_display_setup: fill descriptor + modes
-                // before completion so createDisplayAttributes sees TimingElements.
-                // Do **not** pulse ONLINE here — enable() has not set +0x104 yet
-                // (archive poll waits for mask bit 2, then pending+IRQ).
-                fill_display_descriptor(host, state.display.shared_gpa, index, state.page_size());
-            }
+            apply_setup_shared_state(state, host, &packet.payload, Some(channel_id));
         }
         CHILD_OP_ONLINE_ACK => {
             state.display.online_acked = true;

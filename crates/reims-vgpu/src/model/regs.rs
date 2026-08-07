@@ -301,7 +301,30 @@ pub const PACKET_STAMP_LEN: u32 = 8;
 pub const STAMP_INDEX_MASK: u32 = 0xffff;
 pub const STAMP_SLOT_LEN: u32 = 4;
 
-pub const ROOT_OP_WRAPPER: u16 = 0x01;
+/// `CmdDisplaySetSharedStatePage`, the same command as
+/// [`CHILD_OP_SETUP_SHARED_STATE`] and not a second meaning for the number.
+///
+/// This used to be `ROOT_OP_WRAPPER`, on the reading that a root packet with
+/// opcode 1 wrapped another packet whose opcode was its first payload word.
+/// **There is no wrapper command in this protocol.** Apple's host dispatches
+/// every FIFO packet through one flat jump table indexed by the 16-bit header
+/// opcode, with one handler and one message send per opcode and no re-entry, no
+/// second header parse and no sub-packet loop. Opcode 1's entry is the display
+/// pipe's shared-state page setup, whose payload is
+/// `{u32 pipe index, u32 page PFN}` — which is byte-for-byte what
+/// [`CHILD_SHARED_STATE_INDEX`], [`CHILD_SHARED_STATE_PFN`] and
+/// [`CHILD_SHARED_STATE_LEN`] already say, decoded independently from live
+/// traffic on the child channel.
+///
+/// So the old arm read a **display pipe index** and dispatched the root table on
+/// it. Nothing has ever sent opcode 1 on the root channel here, which is why no
+/// boot caught it: the guest's display pipe submits on a virtual channel, and
+/// the root channel is a separate object.
+///
+/// The `_WRAPPER` name is gone rather than deprecated because the construct it
+/// named does not exist, and a reader meeting it would go looking for a nesting
+/// rule to implement.
+pub const ROOT_OP_SETUP_SHARED_STATE: u16 = CHILD_OP_SETUP_SHARED_STATE;
 /// PVG `CmdDeleteTask` — live UnknownRootOpcode flood was root op `0x20`
 /// total_size=16 (header 12 + task_id u32). Same id as child DeleteTask.
 pub const ROOT_OP_DELETE_TASK: u16 = 0x20;
@@ -1463,8 +1486,16 @@ mod tests {
     /// reading Apple's command table, which is exactly the process that produces
     /// a transcription collision.
     ///
-    /// Root and child are deliberately not crossed: they are separate spaces and
-    /// `CmdDeleteTask` really is `0x20` in both.
+    /// Root and child are not crossed, and the reason has changed. This used to
+    /// say they are separate spaces and that `CmdDeleteTask` "really is `0x20`
+    /// in both" — a coincidence the table tolerated. They are **one** space:
+    /// Apple's host dispatches every packet through a single flat jump table on
+    /// the header's 16-bit opcode, so `0x20` is one command reachable on either
+    /// channel, and so is `0x01` ([`ROOT_OP_SETUP_SHARED_STATE`]). The two
+    /// tables here are two views of it, split by which channel this device has
+    /// seen each command arrive on. Crossing them would therefore report every
+    /// deliberate `ROOT_*`/`CHILD_*` pair as a collision, which is why this test
+    /// still checks each side alone.
     #[test]
     fn no_two_child_opcodes_share_a_number() {
         let table = [
