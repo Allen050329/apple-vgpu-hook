@@ -615,6 +615,24 @@ pub fn negotiate_protocol_version(requested: u32) -> u32 {
 /// higher than the host can execute does not degrade gracefully — the guest
 /// sizes a threadgroup, declares threadgroup memory, or names a depth format,
 /// and the host then refuses the pipeline that comes back.
+///
+/// # Key 1 promises multisampling this device does not rasterize
+///
+/// [`DEVICE_INFO_CAPS`] serves 8 here and [`device_info_caps`] only reduces it
+/// to the host's `framebuffer*SampleCounts`, so on any ordinary host the guest
+/// is told `-[MTLDevice supportsSampleCount:]` is true up to 8. **No render rail
+/// in this device rasterizes above one sample.** A guest that builds a
+/// multisample pass on the strength of this answer gets its `resolveTexture`
+/// refused by name (`stream_color_subresource_unsupported`, carrying `resolve=`)
+/// — which is the measurement of how much this promise costs, and it reads zero
+/// on every driven boot recorded so far.
+///
+/// It is *not* narrowed to 1 the way key 11's primitive mask was narrowed to
+/// what both backends execute, and the difference is that Metal guarantees
+/// sample count 4 on every device it runs on. An `MTLDevice` answering 1 is a
+/// shape no macOS guest has ever had to handle, so narrowing trades a known
+/// refusal for an unknown one. The honest repair is to rasterize at the count
+/// the guest asks for; until then the refusal is where the cost shows.
 pub const DEVICE_INFO_KEY_MAX_SAMPLE_COUNT: u32 = 1;
 pub const DEVICE_INFO_KEY_D24_STENCIL8: u32 = 2;
 pub const DEVICE_INFO_KEY_MAX_THREADS_W: u32 = 3;
@@ -901,15 +919,15 @@ pub fn device_info_caps(limits: &DeviceInfoLimits, version: u32) -> Vec<(u32, u3
 /// The GPU-dependent subset is not served from here directly: see
 /// [`device_info_caps`].
 pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
-    (1, 8),
-    (2, 1),
-    (3, 1024),
-    (4, 1024),
-    (5, 64),
-    (6, 32768),
+    (DEVICE_INFO_KEY_MAX_SAMPLE_COUNT, 8),
+    (DEVICE_INFO_KEY_D24_STENCIL8, 1),
+    (DEVICE_INFO_KEY_MAX_THREADS_W, 1024),
+    (DEVICE_INFO_KEY_MAX_THREADS_H, 1024),
+    (DEVICE_INFO_KEY_MAX_THREADS_D, 64),
+    (DEVICE_INFO_KEY_THREADGROUP_MEMORY, 32768),
     (DEVICE_INFO_KEY_FRAMEBUFFER_READ, 1),
     (DEVICE_INFO_KEY_RGB10A2_GAMMA, 1),
-    (9, 1),
+    (DEVICE_INFO_KEY_NATIVE_FP16, 1),
     (
         DEVICE_INFO_KEY_SERIALIZER_VERSION,
         DEVICE_INFO_SERIALIZER_VERSION,
@@ -918,7 +936,7 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
         DEVICE_INFO_KEY_PRIMITIVE_TYPE_MASK,
         crate::contract::draw::EXECUTABLE_PRIMITIVE_TYPES,
     ),
-    (12, 1),
+    (DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES, 1),
     (DEVICE_INFO_KEY_LINEAR_TEXTURE_ALIGN, 256),
     (DEVICE_INFO_KEY_HEAPS, 1),
     (DEVICE_INFO_KEY_HEAP_BUFFER_GRANULARITY, 32),
