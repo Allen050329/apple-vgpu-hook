@@ -39,15 +39,27 @@
 //!   banding or tearing. One screenshot of a near-static desktop is evidence
 //!   against gross corruption and is *not* a regression gate.
 //!
-//! **It did not pay in throughput.** Present cadence fell (median 18.95 → 16.50
-//! Hz) and `fence_us` rose (median 592 → 945 µs) — roughly what ~500 copy
-//! rectangles per flush costs the GPU against one. So the honest state is: the
-//! rail is correct, the decline is gone, the deferred window count halved, and
-//! the frame is slower. Whoever picks this up should treat the region count as
-//! the thing to attack — coalescing across runs, or a linear scratch so the
-//! second hop is `vkCmdCopyBuffer` with 507 plain ranges instead of ~1500
-//! rectangles — rather than assuming the widening was a mistake. Timings are
-//! wall clock on a shared machine and are upper bounds; the counts above are not.
+//! **It did not pay in throughput**, and that is what moved the work off this
+//! module. Present cadence fell (median 18.95 → 16.50 Hz) and `fence_us` rose
+//! (592 → 945 µs) — roughly what ~1500 copy rectangles per flush cost the GPU
+//! against one. The answer was to stop making the bus-crossing pass detile as
+//! well: [`crate::backend::vulkan::engine`] now copies a dense frame into a
+//! device-local scratch as one rectangle and scatters it with one plain
+//! `VkBufferCopy` per stretch, which took the same probe to 24.50 Hz and 480 µs
+//! with the declines still at zero.
+//!
+//! # What still comes here, and why it is not dead
+//!
+//! That linear form cannot express a window whose rows carry padding: a run's
+//! bytes then include inter-row bytes the copy must not write, and a byte range
+//! has no way to skip them. Rectangles do, so a padded window still plans here.
+//! A driven boot measured **35 such windows against 9186 dense ones** — 0.4 %,
+//! and not zero. Deleting this because the common case moved would lose those
+//! frames, or write padding the copying rail leaves alone, which is the
+//! two-rails-disagree divergence the section below exists to prevent.
+//!
+//! Timings are wall clock on a shared machine and are upper bounds; the counts
+//! are not.
 //!
 //! # What the caller still owes
 //!
