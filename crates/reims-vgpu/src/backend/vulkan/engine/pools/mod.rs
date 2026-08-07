@@ -2250,10 +2250,28 @@ mod pool_trim_order_tests {
 /// they are the cheapest check that the reading is of the boot it claims,
 /// because no other pairing in the census produces it.
 ///
-/// Later commits changed which *name* a writeback decline carries and added a
-/// device-local detiling path, but that path is behind the same import gate and
-/// cannot run here, so these counts still describe the copying rails as they
-/// stand. A timing would not have survived that qualifier; counts do.
+/// Re-run after the device-local detiling path landed, to check that path had
+/// not quietly moved traffic off these rails. It had not, and the boot is worth
+/// keeping for what else it pins:
+///
+/// | route | count | says |
+/// |---|---:|---|
+/// | `zc_buffer_gathered` | 278 269 | the CPU gather carries the rail |
+/// | `zc_buffer_imported` | 0 | nothing bound past the gate |
+/// | `render_flush_gpu_direct` | 0 | nor did the writeback |
+/// | `guest_write_linear` / `_rects` | 0 / 0 | the detiling path cannot run behind a closed gate |
+/// | `render_flush_leased` | 7 524 | one per decline, again |
+/// | `zc_buf_no_import` | 282 235 | and `zc_buf_scattered_*` **zero** |
+///
+/// That last row is the one to keep. Those same windows are scattered — a boot
+/// with the import on classifies 98.5 % of them at 9–32 stretches — and on a
+/// host that cannot import they are now counted as what actually refused them
+/// rather than as their own shape. It is the counter-level statement of the
+/// ordering rule in `guest_ram_map::standing_refusal`, and it is a stronger one
+/// than the log's, because the log deduplicates and this does not.
+///
+/// A timing would not have survived being quoted across two builds. Counts do,
+/// which is why only counts are here.
 ///
 /// The three refusals not firing is the expected reading rather than a null one:
 /// `acquire_staging` and `acquire_readback` round a request up to a power-of-two
