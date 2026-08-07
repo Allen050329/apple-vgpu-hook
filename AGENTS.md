@@ -170,7 +170,10 @@ Four rules survive every sweep:
   comment that settles a divergence is more often on the callee than on the call site, and the arm
   that is easiest to read is often not the arm the boot takes. Check which one runs before calling a
   divergence theoretical. When you find one, check whether its failure line is shared or copied — a
-  copied one is the next divergence.
+  copied one is the next divergence, and so is a copied *check*. Where three arms consume one wire
+  form, the arm holding the shortest version of the rule is the one to read first: the render-pass
+  attachment prefix had a four-term admission rule written by hand three times, and two of the three
+  copies were missing a different term. Count the terms before reading what they say.
 
 **Do not hand-sweep the crate for bounds.** A bound can cost guest work in exactly three ways — an
 entry evicted, an entry never recorded, a run read only partway — and each has a test below that
@@ -227,6 +230,7 @@ simply the wrong number, a length four bytes off, or a field two bytes too wide:
 | Does a bitmask used as a set say what bounds it and how wide it is? | `crates/reims-vgpu/tests/a_mask_used_as_a_set_says_how_wide_it_is.rs` |
 | Does a slot holding one decoded record say what a second one does to it? | `crates/reims-vgpu/tests/a_latched_record_says_whether_a_second_one_replaces_it.rs` |
 | Could a draw be lost because a second pipeline opcode has no exec arm? | `crates/reims-vgpu/tests/a_pipeline_reaches_the_latch_by_one_wire_form.rs` |
+| Does an arm test some of an attachment's subresource coordinates and not the rest? | `crates/reims-vgpu/tests/an_attachment_subresource_is_admitted_by_one_rule.rs` |
 | Is a product widened by a cast that comes too late to help? | `crates/reims-vgpu/tests/a_product_is_widened_before_it_is_taken.rs` |
 | Do the source scans read the product half, or its fixtures? | `crates/reims-vgpu/tests/the_source_scanner_reads_the_product_and_not_its_fixtures.rs` |
 | Can a guest record panic a parser instead of being refused? | `crates/reims-vgpu/tests/a_decoder_survives_bytes_the_guest_could_write.rs` |
