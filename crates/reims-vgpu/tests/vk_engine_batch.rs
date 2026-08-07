@@ -17,6 +17,7 @@ use reims_vgpu::backend::vulkan::engine::{
     TargetIdentity,
 };
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 fn engine_test_lock() -> &'static Mutex<()> {
@@ -668,6 +669,228 @@ fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stre
     assert_eq!(
         d.buffer_snapshot_binds, 0,
         "the CPU must not have gathered a window the GPU could reach: {d:?}"
+    );
+    engine::test_quiesce_ring();
+}
+
+/// Compile GLSL to SPIR-V words with `glslc`, or `None` if it is not installed.
+///
+/// The sibling of `vk_engine_compute.rs`'s `assemble_spvasm`, and GLSL rather
+/// than SPIR-V assembly for one reason: what the shader below has to be is
+/// *obviously* an index into the gathered window, and thirty lines of `OpAccess
+/// Chain` do not read that way. The engine takes SPIR-V words and does not care
+/// which front end produced them.
+fn glsl_words(src: &str, stage: &str, name: &str) -> Option<Vec<u32>> {
+    let dir = std::env::temp_dir();
+    let src_path = dir.join(format!("reims_gather_{}_{}.glsl", name, std::process::id()));
+    let spv_path = dir.join(format!("reims_gather_{}_{}.spv", name, std::process::id()));
+    std::fs::write(&src_path, src).ok()?;
+    let status = Command::new("glslc")
+        .args([
+            &format!("-fshader-stage={stage}"),
+            src_path.to_str().unwrap(),
+            "-o",
+            spv_path.to_str().unwrap(),
+        ])
+        .status();
+    if !matches!(status, Ok(s) if s.success()) {
+        eprintln!("SKIP {name}: no glslc");
+        return None;
+    }
+    let bytes = std::fs::read(&spv_path).ok()?;
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
+/// **The gathered bytes, observed in shader output.**
+///
+/// [`a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stretch`]
+/// proves the disposition — one copy region per stretch, no CPU snapshot, no
+/// in-place bind — and that is what regressed to zero before. It cannot prove
+/// the copies put the bytes anywhere in particular, because it never reads
+/// them: the gather destination is `DEVICE_LOCAL` and a discrete host cannot
+/// map it. So the only way to see the assembled window is to let a shader read
+/// it and write what it found into the colour target, which is already the one
+/// buffer this engine hands back to a test.
+///
+/// The window is deliberately built so that a wrong answer is a *specific*
+/// wrong answer. Its three stretches sit in the import in the reverse of their
+/// order in the window — window byte 0 comes from the last granule, window byte
+/// 512 from the first — and each granule is filled with a different byte. The
+/// fragment shader reads the first word of each stretch and puts the three into
+/// R, G and B.
+///
+/// | | granule 0 | granule 1 | granule 2 |
+/// |---|---|---|---|
+/// | filled with | `0x11` | `0x22` | `0x33` |
+/// | lands at window offset | 512 | 256 | 0 |
+///
+/// So a gather that honours `window_offset` paints `(0x33, 0x22, 0x11)` and one
+/// that concatenates the stretches in the order it happens to walk them paints
+/// exactly the reverse. A test that asserted "the bytes arrived" would pass on
+/// both; this one separates them, which is the whole reason for the reversal.
+///
+/// Skips rather than fails on a host that cannot import guest RAM — there the
+/// CPU gather is the only rail and there is no GPU gather to observe — and on
+/// one without `glslc`.
+#[test]
+fn the_gathered_window_reaches_the_shader_with_every_stretch_at_its_window_offset() {
+    use reims_vgpu::runtime::guest_ram::{granularity, GuestRamImport, GuestRamRegion, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::GuestWindowRun;
+
+    const STRETCH: u64 = 256;
+    // Byte offsets of the three stretches inside the gathered window, as u32
+    // indices: the shader reads the first word of each.
+    const WORDS_PER_STRETCH: usize = (STRETCH / 4) as usize;
+
+    let _guard = engine_test_lock().lock().unwrap();
+
+    // Only the fragment stage is ours. `render_tri.air` already puts a triangle
+    // over the target from `vertex_count: 3` with no vertex buffers, and a
+    // vertex output the fragment stage does not consume is legal — the illegal
+    // direction is a fragment input with no matching output.
+    let vert = translate_words("render_tri.air", Stage::Vertex);
+    let Some(frag) = glsl_words(
+        &format!(
+            r#"#version 450
+layout(set = 0, binding = 0) readonly buffer Gathered {{ uint words[]; }} gathered;
+layout(location = 0) out vec4 color;
+void main() {{
+    color = vec4(
+        float(gathered.words[{a}] & 0xFFu) / 255.0,
+        float(gathered.words[{b}] & 0xFFu) / 255.0,
+        float(gathered.words[{c}] & 0xFFu) / 255.0,
+        1.0);
+}}
+"#,
+            a = 0,
+            b = WORDS_PER_STRETCH,
+            c = WORDS_PER_STRETCH * 2,
+        ),
+        "fragment",
+        "gather_readback",
+    ) else {
+        return;
+    };
+
+    let identity = TargetIdentity::Surface {
+        id: 990_408,
+        width: W,
+        height: H,
+        generation: 1,
+    };
+
+    // The device publishes the import granularity when it is created, so one
+    // draw has to run before the window can be described at all.
+    let (warm_vert, warm_frag) = triangle_spirv();
+    let warm = batch_req(&warm_vert, &warm_frag, &identity, false, half_scissor(true));
+    if let Err(e) = engine::execute_draw_request(&warm) {
+        let msg = e.to_string();
+        if skip_if_no_gpu(&msg) {
+            eprintln!("skipping: {msg}");
+            return;
+        }
+        panic!("warm-up draw: {msg}");
+    }
+    let Some(align) = granularity() else {
+        eprintln!(
+            "skipping: this host cannot import guest RAM, so the CPU gather is the only rail"
+        );
+        engine::test_quiesce_ring();
+        return;
+    };
+
+    // A host allocation standing in for a RAMBlock, aligned to the granularity
+    // the device published — the bound `GuestRamImport` enforces and the
+    // alignment the driver will accept for the import.
+    let block_len = align * 4;
+    let mut backing = vec![0xA5u8; (block_len + align) as usize];
+    let pad = (backing.as_ptr() as u64).next_multiple_of(align) - backing.as_ptr() as u64;
+    let base = backing.as_ptr() as u64 + pad;
+
+    // One byte value per granule, so the colour names which granule it came
+    // from. Only the first word of each is read, but filling the whole stretch
+    // keeps a partial or misaligned copy from reading as a correct one.
+    const FILL: [u8; 3] = [0x11, 0x22, 0x33];
+    for (granule, fill) in FILL.iter().enumerate() {
+        let start = (pad + align * granule as u64) as usize;
+        backing[start..start + STRETCH as usize].fill(*fill);
+    }
+
+    let import = std::sync::Arc::new(
+        GuestRamImport::new(
+            GuestRamRegion {
+                gpa_base: 0x1_0000_0000,
+                host_va: base,
+                len: block_len,
+            },
+            align,
+        )
+        .expect("an aligned, non-empty region"),
+    );
+
+    // Reversed on purpose: see the table in this test's doc.
+    let placement = [(0u64, align * 2), (STRETCH, align), (STRETCH * 2, 0u64)];
+    let mut pages = Vec::new();
+    let mut runs = Vec::new();
+    for (window_offset, import_offset) in placement {
+        pages.push(GuestWindowRun {
+            window_offset,
+            guest: GuestRef::new(
+                std::sync::Arc::clone(&import),
+                import
+                    .slice(import_offset, STRETCH)
+                    .expect("inside the import"),
+            )
+            .expect("the slice came from this import"),
+        });
+        runs.push(GuestRun {
+            host_ptr: (base + import_offset) as usize,
+            len: STRETCH,
+        });
+    }
+
+    let before = engine::counter_snapshot();
+    let mut req = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    req.storage_buffers.push(StorageBufferResource {
+        binding: 0,
+        content: BufferContent::GuestRuns(GuestRunSource {
+            runs: std::sync::Arc::new(runs),
+            total_len: STRETCH * 3,
+            row_length_texels: 0,
+            pages: Some(std::sync::Arc::new(pages)),
+        }),
+    });
+    engine::execute_draw_request(&req).expect("the gathered draw");
+    let px = engine::read_target(&identity)
+        .expect("read_target flushes the batch")
+        .into_rgba8();
+
+    let d = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        d.buffer_guest_gathers, 1,
+        "the colour below is only about the gather if the gather ran: {d:?}"
+    );
+    assert_eq!(
+        d.buffer_snapshot_binds, 0,
+        "a CPU snapshot would paint the same colour and prove nothing: {d:?}"
+    );
+
+    // Inside the scissored half, where the triangle covers the target.
+    let i = (((H / 2) * W + W / 4) * 4) as usize;
+    let got = &px[i..i + 4];
+    assert!(
+        near(got[0], FILL[2]) && near(got[1], FILL[1]) && near(got[2], FILL[0]),
+        "gathered window read back as {got:?}; expected ({}, {}, {}). \
+         The exact reverse would mean the stretches were concatenated in the \
+         order they sit in the import rather than placed at window_offset.",
+        FILL[2],
+        FILL[1],
+        FILL[0],
     );
     engine::test_quiesce_ring();
 }
