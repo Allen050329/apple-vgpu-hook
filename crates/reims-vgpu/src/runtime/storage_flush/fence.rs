@@ -277,16 +277,52 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// driven Safari window-drag, busiest second   draw_us   flush_us
 ///   the copying rail (21/69 below)               21%        69%
 ///   after the GPU writeback landed               61%        34%
-///   after the read direction went zero-copy      35%        59%
+///   after the sampled read went zero-copy        35%        59%
+///   after the buffer gather moved to the GPU     24%        70%
 /// ```
 ///
-/// The third line is what a draw costs once it stops copying guest RAM on the
-/// CPU: the guest's pages reach the GPU as host-pointer imports for sampled
-/// textures and for vertex/storage binds, so the gather phase
-/// (`stage_phase runs_us`) all but vanishes from a worker second and a draw
-/// gets cheaper with it. Nothing about the flush changed between the second and
-/// third lines. It is 59% of the worker because it is the last rail that still
-/// moves a whole frame per fence.
+/// The third line is what a draw costs once its *texture* binds stop copying
+/// guest RAM on the CPU. It was written claiming the vertex and storage binds
+/// had stopped too, and they had not: the boot after it read
+/// `stage_phase runs_us=104719` over 15 758 CPU gathers a second, because
+/// `GuestRunSource::pages` could only carry one contiguous stretch and a guest
+/// buffer window is never one. The fourth line is that actually fixed —
+/// `exec::gather_guest_buffer_window` assembles a scattered window with a GPU
+/// copy per stretch — and `runs_n` is **0** for a whole boot on it.
+///
+/// Nothing about the flush changed across any of the four. It is 70% of the
+/// worker because it is the last rail that still moves a whole frame per fence,
+/// and each time the draw side gets cheaper this line goes up without this rail
+/// doing anything at all.
+///
+/// ### The fourth line, divided
+///
+/// Six consecutive driven seconds, x86/PCI, quiesced, one `vk_caps`, stable to
+/// within 1%:
+///
+/// ```text
+/// drain_us 970 ms/s     draw_us 234 ms/s (2 777 draws)   flush_us 681 ms/s (920 flushes)
+/// readback_split, per flush:  fence 642us  gpu 416us  submit 13us  bar 1.0us  remainder 212us
+/// ```
+///
+/// Three things in that, and the third is the lever:
+///
+/// - `write_us=0 write=0` still. The CPU writes nothing to guest pages; the
+///   linear-scratch rail holds at 506.1 regions a writeback.
+/// - **`bar_us` is 1.0 µs a fence, unchanged.** That is worth stating because
+///   the obvious suspicion about the fourth line is wrong: the GPU gather adds
+///   ~14 900 submissions a second to the *same* `ctx.gq` this fence waits on, so
+///   it should show up as the readback's barrier waiting behind them. It does
+///   not. Do not build a transfer queue to fix queue contention that this
+///   instrument says is not happening.
+/// - **The fence's non-GPU remainder is 212 µs, which is 195 ms/s — 20% of the
+///   worker's entire second.** Not the GPU, not the submit, not the barrier:
+///   the gap between `vkQueueSubmit` returning and the fence being observed
+///   signalled, paid 920 times a second. The "batching the fences" lever below
+///   is priced at ~80 µs a flush from an older boot; on this one it is worth
+///   212, because the flush *rate* went up while the per-flush latency did not
+///   come down. That makes it the best-priced remaining lever on this rail, and
+///   the only one this section has not already tried and measured at zero.
 ///
 /// ## What is left inside a flush, and which lever moves it
 ///
@@ -305,8 +341,12 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// of the link. So:
 ///
 /// - **Batching the fences** (one command buffer for the N windows landing at
-///   one drain fence, one wait) recovers only the ~80 µs of submit-to-signal per
-///   flush. Real, and about a tenth of a flush.
+///   one drain fence, one wait) recovers the submit-to-signal gap per flush.
+///   Priced at ~80 µs here, which is about a tenth of a flush — but that was
+///   measured before the draw side got cheap. Re-read "The fourth line,
+///   divided" above before sizing it: on the current build the same quantity is
+///   **212 µs a flush and 20% of the worker second**, which makes this the
+///   best-priced remaining lever rather than the small one.
 /// - **Bounding what each flush copies** attacks the 354 µs, and was the lever
 ///   the "moving whole frames that nobody asked for" paragraph below argued for
 ///   across three sessions. **It has been built and it saves nothing.** Read the
