@@ -100,6 +100,16 @@ pub(super) enum MetalIcbInheritanceDecline {
         pipeline_ref: u32,
         attribute_count: usize,
     },
+    /// One declared vertex attribute names an `MTLVertexFormat` or
+    /// `MTLVertexStepFunction` ordinal Metal does not declare. Distinct from
+    /// [`Self::VertexDescriptorMissing`], which is the whole block coming back
+    /// empty: this one is a block that would have encoded *around* the bad
+    /// attribute and left the shader's `[[stage_in]]` a field short.
+    VertexAttributeUnencodable {
+        pipeline_ref: u32,
+        location: u32,
+        value: u32,
+    },
     RenderPipelineCreate {
         pipeline_ref: u32,
         detail: String,
@@ -127,6 +137,9 @@ impl crate::observe::Decline for MetalIcbInheritanceDecline {
             Self::VertexFunctionGet { .. } => "metal_icb_inherit_vertex_function_get",
             Self::FragmentFunctionGet { .. } => "metal_icb_inherit_fragment_function_get",
             Self::VertexDescriptorMissing { .. } => "metal_icb_inherit_vertex_descriptor_missing",
+            Self::VertexAttributeUnencodable { .. } => {
+                "metal_icb_inherit_vertex_attribute_unencodable"
+            }
             Self::RenderPipelineCreate { .. } => "metal_icb_inherit_render_pipeline_create",
         }
     }
@@ -176,6 +189,15 @@ impl crate::observe::Decline for MetalIcbInheritanceDecline {
                 ("detail", token(detail)),
             ],
             Self::PipelineRefZero => Vec::new(),
+            Self::VertexAttributeUnencodable {
+                pipeline_ref,
+                location,
+                value,
+            } => vec![
+                ("pipeline_ref", pipeline_ref.to_string()),
+                ("location", location.to_string()),
+                ("value", value.to_string()),
+            ],
             Self::PipelineMissing { pipeline_ref }
             | Self::VertexDescriptorMissing { pipeline_ref, .. }
             | Self::RenderPipelineCreate { pipeline_ref, .. } => {
@@ -601,12 +623,23 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
             ca.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
         }
         match crate::runtime::icb::metal_vertex_descriptor_from_attrs(&pipeline.vertex_attributes) {
-            Some(vd) => pdesc.set_vertex_descriptor(Some(vd.as_ref())),
-            None if pipeline.vertex_attributes.is_empty() => {}
-            None => {
+            Ok(Some(vd)) => pdesc.set_vertex_descriptor(Some(vd.as_ref())),
+            Ok(None) if pipeline.vertex_attributes.is_empty() => {}
+            Ok(None) => {
                 return Err(MetalIcbInheritanceDecline::VertexDescriptorMissing {
                     pipeline_ref: req.pipeline_ref,
                     attribute_count: pipeline.vertex_attributes.len(),
+                });
+            }
+            // This arm is why the builder returns a `Result`. It already
+            // refused a descriptor that came back empty; what it could not see
+            // was one that came back *partial*, because a surviving attribute
+            // made the whole set look encodable.
+            Err(refusal) => {
+                return Err(MetalIcbInheritanceDecline::VertexAttributeUnencodable {
+                    pipeline_ref: req.pipeline_ref,
+                    location: refusal.location,
+                    value: refusal.value,
                 });
             }
         }

@@ -108,8 +108,11 @@ struct Row {
 /// which is the opposite of what it is for. Raising it for a *new* modification
 /// is the thing it forbids.
 ///
-/// It has been **lowered** twice, and both have the shape a lowering is supposed
-/// to have: the modification was not reclassified, it was made impossible.
+/// It has been **lowered** four times — 9, 8, 7, 6, 5, one per entry below —
+/// and all four have the shape a lowering is supposed to have: the modification
+/// was not reclassified, it was made impossible. The count is spelled out
+/// against the sequence because it had already drifted once: it read "twice"
+/// with three entries listed, the third having been added without it.
 ///
 /// * `VertexFormatWidenDecline` — the substitution now runs only where the
 ///   shader's own declared read width proves it unobservable, and the two cases
@@ -119,6 +122,14 @@ struct Row {
 ///   measurable; measuring it identified every tag that was arriving; and with
 ///   the identified ones argued and set aside, what remained could be refused.
 ///   Raise-then-retire is the intended path, not an embarrassment.
+/// * `DroppedVertexAttribute` — the builder that skipped an unencodable vertex
+///   attribute and encoded the rest now returns a `Result`, and both callers
+///   refuse the pipeline. The type survives its own reclassification, which is
+///   the shape a lowering should have most often: nothing was deleted and no
+///   verdict was argued away, the modification simply stopped happening. What
+///   settled it was **the other arm** — Vulkan already refused on the same two
+///   wire words — so the divergence was the finding and the fix was to make the
+///   two agree rather than to reason about what Metal ought to do.
 /// * `WrapperUpperHalf` — the type is **gone**, and so is the arm it guarded.
 ///   Its `why` named the retirement as "learning what the upper half selects";
 ///   what static RE established instead is that the word is not an opcode at
@@ -127,7 +138,7 @@ struct Row {
 ///   normally the wrong way to move this number — the doc above says so — and
 ///   this is the exception the rule needs stated: the entry is removed because
 ///   the *code path* is, not because the verdict was inconvenient.
-const EXECUTED_MODIFIED_CEILING: usize = 6;
+const EXECUTED_MODIFIED_CEILING: usize = 5;
 
 /// Every `impl Decline`/`impl Refusal` in the crate, and what its worst arm
 /// costs the guest.
@@ -845,20 +856,21 @@ const ROWS: &[Row] = &[
     Row {
         file: "crates/reims-vgpu/src/runtime/icb/mod.rs",
         ty: "DroppedVertexAttribute",
-        loss: Loss::ExecutedModified,
-        why: "**verdict confirmed against the emitter, description was not.** \
-              This is not about a location the pipeline has no input for. Both \
-              arms fire when a word off the guest's type-7 descriptor is not a \
-              declared `MTLVertexFormat` or `MTLVertexStepFunction` variant: the \
-              attribute is skipped, the remaining ones are encoded, and \
-              `Some(vd)` is returned as long as one survived. So the pipeline is \
-              built with a `[[stage_in]]` struct missing a field and the shader \
-              reads whatever occupies it — wrong geometry, not an error, which \
-              is what the emitter's own doc says. Retired by returning `None` \
-              when any attribute was dropped rather than when all were, which \
-              needs the caller's `None` path checked first: it means `no vertex \
-              descriptor`, and building the pipeline without one is not a \
-              refusal either",
+        loss: Loss::Refused,
+        why: "both arms fire when a word off the guest's type-7 descriptor is \
+              not a declared `MTLVertexFormat` or `MTLVertexStepFunction` \
+              variant. This used to skip the attribute, encode the rest, and \
+              return `Some(vd)` as long as one survived — a pipeline built with \
+              a `[[stage_in]]` struct missing a field, whose shader read \
+              whatever occupied it. The builder now returns \
+              `Result<Option<VertexDescriptor>, VertexAttributeUnencodable>`, \
+              so the three answers are distinct and both callers refuse the \
+              pipeline on `Err`. The type stays because the *line* is still \
+              worth printing beside the refusal: it names which attribute and \
+              which word, once per pair, on a path a cache miss would repeat. \
+              What settled the verdict was the Vulkan arm, which already \
+              refuses on the same two words through \
+              `DrawPreparationDecline::VertexAttributeFormat`",
     },
     Row {
         file: "crates/reims-vgpu/src/runtime/icb/mod.rs",

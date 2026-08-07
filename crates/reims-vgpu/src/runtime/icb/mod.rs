@@ -2082,14 +2082,28 @@ pub fn fill_icb_from_command_memory<M: HostMemory + HostOps>(
     Ok(())
 }
 
+/// An attribute of the guest's type-7 vertex-input block that this device could
+/// not encode, which refuses the pipeline that declared it.
+///
+/// Carries what the [`DroppedVertexAttribute`] line reports, so the caller's
+/// refusal and the log line name the same attribute and the same word.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VertexAttributeUnencodable {
+    pub slug: &'static str,
+    pub location: u32,
+    pub value: u32,
+}
+
 /// Build an `MTLVertexDescriptor` from the type-7 pipeline vertex-input block.
 ///
-/// Returns `None` when there are no usable attributes (no stage-in / SSBO-only
-/// pipelines). Format `0` or stride `0` entries are skipped as incomplete.
+/// `Ok(None)` ⇒ the pipeline declares no vertex input at all (SSBO-only, or
+/// every entry undeclared); `Err` ⇒ an attribute the guest *did* declare could
+/// not be encoded, and the pipeline must be refused rather than built.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 pub(crate) fn metal_vertex_descriptor_from_attrs(
     attrs: &[crate::runtime::decode::resource::VertexAttribute],
-) -> Option<metal::VertexDescriptor> {
+) -> Result<Option<metal::VertexDescriptor>, VertexAttributeUnencodable> {
     metal_vertex_descriptor_from_attrs_for_draw(attrs, false)
 }
 
@@ -2098,35 +2112,54 @@ pub(crate) fn metal_vertex_descriptor_from_attrs(
 /// When `for_patches` is true and a layout lacks an explicit step function,
 /// use `PerPatchControlPoint` (SDK value 4) so post-tessellation vertex
 /// functions receive control-point attributes correctly.
+///
+/// # One unencodable attribute refuses the whole pipeline
+///
+/// This used to skip the attribute, encode the rest, and hand back `Some(vd)` as
+/// long as one survived — so the PSO was built with a `[[stage_in]]` struct
+/// missing a field and the shader read whatever occupied it. Wrong geometry,
+/// not an error, and nothing downstream could tell.
+///
+/// **The Vulkan arm already answers this correctly** and is what settles it:
+/// `DrawPreparationDecline::VertexAttributeFormat` and
+/// `..::VertexStepFunctionUnsupported` refuse the draw on exactly these two
+/// words. Two arms consuming one wire form had two different answers, and the
+/// one that skipped was the one with no way to say so.
+///
+/// A `format` or `stride` of zero is *not* this case. `MTLVertexFormatInvalid`
+/// is 0, so a zero there is the guest declaring no attribute at that index —
+/// the same shape as an unattached colour slot — and skipping it is what the
+/// wire says to do. It is counted rather than assumed, because the count is
+/// what would say if the reading were ever wrong.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 pub(crate) fn metal_vertex_descriptor_from_attrs_for_draw(
     attrs: &[crate::runtime::decode::resource::VertexAttribute],
     for_patches: bool,
-) -> Option<metal::VertexDescriptor> {
+) -> Result<Option<metal::VertexDescriptor>, VertexAttributeUnencodable> {
     use crate::backend::metal::mtl_enum;
     use metal::{MTLVertexStepFunction, VertexDescriptor};
 
     if attrs.is_empty() {
-        return None;
+        return Ok(None);
     }
     let vd = VertexDescriptor::new().to_owned();
     let mut any = false;
     for a in attrs {
         if a.format == 0 || a.stride == 0 {
+            crate::runtime::drain::note_store_route("icb_vertex_attr_undeclared");
             continue;
         }
         // Both words come straight off the guest's type-7 descriptor and had no
         // check at all — they were reinterpreted as `MTLVertexFormat` and
-        // `MTLVertexStepFunction` directly. The attribute is dropped rather
-        // than the whole descriptor, because one bad attribute does not make
-        // the others unencodable, and the drop is reported.
+        // `MTLVertexStepFunction` directly.
         let Some(format) = mtl_enum::vertex_format(a.format) else {
-            note_dropped_vertex_attribute(
-                "icb_vertex_attr_format_unsupported",
-                a.location,
-                a.format,
-            );
-            continue;
+            let slug = "icb_vertex_attr_format_unsupported";
+            note_dropped_vertex_attribute(slug, a.location, a.format);
+            return Err(VertexAttributeUnencodable {
+                slug,
+                location: a.location,
+                value: a.format,
+            });
         };
         let step_ordinal = a.step_function_ordinal(if for_patches {
             MTLVertexStepFunction::PerPatchControlPoint as u32
@@ -2134,12 +2167,13 @@ pub(crate) fn metal_vertex_descriptor_from_attrs_for_draw(
             MTLVertexStepFunction::PerVertex as u32
         });
         let Some(step) = mtl_enum::vertex_step_function(step_ordinal) else {
-            note_dropped_vertex_attribute(
-                "icb_vertex_attr_step_function_unsupported",
-                a.location,
-                step_ordinal,
-            );
-            continue;
+            let slug = "icb_vertex_attr_step_function_unsupported";
+            note_dropped_vertex_attribute(slug, a.location, step_ordinal);
+            return Err(VertexAttributeUnencodable {
+                slug,
+                location: a.location,
+                value: step_ordinal,
+            });
         };
         any = true;
         if let Some(attr) = vd.attributes().object_at(a.location as u64) {
@@ -2153,20 +2187,16 @@ pub(crate) fn metal_vertex_descriptor_from_attrs_for_draw(
             layout.set_step_rate(a.step_rate() as u64);
         }
     }
-    if any {
-        Some(vd)
-    } else {
-        None
-    }
+    Ok(if any { Some(vd) } else { None })
 }
 
 /// A vertex attribute this device could not encode, named by which of its two
 /// enum words the guest set to something Metal does not declare.
 ///
-/// Skipping one attribute silently would leave a pipeline whose `[[stage_in]]`
-/// struct is missing a field, which shows up as wrong geometry rather than as
-/// an error, so the drop is counted and printed even though the caller has no
-/// status channel to return.
+/// The line, beside the [`VertexAttributeUnencodable`] the caller refuses on.
+/// Both exist because they answer to different readers: the refusal stops the
+/// pipeline and the line says which attribute and which word stopped it, once
+/// per pair, on a path a cache miss would otherwise repeat indefinitely.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 struct DroppedVertexAttribute {
     slug: &'static str,
@@ -2510,10 +2540,21 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
             // Stage-in / control-point: type-7 vertex-input block → MTLVertexDescriptor.
             // Patch draws force PerPatchControlPoint when the layout does not already
             // carry a step function (host tessellation oracle fixture).
-            if let Some(vd) =
-                metal_vertex_descriptor_from_attrs_for_draw(&rp.vertex_attributes, is_patches)
-            {
-                pdesc.set_vertex_descriptor(Some(vd.as_ref()));
+            // Three answers, and the two that are not `Ok(Some)` used to be one
+            // `if let` that ignored both. A pipeline declaring attributes and
+            // getting no descriptor is a PSO with no `[[stage_in]]` at all,
+            // which is not the same as a pipeline that declared none — the
+            // sibling call in `draw::metal_icb` separates them and this one did
+            // not, so the same wire form had two answers one file apart.
+            match metal_vertex_descriptor_from_attrs_for_draw(&rp.vertex_attributes, is_patches) {
+                Ok(Some(vd)) => pdesc.set_vertex_descriptor(Some(vd.as_ref())),
+                Ok(None) if rp.vertex_attributes.is_empty() => {}
+                Ok(None) => {
+                    return Err(IcbStatus::BadDescriptor(
+                        "icb_frc_vertex_descriptor_missing",
+                    ))
+                }
+                Err(refusal) => return Err(IcbStatus::BadDescriptor(refusal.slug)),
             }
             device
                 .new_render_pipeline_state(&pdesc)
