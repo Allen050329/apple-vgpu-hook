@@ -653,21 +653,35 @@ fn packet_snapshot_len(header: &[u8], available: u32, ring_capacity: u32) -> u32
 /// packet_stamps_none     31168
 /// packet_stamps_present   3426      ~10 % of all decoded packets
 ///
-/// opcode=0x04 count=1  w0=0x2 w1=0x4
-/// opcode=0x06 count=1  w0=0x1 w1=0x7
-/// opcode=0x06 count=2  w0=0x1 w1=0x5
-/// opcode=0x20 count=1  w0=0x2 w1=0x5da
-/// opcode=0x22 count=1  w0=0x4 w1=0x1
-/// opcode=0x25 count=1  w0=0x1 w1=0x69
-/// opcode=0x35 count=1  w0=0x1 w1=0xe7
-/// opcode=0x37 count=1  w0=0x2 w1=0xe
-/// opcode=0x37 count=2  w0=0x4 w1=0x4
-/// opcode=0x3b count=1  w0=0x1 w1=0x19
+/// 0x04 CURSOR_GLYPH           count=1  w0=0x2 w1=0x4
+/// 0x06 PRESENT_X86            count=1  w0=0x1 w1=0x7
+/// 0x06 PRESENT_X86            count=2  w0=0x1 w1=0x5
+/// 0x20 DELETE_TASK            count=1  w0=0x2 w1=0x5da
+/// 0x22 UNMAP_MEMORY           count=1  w0=0x4 w1=0x1
+/// 0x25 DELETE_OBJECT          count=1  w0=0x1 w1=0x69
+/// 0x35 SYNCHRONIZE_RESOURCES  count=1  w0=0x1 w1=0xe7
+/// 0x37 EXEC_INDIRECT2         count=1  w0=0x2 w1=0xe
+/// 0x37 EXEC_INDIRECT2         count=2  w0=0x4 w1=0x4
+/// 0x3b GET_COMPUTE_INFO       count=1  w0=0x1 w1=0x19
 /// ```
 ///
 /// So this is live traffic, not a dormant field: about one packet in ten
-/// carries a record, across ten commands including cursor, present, delete-task
-/// and unmap.
+/// carries a record.
+///
+/// **The ten commands that carry one are not a random ten.** They are work
+/// submission (`CHILD_OP_EXEC_INDIRECT2`), explicit synchronisation
+/// (`CHILD_OP_SYNCHRONIZE_RESOURCES`), presentation, and then the teardown
+/// set — `CHILD_OP_DELETE_TASK`, `CHILD_OP_DELETE_OBJECT`,
+/// `CHILD_OP_UNMAP_MEMORY`. That is the list of commands whose ordering
+/// *against GPU work* is the thing that matters, and three of them free or
+/// unmap memory the GPU may still be reading. A record on an unmap is either
+/// "do not unmap until the GPU has reached this point" or "tell the guest when
+/// the unmap is done", and under the first, ignoring it is a use-after-free of
+/// guest pages.
+///
+/// That is the strongest evidence here, and it still does not choose between
+/// the two readings — which is the point. It says the records are about
+/// ordering without saying which direction they order in.
 ///
 /// The records have shape. `w0` is small and repeats — 1, 2, 4 — and `w1`
 /// ranges from 1 to 0x5da and is larger for the commands that appear later in
