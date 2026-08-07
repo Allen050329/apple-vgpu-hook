@@ -669,6 +669,14 @@ pub struct RenderPipelineDescriptor {
     /// Byte offset from end of 16-byte header to color-attachment section (tag 0x08).
     pub color_attachment_offset: u32,
     pub has_color_attachment_offset: bool,
+    /// Byte offset from the end of the same header to the serialized
+    /// `vertexDescriptor`, on the classic shape only. See
+    /// [`PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET`].
+    pub vertex_descriptor_offset: u32,
+    /// Whether the descriptor stated that offset. False means **no vertex
+    /// descriptor**, not an unknown position; the mesh shape never states one
+    /// and falls back to inferring the block.
+    pub has_vertex_descriptor_offset: bool,
     pub vertex_attributes: Vec<VertexAttribute>,
     /// First color attachment (compat / color0).
     pub color0: PipelineColorAttachment,
@@ -1100,6 +1108,29 @@ pub const PIPELINE_TAG_VERTEX_FUNC: u8 = 0x01;
 pub const PIPELINE_TAG_FRAGMENT_FUNC: u8 = 0x02;
 /// Mesh SPI only: fragment function (classic tag 0x03 is a different field).
 pub const PIPELINE_TAG_MESH_FRAGMENT_FUNC: u8 = 0x03;
+/// Classic: where the serialized `vertexDescriptor` starts, in the same units as
+/// [`PIPELINE_TAG_COLOR_ATTACH_OFFSET`] — a byte offset from the end of the
+/// 16-byte type-7 header.
+///
+/// The same wire tag as [`PIPELINE_TAG_MESH_FRAGMENT_FUNC`], whose role it takes
+/// on the mesh shape. The pair is the third instance of this file's standing
+/// rule that a tag's meaning is a property of the shape it arrives in: `0x01`
+/// and `0x02` are already vertex/fragment on one and object/mesh on the other.
+///
+/// **A classic descriptor without this tag has no vertex descriptor at all**,
+/// rather than one whose offset went missing. A driven boot shows the shape
+/// `[08,01,02]` producing no vertex-descriptor entry and every shape carrying
+/// `0x03` producing one, which is the reading that licenses treating absence as
+/// "none" rather than as "look for it".
+///
+/// Reading it retires a guess. Before it was identified, the block was assumed
+/// to be everything between the end of the TLV block and the colour section, and
+/// that assumption needs [`skip_optional_label_and_pad`] to step over a `label`
+/// string of unknown length — a heuristic that misreads any `fieldCount` of
+/// `0x20` or above as the first character of a label. See
+/// [`note_vertex_block_inferred`], which is what still measures the mesh arm's
+/// reliance on it.
+pub const PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET: u8 = PIPELINE_TAG_MESH_FRAGMENT_FUNC;
 /// Offset (from header end) to color-attachment section; vertex block lives before it.
 pub const PIPELINE_TAG_COLOR_ATTACH_OFFSET: u8 = 0x08;
 /// Mesh SPI section offset (analog of classic [`PIPELINE_TAG_COLOR_ATTACH_OFFSET`]).
@@ -2078,9 +2109,10 @@ pub fn decode_sampler_descriptor(bytes: &[u8]) -> Result<SamplerDescriptor, Deco
 /// boot's classic pipelines that carry `0x03` — an instrument built to find
 /// unread fields hiding one behind a tag its *other* branch reads. Which tags
 /// count as consumed is a property of the branch taken, so it is chosen there.
-const CLASSIC_PIPELINE_TAGS_CONSUMED: [u8; 3] = [
+const CLASSIC_PIPELINE_TAGS_CONSUMED: [u8; 4] = [
     PIPELINE_TAG_VERTEX_FUNC,
     PIPELINE_TAG_FRAGMENT_FUNC,
+    PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET,
     PIPELINE_TAG_COLOR_ATTACH_OFFSET,
 ];
 
@@ -2132,26 +2164,35 @@ const COMPUTE_PIPELINE_TAGS_CONSUMED: [u8; 1] = [PIPELINE_TAG_KERNEL_FUNC];
 /// kind=compute     tags=[00:4]                     unconsumed=0
 /// ```
 ///
-/// Three tags a live guest sends and no decoder reads, all four bytes wide:
+/// # What the four were
 ///
-/// * **`0x00` on a classic render pipeline.** This file names `0x00`
-///   [`PIPELINE_TAG_KERNEL_FUNC`] because that is its role on a *compute*
-///   pipeline; on a render one it is a fourth `u32` with no identification.
-/// * **`0x03` on a classic render pipeline.** The decoder loads it into `tag03`
-///   and uses that variable only on the mesh branch, so on this shape it is read
-///   and thrown away. Named `PIPELINE_TAG_MESH_FRAGMENT_FUNC` for its mesh role;
-///   its classic role is unidentified.
-/// * **`0x01` and `0x02` on a compute pipeline.** Named for their render roles.
-///   `MTLComputePipelineDescriptor`'s own scalar properties are
-///   `maxTotalThreadsPerThreadgroup` and
-///   `threadGroupSizeIsMultipleOfThreadExecutionWidth`, which is a plausible
-///   pair and **not** a decode: nothing here has read a value against a driven
-///   dispatch, and acting on the guess would be the magic-number failure this
-///   repository's ground rules name.
+/// The block is `MTLRenderPipelineDescriptor`'s property list, one tag per
+/// property, and a property left at its Metal default is **omitted** rather than
+/// sent as a zero — which is why only three to five arrive. Same grammar as the
+/// colour-attachment and vertex entries this file already decodes.
 ///
-/// The compute pair is the more alarming of the two: if either is
-/// `maxTotalThreadsPerThreadgroup`, this device dispatches threadgroups the
-/// guest capped and the pipeline may exceed what its shader was compiled for.
+/// * **render `0x03` = `vertexDescriptor`**, a byte offset to the serialized
+///   sub-object in the same units as `0x08` beside it. **Load-bearing, and now
+///   read** — see [`PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET`]. It is the one of
+///   the four that cost anything: the block was being located by guesswork while
+///   the descriptor stated its position.
+/// * **render `0x00` = `label`** and **compute `0x02` = `label`**, each a
+///   four-byte reference into the record's string area. A debug name; nothing
+///   this device renders depends on it. Left unread, and the shape line is what
+///   keeps that decision visible.
+/// * **compute `0x01` =
+///   `threadGroupSizeIsMultipleOfThreadExecutionWidth`**, a `BOOL` widened to
+///   four bytes. A hint to Metal's own compiler about how it may size a
+///   threadgroup; this device compiles the shader itself and takes the
+///   threadgroup size from the dispatch record, so there is nothing here to
+///   apply.
+///
+/// An earlier draft of this doc guessed that the compute pair might include
+/// `maxTotalThreadsPerThreadgroup` and warned that dropping it could let this
+/// device dispatch past a cap the guest set. **That alarm was wrong.** That
+/// property is a different tag and a `u16`, and it appears in none of the shapes
+/// above. The guess is recorded here rather than deleted because the shape line
+/// is what disproved it, which is the argument for having one.
 ///
 /// # Reported, not refused
 ///
@@ -2159,9 +2200,9 @@ const COMPUTE_PIPELINE_TAGS_CONSUMED: [u8; 1] = [PIPELINE_TAG_KERNEL_FUNC];
 /// not, on that sibling's own stated licence: its zero was *measured* first —
 /// `type7_color_attach_shape` runs 4–13 times a boot with `unconsumed=0` — and
 /// only a measured zero makes refusing safe. This block's reading is **not**
-/// zero, as the table above shows, so refusing here would decline pipelines a
-/// live guest sends on every boot. Identify the four tags, then decide; do not
-/// promote this to a refusal on the strength of the shape line alone.
+/// zero: two labels still arrive and are dropped on purpose. Refusing a pipeline
+/// for carrying a debug name would decline pipelines a live guest sends on every
+/// boot, to no end.
 ///
 /// Deduped per distinct `(tag, len)` rather than per value: what a reader needs
 /// first is which properties arrive, and a per-value latch on a field like a
@@ -2328,6 +2369,14 @@ pub fn decode_render_pipeline_descriptor(
         out.fragment_func_ref = tag02;
         out.object_func_ref = 0;
         out.mesh_func_ref = 0;
+        // The classic role of `0x03`: where the serialized `vertexDescriptor`
+        // starts, in the same units as the colour-attachment offset beside it.
+        // A descriptor without this tag has no vertex descriptor at all — it is
+        // not one whose offset went missing.
+        if let Some(off) = compact_tlv_u32(&fields, PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET) {
+            out.vertex_descriptor_offset = off;
+            out.has_vertex_descriptor_offset = true;
+        }
         if let Some(off) = compact_tlv_u32(&fields, PIPELINE_TAG_COLOR_ATTACH_OFFSET) {
             out.color_attachment_offset = off;
             out.has_color_attachment_offset = true;
@@ -2336,8 +2385,23 @@ pub fn decode_render_pipeline_descriptor(
     let first_tlv_end = TYPE7_FIRST_TLVS + consumed;
     if out.has_color_attachment_offset {
         let color_abs = TYPE7_FIRST_TLVS + out.color_attachment_offset as usize;
-        if color_abs <= declared && first_tlv_end < color_abs {
-            out.vertex_attributes = parse_vertex_block(bytes, first_tlv_end, color_abs)?;
+        // The vertex block runs from where the descriptor says it starts to
+        // where the colour section begins. Only the classic shape states that
+        // start; the mesh shape does not, so it keeps the old inference —
+        // everything between the end of the TLV block and the colour section —
+        // and `note_vertex_block_inferred` is what keeps the reliance on that
+        // guess measurable rather than assumed.
+        let inferred = !out.has_vertex_descriptor_offset;
+        let start = if inferred {
+            first_tlv_end
+        } else {
+            TYPE7_FIRST_TLVS + out.vertex_descriptor_offset as usize
+        };
+        if color_abs <= declared && start < color_abs {
+            out.vertex_attributes = parse_vertex_block(bytes, start, color_abs)?;
+            if inferred && !out.vertex_attributes.is_empty() {
+                note_vertex_block_inferred(start, color_abs);
+            }
         }
         if color_abs < declared {
             out.color_attachments = parse_color_attachments(bytes, declared, color_abs)?;
@@ -2347,6 +2411,44 @@ pub fn decode_render_pipeline_descriptor(
         }
     }
     Ok(out)
+}
+
+/// A vertex descriptor found without the wire having said where it starts.
+///
+/// The classic shape carries [`PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET`]; the mesh
+/// shape does not, so the mesh arm still has to guess that the descriptor is
+/// whatever sits between the end of the TLV block and the colour section. That
+/// guess is what *both* arms made until the classic tag was identified, and it
+/// needs [`skip_optional_label_and_pad`] to step over a `label` string of
+/// unknown length first — a byte-sniffing heuristic that reads a `fieldCount`
+/// of `0x20` or above as the first character of a label. The explicit offset
+/// makes it unnecessary on the arm that has one, and this line is what says how
+/// much traffic still depends on it.
+///
+/// Not a loss and not a refusal: the guess is taken and the attributes are
+/// decoded. Off channel, deduped on the pair of offsets, because what a reader
+/// wants is whether the fallback runs at all rather than how often. A boot that
+/// never emits this is a boot on which the heuristic could be deleted.
+///
+/// **It reads zero on a driven x86/Vulkan boot**, on which every vertex block
+/// the guest sends is located from the stated offset and the same six
+/// vertex-entry shapes decode as they did from the inferred one. That is not yet
+/// a licence to delete [`skip_optional_label_and_pad`]: the mesh shape is a real
+/// Apple one this workload never builds, and a zero from a workload that does
+/// not enter the branch says nothing about the branch. What the zero does
+/// establish is that the classic arm no longer depends on byte-sniffing, which
+/// is the whole of what the offset was read for.
+fn note_vertex_block_inferred(start: usize, color_abs: usize) {
+    if crate::observe::first_sight(
+        "type7_vertex_block_inferred",
+        ((start as u64) << 32) | color_abs as u64,
+    ) {
+        crate::observe::off(format!(
+            "type7_vertex_block_inferred start={start} color={color_abs} \
+             (the descriptor stated no vertexDescriptor offset, so the block was \
+              located by stepping over the label)"
+        ));
+    }
 }
 
 /// A colour-attachment TLV field this decoder does not read, and the pipeline

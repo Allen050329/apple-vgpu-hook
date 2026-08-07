@@ -1446,59 +1446,116 @@ fn an_unread_pipeline_descriptor_field_says_so_without_refusing_the_pipeline() {
     );
 }
 
-/// Tag `0x03` on a *classic* render pipeline is unread, and the shape line says
-/// so.
+/// A classic render pipeline's vertex block is taken from the offset the
+/// descriptor states, not from where the bytes after the TLV block happen to
+/// begin.
 ///
-/// The decoder loads it into `tag03` and uses that variable only on the mesh
-/// branch, so a classic descriptor carrying it has the field read and thrown
-/// away. A driven boot sends exactly this shape, and the first draft of the
-/// shape line reported `unconsumed=0` for it — the consumed set was the union
-/// of what either branch reads, which is an instrument built to find unread
-/// fields hiding one behind a tag its *other* branch reads. Which tags count as
-/// consumed is a property of the branch taken.
+/// Tag `0x03` is `vertexDescriptor`'s offset on this shape, in the same units as
+/// the colour-attachment offset beside it. The decoder used to load it into
+/// `tag03`, use that variable only on the mesh branch, and locate the vertex
+/// block by assuming it was everything between the end of the TLV block and the
+/// colour section — an assumption that needs `skip_optional_label_and_pad` to
+/// step over a `label` string of unknown length first.
+///
+/// The fixture puts **two** vertex descriptors in the record: a decoy exactly
+/// where the old assumption lands, and the real one where tag `0x03` points. The
+/// two name different buffer indices, so which offset the decoder used is
+/// readable off the result rather than argued.
 #[test]
-fn a_classic_pipelines_mesh_tag_is_unread_and_the_shape_line_says_so() {
+fn a_classic_pipeline_takes_its_vertex_block_from_the_stated_offset() {
     use crate::contract::endian::st32;
 
-    // Classic: 0x08 present, 0x14 absent. Plus 0x03, which only the mesh branch
-    // reads. The colour section the offset names is present and empty, for the
-    // reason `compact_render_pipeline_object_mesh_funcs` below gives.
-    let mut b = vec![0u8; 16 + 19 + 8];
+    const DECOY_BUFFER: u32 = 0;
+    const REAL_BUFFER: u32 = 2;
+    let decoy = vertex_block_on_buffer(&[], DECOY_BUFFER);
+    let real = vertex_block_on_buffer(&[], REAL_BUFFER);
+
+    // Four fields of six bytes each, plus the count byte. Offsets in tags 0x03
+    // and 0x08 are from the end of the 16-byte header, which is where the TLV
+    // block starts, so the decoy sits at exactly the offset the old assumption
+    // would have computed.
+    const TLV_LEN: usize = 1 + 4 * 6;
+    let decoy_rel = TLV_LEN;
+    let real_rel = decoy_rel + decoy.len();
+    let color_rel = real_rel + real.len();
+
+    let mut b = vec![0u8; 16 + color_rel + 8];
     let blen = b.len() as u32;
     st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], blen);
-    st32(&mut b[8..], 11);
-    b[16] = 3;
+    st32(&mut b[8..], 12);
+    b[16] = 4;
+    let mut p = 17;
+    for (tag, value) in [
+        (PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET, real_rel as u32),
+        (PIPELINE_TAG_COLOR_ATTACH_OFFSET, color_rel as u32),
+        (PIPELINE_TAG_VERTEX_FUNC, 2),
+        (PIPELINE_TAG_FRAGMENT_FUNC, 1),
+    ] {
+        b[p] = tag;
+        b[p + 1] = 4;
+        st32(&mut b[p + 2..], value);
+        p += 6;
+    }
+    assert_eq!(
+        p,
+        16 + TLV_LEN,
+        "the TLV block is the length the offsets assume"
+    );
+    b[16 + decoy_rel..16 + decoy_rel + decoy.len()].copy_from_slice(&decoy);
+    b[16 + real_rel..16 + real_rel + real.len()].copy_from_slice(&real);
+
+    let cap = crate::observe::FailCapture::start();
+    let d = decode_render_pipeline_descriptor(&b).expect("a classic descriptor decodes");
+    assert!(d.has_vertex_descriptor_offset);
+    assert_eq!(d.vertex_descriptor_offset, real_rel as u32);
+    assert_eq!(d.vertex_attributes.len(), 1);
+    assert_eq!(
+        d.vertex_attributes[0].buffer_index, REAL_BUFFER,
+        "the block at the stated offset is the one decoded; the decoy at the \
+         inferred start is not"
+    );
+    assert!(
+        !cap.lines()
+            .iter()
+            .any(|l| l.contains("type7_vertex_block_inferred")),
+        "and a descriptor that stated its offset must not report the fallback: \
+         {:?}",
+        cap.lines()
+    );
+}
+
+/// A shape carrying no vertex-descriptor offset carries no vertex descriptor.
+///
+/// The reading that licenses this: on a driven boot, the classic shape
+/// `[08,01,02]` produces no vertex-descriptor entry, and every shape carrying
+/// `0x03` produces one. So an absent tag is "none", not "look for it" — which is
+/// what makes the stated offset usable as the only route to the block.
+#[test]
+fn a_classic_pipeline_without_the_offset_reports_no_vertex_descriptor() {
+    use crate::contract::endian::st32;
+
+    let mut b = vec![0u8; 16 + 13 + 8];
+    let blen = b.len() as u32;
+    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[4..], blen);
+    st32(&mut b[8..], 13);
+    b[16] = 2;
     b[17] = PIPELINE_TAG_COLOR_ATTACH_OFFSET;
     b[18] = 4;
-    st32(&mut b[19..], 19);
+    st32(&mut b[19..], 13);
     b[23] = PIPELINE_TAG_VERTEX_FUNC;
     b[24] = 4;
     st32(&mut b[25..], 2);
-    b[29] = PIPELINE_TAG_MESH_FRAGMENT_FUNC;
-    b[30] = 4;
-    st32(&mut b[31..], 6);
 
-    let cap = crate::observe::FailCapture::start();
-    let p = decode_render_pipeline_descriptor(&b).expect("a classic descriptor decodes");
-    assert_eq!(p.vertex_func_ref, 2);
-    assert_eq!(
-        p.fragment_func_ref, 0,
-        "0x03 is not the classic fragment function; the decoder discards it"
-    );
-    let lines = cap.lines();
-    let shape: Vec<&String> = lines
-        .iter()
-        .filter(|l| l.contains("type7_pipeline_shape"))
-        .collect();
-    assert_eq!(shape.len(), 1, "one shape line: {lines:?}");
+    let d = decode_render_pipeline_descriptor(&b).expect("decodes");
+    assert!(!d.has_vertex_descriptor_offset);
     assert!(
-        shape[0].contains("kind=render")
-            && shape[0].contains("tags=[08:4,01:4,03:4*]")
-            && shape[0].contains("unconsumed=1"),
-        "the tag the classic branch discards must be starred and counted: {}",
-        shape[0]
+        d.vertex_attributes.is_empty(),
+        "no offset, no descriptor: the gap between the TLV block and the colour \
+         section is not one"
     );
+    assert_eq!(d.vertex_func_ref, 2, "the tags it does read are unaffected");
 }
 
 #[test]
