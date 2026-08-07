@@ -894,3 +894,170 @@ void main() {{
     );
     engine::test_quiesce_ring();
 }
+
+/// **Past `MAX_GUEST_GATHER_REGIONS`, the bytes are still the guest's.**
+///
+/// The GPU gather takes one `vkCmdCopyBuffer` region per stretch and stops
+/// offering above 64 of them, because past that the per-region overhead starts
+/// competing with the memcpy it replaces. That bound is a *cost* bound and its
+/// own doc says so: the CPU gather reads the same bytes through the same runs,
+/// so exceeding it must cost throughput and nothing else.
+///
+/// "Nothing else" is the part that was asserted nowhere. `zc_buf_gather_wide`
+/// counts what the bound turns away, so a window going over is visible — but a
+/// counter says a window took the other rail, not that the other rail assembled
+/// it correctly. A fallback that dropped the tail, or reassembled the stretches
+/// in walk order, would raise exactly the same counter.
+///
+/// So this is the over-the-bound twin of
+/// [`the_gathered_window_reaches_the_shader_with_every_stretch_at_its_window_offset`]:
+/// same shader, same reversed first three stretches, same colour — and 65 runs
+/// instead of 3, which is one past the bound. The GPU gather must decline, and
+/// the picture must not change.
+#[test]
+fn a_window_past_the_gather_bound_falls_back_and_still_lands_the_right_bytes() {
+    use reims_vgpu::runtime::guest_ram::{granularity, GuestRamImport, GuestRamRegion, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::GuestWindowRun;
+
+    const STRETCH: u64 = 256;
+    const WORDS_PER_STRETCH: usize = (STRETCH / 4) as usize;
+    // `MAX_GUEST_GATHER_REGIONS` is 64 and private to the engine. One past it is
+    // the only interesting count: it is the smallest window the bound refuses,
+    // so a bound that moved by one is still caught here.
+    const RUNS: u64 = 65;
+
+    let _guard = engine_test_lock().lock().unwrap();
+
+    let vert = translate_words("render_tri.air", Stage::Vertex);
+    let Some(frag) = glsl_words(
+        &format!(
+            r#"#version 450
+layout(set = 0, binding = 0) readonly buffer Gathered {{ uint words[]; }} gathered;
+layout(location = 0) out vec4 color;
+void main() {{
+    color = vec4(
+        float(gathered.words[{a}] & 0xFFu) / 255.0,
+        float(gathered.words[{b}] & 0xFFu) / 255.0,
+        float(gathered.words[{c}] & 0xFFu) / 255.0,
+        1.0);
+}}
+"#,
+            a = 0,
+            b = WORDS_PER_STRETCH,
+            c = WORDS_PER_STRETCH * 2,
+        ),
+        "fragment",
+        "gather_wide_readback",
+    ) else {
+        return;
+    };
+
+    let identity = TargetIdentity::Surface {
+        id: 990_409,
+        width: W,
+        height: H,
+        generation: 1,
+    };
+
+    let (warm_vert, warm_frag) = triangle_spirv();
+    let warm = batch_req(&warm_vert, &warm_frag, &identity, false, half_scissor(true));
+    if let Err(e) = engine::execute_draw_request(&warm) {
+        let msg = e.to_string();
+        if skip_if_no_gpu(&msg) {
+            eprintln!("skipping: {msg}");
+            return;
+        }
+        panic!("warm-up draw: {msg}");
+    }
+    let Some(align) = granularity() else {
+        eprintln!("skipping: this host cannot import guest RAM, so there is no bound to exceed");
+        engine::test_quiesce_ring();
+        return;
+    };
+
+    // One granule per stretch, so every run is its own bind range and the count
+    // the bound sees is the count this test asked for.
+    let block_len = align * (RUNS + 1);
+    let mut backing = vec![0xA5u8; (block_len + align) as usize];
+    let pad = (backing.as_ptr() as u64).next_multiple_of(align) - backing.as_ptr() as u64;
+    let base = backing.as_ptr() as u64 + pad;
+
+    const FILL: [u8; 3] = [0x11, 0x22, 0x33];
+    for (granule, fill) in FILL.iter().enumerate() {
+        let start = (pad + align * granule as u64) as usize;
+        backing[start..start + STRETCH as usize].fill(*fill);
+    }
+
+    let import = std::sync::Arc::new(
+        GuestRamImport::new(
+            GuestRamRegion {
+                gpa_base: 0x1_0000_0000,
+                host_va: base,
+                len: block_len,
+            },
+            align,
+        )
+        .expect("an aligned, non-empty region"),
+    );
+
+    // The first three reversed exactly as in the gathered twin, so the expected
+    // colour is the same one and a difference is about the rail and not the
+    // fixture. The remaining 62 only have to exist, to carry the count over.
+    let mut placement = vec![(0u64, align * 2), (STRETCH, align), (STRETCH * 2, 0u64)];
+    for i in 3..RUNS {
+        placement.push((STRETCH * i, align * i));
+    }
+    let mut pages = Vec::new();
+    let mut runs = Vec::new();
+    for (window_offset, import_offset) in placement {
+        pages.push(GuestWindowRun {
+            window_offset,
+            guest: GuestRef::new(
+                std::sync::Arc::clone(&import),
+                import
+                    .slice(import_offset, STRETCH)
+                    .expect("inside the import"),
+            )
+            .expect("the slice came from this import"),
+        });
+        runs.push(GuestRun {
+            host_ptr: (base + import_offset) as usize,
+            len: STRETCH,
+        });
+    }
+
+    let before = engine::counter_snapshot();
+    let mut req = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    req.storage_buffers.push(StorageBufferResource {
+        binding: 0,
+        content: BufferContent::GuestRuns(GuestRunSource {
+            runs: std::sync::Arc::new(runs),
+            total_len: STRETCH * RUNS,
+            row_length_texels: 0,
+            pages: Some(std::sync::Arc::new(pages)),
+        }),
+    });
+    engine::execute_draw_request(&req).expect("the fallback draw");
+    let px = engine::read_target(&identity)
+        .expect("read_target flushes the batch")
+        .into_rgba8();
+
+    let d = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        d.buffer_guest_gathers, 0,
+        "65 regions is past MAX_GUEST_GATHER_REGIONS; the GPU gather must decline: {d:?}"
+    );
+
+    let i = (((H / 2) * W + W / 4) * 4) as usize;
+    let got = &px[i..i + 4];
+    assert!(
+        near(got[0], FILL[2]) && near(got[1], FILL[1]) && near(got[2], FILL[0]),
+        "window past the bound read back as {got:?}; expected ({}, {}, {}). \
+         The bound is a cost bound — the rail that takes over must land the same \
+         bytes the gather would have.",
+        FILL[2],
+        FILL[1],
+        FILL[0],
+    );
+    engine::test_quiesce_ring();
+}
