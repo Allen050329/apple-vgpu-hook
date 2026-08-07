@@ -655,6 +655,26 @@ pub struct ColorRtRequest {
     pub target_seed_rgba: Option<Vec<u8>>,
 }
 
+/// One `setVisibilityResultMode:offset:`, as the encoder state it is.
+///
+/// The offset travels with the mode rather than beside it because they are one
+/// record and mean nothing apart: the mode says what to count and the offset
+/// says which 64-bit word of the pass's `visibilityResultBuffer` the count
+/// lands in. Several offsets in one pass are legal Metal — that is how a guest
+/// asks a pass several independent occlusion questions — so the writeback keys
+/// results by offset rather than assuming one per pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VisibilityArming {
+    /// `MTLVisibilityResultMode`, carried raw and translated per backend, the
+    /// way `cull_mode` and `fill_mode` beside it are: only the backend knows
+    /// whether the host can spell the answer, so only the backend can refuse by
+    /// name. Never `0` — `MTLVisibilityResultModeDisabled` is the `None` around
+    /// this.
+    pub mode: u32,
+    /// Byte offset into the pass's `visibilityResultBuffer`.
+    pub offset: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DrawEncodeRequest {
     pub task_id: u32,
@@ -690,6 +710,17 @@ pub struct DrawEncodeRequest {
     /// Every scissor rect the pass bound, in the guest's order. Entry `i` clips
     /// viewport `i`; see [`Self::viewports`].
     pub scissors: Vec<ScissorRect>,
+    /// The occlusion query this draw is armed with, or `None` where the guest
+    /// disarmed it (`MTLVisibilityResultModeDisabled`) or never armed one.
+    pub visibility: Option<VisibilityArming>,
+    /// Samples the draw passed, filled in by the backend that ran the query.
+    ///
+    /// An **out** field on a request, which is the shape the encode chain
+    /// already uses for what a draw produced rather than what it was asked to
+    /// do. `None` where no query was armed *or* where this backend cannot run
+    /// one; the two are told apart by whether [`Self::visibility`] is set, and
+    /// the backend that cannot names its own refusal.
+    pub visibility_samples: Option<u64>,
     pub indexed: Option<IndexedDrawInfo>,
     pub blend_color: Option<[f32; 4]>,
     pub cull_mode: Option<u32>,

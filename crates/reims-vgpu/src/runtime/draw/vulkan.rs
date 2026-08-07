@@ -5246,6 +5246,22 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 chain_load_from_target,
             );
         }
+        // The mode is the guest's raw `MTLVisibilityResultMode`; the engine
+        // takes the translated arm, and an ordinal outside the enum refuses the
+        // draw by the translation's own name rather than being coerced into
+        // one. `Ok(None)` cannot reach here — `runtime::exec` turns
+        // `Disabled` into `req.visibility == None` — but it is handled rather
+        // than asserted, because "the guest disarmed it" and "no query" are the
+        // same draw either way.
+        resources.occlusion_query = match req.visibility {
+            None => None,
+            Some(v) => translate::raster::visibility_result_mode(v.mode)
+                .map_err(|e| {
+                    DrawError::Unsupported(
+                        crate::backend::vulkan::engine::reason::DrawReason::VisibilityResultMode(e),
+                    )
+                })?,
+        };
         resources.scissors = req
             .scissors
             .iter()
@@ -5807,6 +5823,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // `reason=` rather than flattening it into a `vk_engine: {e}` blob.
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
         let out = crate::backend::vulkan::engine::execute_draw_request(&resources)?;
+        // Carried back on the request so `runtime::exec` can sum the chain's
+        // draws into the guest's buffer. The engine reports per draw because a
+        // Metal pass whose counter spans several draws is several Vulkan
+        // queries; the sum belongs to whoever knows the offset, which is not
+        // this arm.
+        req.visibility_samples = out.occlusion_samples;
         // Everything from here to the end of the chain is Store routing, and the
         // `?` above deliberately leaves a declined draw charged to `engine`:
         // where it declined is the engine's own typed reason to report, not this

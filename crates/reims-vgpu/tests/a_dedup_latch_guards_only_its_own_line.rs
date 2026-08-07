@@ -237,11 +237,14 @@ const ROWS: &[(&str, usize, Guarded, &str)] = &[
     ),
     (
         "reims-vgpu/src/runtime/exec/mod.rs",
-        1,
+        2,
         Guarded::EmitsOnly,
-        "render_set_pipeline_zero, latched as the second half of an `&&`. The \
+        "render_set_pipeline_zero, latched as the second half of an `&&` — the \
          `acc.pipeline_ref = cmd.pipeline_ref` assignment it reports on is after \
-         the block and unconditional",
+         the block and unconditional. And visibility_query_unanswered, whose \
+         `note_store_route` sits outside the latch on purpose: the count is how \
+         many occlusion queries went unrun and must not be deduped, while the \
+         line that explains one of them is the same line every time",
     ),
     (
         "reims-vgpu/src/runtime/exec/report.rs",

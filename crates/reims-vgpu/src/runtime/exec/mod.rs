@@ -115,6 +115,10 @@ struct PendingDraw {
     stencil_ref: Option<(u32, u32)>,
     depth_attach: Option<DepthAttachment>,
     stencil_attach: Option<StencilAttachment>,
+    /// The occlusion query armed when this draw was recorded, snapshotted from
+    /// [`StreamAccum::visibility`]. `None` is the Metal default,
+    /// `MTLVisibilityResultModeDisabled`.
+    visibility: Option<draw::VisibilityArming>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -162,6 +166,21 @@ struct StreamAccum {
     stencil_ref: Option<(u32, u32)>,
     depth_attach: Option<DepthAttachment>,
     stencil_attach: Option<StencilAttachment>,
+    /// Serializer ref of the pass's `visibilityResultBuffer`, `0` for a pass
+    /// that named none.
+    ///
+    /// A *pass* property, set once by the `RenderPass` arm, where
+    /// [`Self::visibility`] beside it is encoder state each `0x84` replaces.
+    /// Both are needed to write anything: the mode says what to count and this
+    /// says where the guest will read it.
+    visibility_buffer_ref: u32,
+    /// The occlusion query currently armed, replaced by each
+    /// `setVisibilityResultMode:offset:`.
+    ///
+    /// Encoder state, so one slot is the contract rather than a bound: a second
+    /// record genuinely replaces the first. What *accumulates* across draws is
+    /// the count in the guest's buffer, not the arming.
+    visibility: Option<draw::VisibilityArming>,
     /// Draw records this stream decoded but did not keep. See
     /// [`StreamDrawDrop`]; reported once per stream by [`note_stream_draw_drops`].
     dropped_unbound: u32,
@@ -226,6 +245,7 @@ impl StreamAccum {
             stencil_ref: self.stencil_ref,
             depth_attach: self.depth_attach,
             stencil_attach: self.stencil_attach,
+            visibility: self.visibility,
             ..Default::default()
         })
     }
@@ -1667,9 +1687,11 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // loss is settled by `note_pass_extent_coverage`'s bands and not by
             // this count: the two agree, so this is the denominator of a
             // measurement rather than an alarm.
-            if cmd.pass_visibility_result_buffer_ref != 0 {
-                crate::runtime::drain::note_store_route("render_pass_visibility_buffer_dropped");
-            }
+            // Kept, not counted: this is where the pass says which guest buffer
+            // its occlusion counts land in, and `finish_stream` writes them
+            // there. `0` is a pass that named none, which leaves the arming
+            // below with nowhere to write.
+            acc.visibility_buffer_ref = cmd.pass_visibility_result_buffer_ref;
             if cmd.pass_render_target_array_length > 1 {
                 crate::runtime::drain::note_store_route("render_pass_array_length_dropped");
             }
@@ -2084,12 +2106,17 @@ fn handle_render_record<M: HostMemory + HostOps>(
             }
         }
         RenderKind::SetVisibilityResultMode => {
-            // The seventh of those states. `MTLVisibilityResultModeDisabled` is
-            // 0, so a zero mode is a guest disarming a query this rail never
-            // armed — which is what we already do.
-            if cmd.mode != 0 {
-                crate::runtime::drain::note_store_route("render_visibility_result_mode_dropped");
-            }
+            // `MTLVisibilityResultModeDisabled` is 0, and it is the guest
+            // disarming the query rather than an unknown value: subsequent draws
+            // simply carry none. The record's field is 64-bit and the ordinals
+            // are small, but a guest writes what it likes — a wide word reaches
+            // the backend as an out-of-contract value that says its own name,
+            // the same treatment `fill_mode` gives its ordinal, rather than as
+            // its own low half.
+            acc.visibility = (cmd.mode != 0).then(|| draw::VisibilityArming {
+                mode: u32::try_from(cmd.mode).unwrap_or(u32::MAX),
+                offset: cmd.visibility_result_offset,
+            });
         }
         RenderKind::DrawIndirect => {
             execute_indirect_draw(state, host, task_id, &cmd, acc);
@@ -2991,6 +3018,15 @@ fn finish_stream<M: HostMemory + HostOps>(
             .filter(|pd| pd.pipeline_ref != 0 && pd.draw.vertex_count > 0)
             .collect();
         let mut chain_rgba: Option<Vec<u8>> = None;
+        // Occlusion counts, keyed by the guest byte offset each lands at.
+        //
+        // Summed rather than replaced because one Metal counter can span
+        // several draws and every backend here runs one query per draw: Metal
+        // accumulates into the buffer word itself, so the equivalent is the sum
+        // of what each draw passed. Several offsets in one pass are legal and
+        // independent, which is why this is a map and not a scalar.
+        let mut visibility_counts: std::collections::BTreeMap<u64, u64> =
+            std::collections::BTreeMap::new();
         // Resident render-pass chain: intermediate records keep their content
         // on the engine target (no CPU chain buffer); records 2+ LoadFromTarget.
         let mut resident_chain = false;
@@ -3090,6 +3126,38 @@ fn finish_stream<M: HostMemory + HostOps>(
                 let draw_started = std::time::Instant::now();
                 let encode =
                     draw::encode_draw_chain(state, host, &mut req, do_writeback, force_full_store);
+                // Read before the status is matched: a draw whose Store failed
+                // still ran its query, and the count is the guest's answer
+                // either way.
+                match (req.visibility, req.visibility_samples) {
+                    (Some(arming), Some(samples)) => {
+                        let slot = visibility_counts.entry(arming.offset).or_default();
+                        *slot = slot.saturating_add(samples);
+                    }
+                    // Armed and unanswered: the backend that ran this draw does
+                    // not record occlusion queries, so the guest will read its
+                    // own stale word and cull on it. Detected here rather than
+                    // in each backend because the question is the same on all
+                    // three pathways — "was the query the guest armed actually
+                    // run" — and the Metal arm has no visibility rail at all.
+                    (Some(arming), None) => {
+                        crate::runtime::drain::note_store_route("visibility_query_unanswered");
+                        if crate::observe::first_sight(
+                            "visibility_query_unanswered",
+                            u64::from(arming.mode),
+                        ) {
+                            crate::observe::fail(format!(
+                                "visibility_query_unanswered \
+                                 reason=visibility_query_unanswered task={task_id} \
+                                 pipe={} mode={} off={:#x} (the guest armed an \
+                                 occlusion query and this backend ran none; it will \
+                                 read whatever its buffer already held)",
+                                pd.pipeline_ref, arming.mode, arming.offset
+                            ));
+                        }
+                    }
+                    (None, _) => {}
+                }
                 crate::runtime::drain::note_drain_phase(
                     crate::runtime::drain::DrainPhase::Draw,
                     draw_started,
@@ -3183,6 +3251,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 }
             }
         }
+        write_visibility_results(state, host, task_id, acc, &visibility_counts);
         // Encode never landed Stores (NoMetal stubs, missing MTLB/pipeline, or
         // mrt resolve fail). Honor CLEAR load+store into guest/host pages so
         // dual-buffer display mids at least hold the pass clear color (archive
@@ -3201,6 +3270,113 @@ fn finish_stream<M: HostMemory + HostOps>(
                     out.clears_applied, out.metal_draws_fail, saw_nometal as u8
                 ));
             }
+        }
+    }
+}
+
+/// Land this stream's occlusion counts in the guest's `visibilityResultBuffer`.
+///
+/// The guest reads this buffer with its own CPU and culls on what it finds, so
+/// a count this device does not write is not a picture that comes out wrong —
+/// it is the guest acting on whatever it last initialised. That is why every
+/// refusal below is fail-visible: dropping the write silently is the one
+/// outcome the ground rules forbid.
+///
+/// Each result is a little-endian `u64` at `base + offset`, the width
+/// `MTLVisibilityResultMode` documents for both of its modes.
+///
+/// The span is resolved once, here, rather than per draw.
+/// `objects::resolve_buffer_span` is the same resolver an indirect-draw buffer
+/// and a vertex bind go through, so a guest naming a non-buffer or an unbacked
+/// object refuses by that rail's own name instead of a literal invented here.
+fn write_visibility_results<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    acc: &StreamAccum,
+    counts: &std::collections::BTreeMap<u64, u64>,
+) {
+    if counts.is_empty() {
+        return;
+    }
+    // A pass that armed a query and named no buffer has nowhere to put the
+    // answer. The two halves are decoded from separate records, so this device
+    // can see a pairing neither record states on its own.
+    if acc.visibility_buffer_ref == 0 {
+        crate::runtime::drain::note_store_route("visibility_result_no_buffer");
+        crate::observe::fail(format!(
+            "visibility_result_unwritable reason=visibility_result_no_buffer \
+             task={task_id} results={} (a draw armed an occlusion query and the \
+             pass named no visibilityResultBuffer; the counts are lost)",
+            counts.len()
+        ));
+        return;
+    }
+    let (base, size) = match crate::runtime::objects::resolve_buffer_span(
+        state,
+        host,
+        task_id,
+        acc.visibility_buffer_ref,
+    ) {
+        Ok(v) => v,
+        Err(refusal) => {
+            // Mapped into this rail's own vocabulary rather than reported as
+            // one slug, for the reason `resolve_buffer_span` gives: a ref
+            // naming nothing, a ref holding some other object, a descriptor
+            // that would not decode and one naming no allocation are four
+            // different findings, and collapsing them names the last.
+            let reason = match refusal {
+                crate::runtime::objects::BufferSpanRefusal::Rung(rung) => {
+                    crate::observe::ladder_slugs!("visibility_buf")(rung)
+                }
+                crate::runtime::objects::BufferSpanRefusal::Decode => {
+                    crate::observe::ladder_slug!("visibility_buf", desc_decode)
+                }
+                crate::runtime::objects::BufferSpanRefusal::NoBacking => {
+                    "visibility_buf_no_backing"
+                }
+            };
+            crate::runtime::drain::note_store_route(reason);
+            crate::observe::fail(format!(
+                "visibility_result_unwritable reason={reason} task={task_id} buf={} \
+                 results={} (the pass named a visibilityResultBuffer this device \
+                 cannot resolve; the counts are lost)",
+                acc.visibility_buffer_ref,
+                counts.len()
+            ));
+            return;
+        }
+    };
+    for (&offset, &samples) in counts {
+        // Bound each word against the buffer the guest actually allocated. The
+        // offset is decoded guest data and the two halves arrive in separate
+        // records, so nothing before this point has compared them.
+        let Some(end) = offset.checked_add(8) else {
+            continue;
+        };
+        if end > size {
+            crate::runtime::drain::note_store_route("visibility_result_offset_past_buffer");
+            crate::observe::fail(format!(
+                "visibility_result_unwritable reason=visibility_result_offset_past_buffer \
+                 task={task_id} buf={} off={offset:#x} size={size} (count {samples} lost)",
+                acc.visibility_buffer_ref
+            ));
+            continue;
+        }
+        if let Err(e) = crate::runtime::gva_mem::write_task_gva_product_within(
+            state,
+            host,
+            task_id,
+            base.saturating_add(offset),
+            &samples.to_le_bytes(),
+            None,
+        ) {
+            crate::runtime::drain::note_store_route("visibility_result_write_failed");
+            crate::observe::fail(format!(
+                "visibility_result_unwritable reason=visibility_result_write_failed \
+                 task={task_id} buf={} off={offset:#x} err={e:?}",
+                acc.visibility_buffer_ref
+            ));
         }
     }
 }
@@ -3490,6 +3666,12 @@ fn fill_draw_binds_from_pending(req: &mut draw::DrawEncodeRequest, pd: &PendingD
     req.stencil_ref = pd.stencil_ref;
     req.depth_attach = pd.depth_attach;
     req.stencil_attach = pd.stencil_attach;
+    req.visibility = pd.visibility;
+    // Cleared with the arming it belongs to. `req` is reused across the draws
+    // of a chain, so a stale count from draw N-1 would otherwise be read as
+    // draw N's — and an occlusion count that is silently the previous draw's is
+    // the exact shape of wrong this rail exists to avoid.
+    req.visibility_samples = None;
 }
 
 fn dirty_color_targets<M: HostMemory + HostOps>(

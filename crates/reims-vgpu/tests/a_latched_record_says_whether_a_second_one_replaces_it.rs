@@ -106,6 +106,25 @@ const VERDICTS: &[(&str, &str, Second, &str)] = &[
     // --- StreamAccum: one serialized Metal render pass -------------------
     (
         "StreamAccum",
+        "visibility",
+        Second::ReplacesIt,
+        "setVisibilityResultMode:offset:. Encoder state: one query is armed at a \
+         time and the last arming is what a draw records with. What accumulates \
+         across draws is the count in the guest's buffer, not the arming — so a \
+         collection here would model the wrong thing. `None` is \
+         MTLVisibilityResultModeDisabled, which is the guest disarming rather \
+         than a third mode",
+    ),
+    (
+        "StreamAccum",
+        "visibility_buffer_ref",
+        Second::ReplacesIt,
+        "MTLRenderPassDescriptor.visibilityResultBuffer. A pass property, and \
+         one pass descriptor is decoded per stream, so a second record is a \
+         second pass rather than a second buffer for this one",
+    ),
+    (
+        "StreamAccum",
         "pipeline_ref",
         Second::ReplacesIt,
         "setRenderPipelineState:. One PSO is bound at a time and the last one \

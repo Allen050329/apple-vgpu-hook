@@ -113,21 +113,6 @@ const ROWS: &[(&str, Counted, &str)] = &[
          mode 0 — and the counter fires only past it",
     ),
     (
-        "render_visibility_result_mode_dropped",
-        Counted::StateNotApplied,
-        "MTLVisibilityResultModeDisabled is 0, so a zero mode is a guest \
-         disarming a query this rail never armed and is not counted. A non-zero \
-         one asked for an occlusion result that no draw will write",
-    ),
-    (
-        "render_pass_visibility_buffer_dropped",
-        Counted::StateNotApplied,
-        "the pass names a visibility result buffer and no draw in it writes an \
-         occlusion count, so the buffer keeps whatever it held. Zero on every \
-         driven boot recorded, beside a pass-extent count of 1575 from the same \
-         record — which is what makes this zero measured rather than unreached",
-    ),
-    (
         "render_pass_array_length_dropped",
         Counted::StateNotApplied,
         "layered rendering: the pass declares a render-target array length above \
@@ -413,7 +398,7 @@ fn every_counted_loss_says_what_it_costs() {
     // directory carries: a scan that matched no counter argument would report
     // an empty population as fully adjudicated.
     assert!(
-        found.len() >= 26,
+        found.len() >= 24,
         "the scan found only {} counter-only loss slugs, so it is not parsing \
          `note_store_route` arguments and its verdict means nothing: {found:?}",
         found.len()
@@ -469,7 +454,7 @@ fn no_counted_loss_is_unread() {
 /// population without changing anything the guest sees.
 #[test]
 fn the_counted_loss_census_only_shrinks() {
-    const COUNTED_LOSS_CEILING: usize = 21;
+    const COUNTED_LOSS_CEILING: usize = 19;
     let losses = ROWS
         .iter()
         .filter(|(_, c, _)| matches!(c, Counted::StateNotApplied | Counted::WorkNotExecuted))

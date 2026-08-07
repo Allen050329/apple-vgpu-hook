@@ -1813,6 +1813,7 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
     acc.saw_draw = true;
     acc.color_slots.push((0, att));
     acc.draws.push(PendingDraw {
+        visibility: None,
         pipeline_ref: 1,
         draw: DrawArgs {
             vertex_count: 3,
@@ -1919,6 +1920,7 @@ fn nometal_draw_falls_back_to_type4_clear() {
     acc.saw_draw = true;
     acc.color_slots.push((0, att));
     acc.draws.push(PendingDraw {
+        visibility: None,
         pipeline_ref: 7,
         draw: DrawArgs {
             vertex_count: 3,
@@ -3845,24 +3847,6 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
             "render_tessellation_scale_dropped",
         ),
         (
-            wire_render::OPCODE_SET_VISIBILITY_RESULT_MODE,
-            24,
-            // The mode is the *second* field: this record puts the offset
-            // first, reversing its selector. Writing the mode at payload+0
-            // sets the offset instead and leaves the mode at Disabled, so
-            // the counter correctly stays quiet -- which is how this test
-            // first failed.
-            |p| {
-                st64(p, 0x1234);
-                st64(&mut p[8..], 2);
-            },
-            Some(|p| {
-                st64(p, 0x1234);
-                st64(&mut p[8..], 0);
-            }),
-            "render_visibility_result_mode_dropped",
-        ),
-        (
             wire_render::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT,
             reims_vgpu_wire::OP_HEADER_LEN
                 + render::AMPLIFICATION_COUNT_LEN
@@ -4438,5 +4422,76 @@ fn a_buffer_offset_past_the_table_refuses_the_stream() {
             "render_buffer_offset reason=render_buffer_offset_slot_past_table \
              stage=vertex index={FIRST} table=31 apple_table=31"
         )
+    );
+}
+
+/// `setVisibilityResultMode:offset:` reaches the accumulator, and the pass's
+/// buffer ref reaches it beside the mode.
+///
+/// These two used to be counted and dropped, one counter each. They are decoded
+/// from separate records and mean nothing apart — the mode says what to count,
+/// the pass says which guest buffer the count lands in — so a fixture that
+/// drove only one of them would have passed against a device that still lost
+/// the other.
+///
+/// `MTLVisibilityResultModeDisabled` is 0, and it is the guest *disarming* the
+/// query rather than an unknown ordinal, so it must clear the arming rather
+/// than record a mode of zero. That is the case the `Option` exists for and the
+/// one a naive `mode: u32` field would get wrong.
+#[test]
+fn an_armed_visibility_query_and_its_buffer_both_reach_the_accumulator() {
+    let mut state = DeviceState::new(DeviceId(0), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+
+    let mut arm = |acc: &mut StreamAccum, offset: u64, mode: u64| {
+        let total = wire_render::SET_VISIBILITY_RESULT_MODE_TOTAL_LEN as usize;
+        let mut command = vec![0u8; total];
+        st32(&mut command[0..], wire_render::OPCODE_SET_VISIBILITY_RESULT_MODE);
+        st32(&mut command[4..], total as u32);
+        // Offset first, mode second — the wire's own order, which is the
+        // reverse of the selector's.
+        st64(&mut command[reims_vgpu_wire::OP_HEADER_LEN..], offset);
+        st64(&mut command[reims_vgpu_wire::OP_HEADER_LEN + 8..], mode);
+        handle_render_record(
+            &mut state,
+            &host,
+            1,
+            wire_render::OPCODE_SET_VISIBILITY_RESULT_MODE,
+            &command,
+            &mut out,
+            acc,
+        );
+    };
+
+    // Counting at 0x1234.
+    arm(&mut acc, 0x1234, 2);
+    assert_eq!(
+        acc.visibility,
+        Some(crate::runtime::draw::VisibilityArming {
+            mode: 2,
+            offset: 0x1234
+        }),
+        "a counting query keeps both its mode and the offset it writes to"
+    );
+
+    // A second record replaces the first: this is encoder state, and Metal's
+    // second `setVisibilityResultMode:` genuinely supersedes the first.
+    arm(&mut acc, 0x20, 1);
+    assert_eq!(
+        acc.visibility,
+        Some(crate::runtime::draw::VisibilityArming {
+            mode: 1,
+            offset: 0x20
+        }),
+        "a second arming replaces the first rather than accumulating"
+    );
+
+    // Disabled clears it, rather than arming a query with mode 0.
+    arm(&mut acc, 0x20, 0);
+    assert_eq!(
+        acc.visibility, None,
+        "MTLVisibilityResultModeDisabled disarms; it is not a third mode"
     );
 }
