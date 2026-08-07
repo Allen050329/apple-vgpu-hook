@@ -179,6 +179,21 @@ fn note_read_refusal(task_id: u32, gva: u64, named: MemError) {
 /// this crate writes arm64e and treats a failed write as a broken fixture
 /// rather than a result, which is why the assertion lives here instead of at
 /// each call site.
+///
+/// # The `#[cfg(test)]` is the enforcement — do not remove it
+///
+/// "Product code must not call a helper with a page shift baked into its name"
+/// is not a rule a reader has to hold, and it is not something to go looking
+/// for: this gate and the one on [`define_task_pages_arm64e`] are the only two
+/// arch-fixed functions in the crate, and behind them a product call is a
+/// `cannot find function` from rustc rather than a finding. `contract::gva`
+/// exposes the arch-fixed *constants* ungated, which is fine — a shift is
+/// picked from `state.page_shift` at the call site, and a constant cannot
+/// silently walk a page table at the wrong stride the way a helper can.
+///
+/// Ungating either one to share it with an integration test would take the
+/// enforcement away and leave nothing, so a caller outside the crate is a
+/// reason to move the fixture, not to widen the gate.
 #[cfg(test)]
 #[track_caller]
 pub fn write_task_gva_arm64e<M: HostMemory>(host: &mut M, task: &TaskEntry, gva: u64, buf: &[u8]) {
