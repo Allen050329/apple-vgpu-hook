@@ -1382,6 +1382,7 @@ pub(crate) unsafe fn execute_draw_inner(
         ctx,
         &pipeline_key,
         vert_module,
+        &req.vert_spirv,
         frag_module,
         pipeline_layout,
         render_pass,

@@ -107,7 +107,12 @@ struct Row {
 /// the cheapest way to keep this number low is to leave a loss unnamed, which is
 /// the opposite of what it is for. Raising it for a *new* modification is the
 /// thing it forbids.
-const EXECUTED_MODIFIED_CEILING: usize = 9;
+/// It has been lowered once, for `VertexFormatWidenDecline`, and that is the
+/// shape a lowering is supposed to have: the modification was not reclassified,
+/// it was made impossible. The substitution now runs only where the shader's
+/// own declared read width proves it unobservable, and the two cases where it
+/// would have been observable refuse by name.
+const EXECUTED_MODIFIED_CEILING: usize = 8;
 
 /// Every `impl Decline`/`impl Refusal` in the crate, and what its worst arm
 /// costs the guest.
@@ -144,20 +149,24 @@ const ROWS: &[Row] = &[
     Row {
         file: "crates/reims-vgpu/src/backend/vulkan/engine/caches.rs",
         ty: "VertexFormatWidenDecline",
-        loss: Loss::ExecutedModified,
+        loss: Loss::Repaired,
         why: "a three-component vertex format the host does not offer is \
-              widened to its mandatory four-component sibling and the pipeline \
-              is built anyway, with `resolve` checking only that the wider read \
-              stays inside the stride. **Not retirable by proving the read \
-              identical**, which is the obvious attempt: a shader input \
-              declared `vec4` over a three-component attribute takes \
-              `(x,y,z,1.0)` from the format the guest asked for and \
+              widened to its mandatory four-component sibling. This was the \
+              census's worked example of a modification nothing checked — a \
+              shader input declared `vec4` over a three-component attribute \
+              takes `(x,y,z,1.0)` from the format the guest asked for and \
               `(x,y,z,<whatever those four bytes hold>)` from the substitute, \
-              because the fourth component is now supplied rather than \
-              defaulted. Identical only where every consumer reads three \
-              components or fewer, which nothing here checks. Retired by \
-              refusing the pipeline, or by reading the shader's declared input \
-              width and widening only when it is three or under",
+              because Vulkan supplies the fourth component instead of \
+              defaulting it. `resolve` now asks \
+              `runtime::spirv_vertex_input` how wide the shader's read at that \
+              location is and widens only where the answer makes the \
+              substitution unobservable: three components or fewer, or no \
+              input declared there at all. A `vec4` reader, and a declared \
+              type the walk cannot measure, are refused by name instead \
+              (`vertex_format_widen_read_as_four`, \
+              `vertex_format_widen_shader_unreadable`). So the line now \
+              reports a substitution that has been proved invisible, which is \
+              what keeps the reliance measurable on a host nobody here owns",
     },
     Row {
         file: "crates/reims-vgpu/src/backend/vulkan/engine/compute_execution.rs",

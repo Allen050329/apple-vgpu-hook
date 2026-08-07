@@ -90,6 +90,8 @@ pub mod scanout;
 /// SPIR-V set-0 binding relocation for metal2vulkan + internal Vulkan engine (Linux).
 pub mod spirv_bind;
 mod spirv_layout;
+/// How wide a translated vertex shader's stage-in reads are, per `Location`.
+pub mod spirv_vertex_input;
 /// Bounded structural evaluation of vertex clip positions (coverage proof).
 /// Deferred compute-writeback flush (flush-on-access; resident authoritative).
 pub mod storage_flush;

@@ -49,6 +49,7 @@ impl crate::observe::Decline for VertexFormatWidenDecline {
     }
 }
 use crate::backend::vulkan::translate;
+use crate::runtime::spirv_vertex_input::VertexInputWidths;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct AttrKey {
@@ -899,6 +900,10 @@ impl ObjectCaches {
         ctx: &DeviceContext,
         key: &PipelineKey,
         vert_module: vk::ShaderModule,
+        // The post-relocation words `vert_module` was built from. Read only to
+        // answer how wide this shader's stage-in reads are, and only on a host
+        // that substitutes a vertex format; see the resolution loop below.
+        vert_spirv: &[u32],
         frag_module: vk::ShaderModule,
         pipeline_layout: vk::PipelineLayout,
         render_pass: vk::RenderPass,
@@ -972,26 +977,45 @@ impl ObjectCaches {
         // optional, so the format the guest decoded is not automatically
         // bindable; `translate::support` either confirms it, substitutes the
         // mandatory wider sibling, or declines by name.
+        //
+        // A substitution is only invisible to a shader that does not read the
+        // component it oversupplies, so `resolve` asks what this shader
+        // declares at the attribute's location. Walked at most once per
+        // pipeline miss and only when some attribute really needs substituting:
+        // on a host that accepts every format — every host this project has run
+        // on — `vert_spirv` is never read at all.
+        let mut shader_inputs: Option<VertexInputWidths> = None;
         let mut attribute_formats = Vec::with_capacity(key.attrs.len());
         for attr in &key.attrs {
-            let binding = match ctx
-                .vertex_formats
-                .resolve(attr.format, attr.offset, attr.stride)
-            {
+            let binding = match ctx.vertex_formats.resolve(
+                attr.format,
+                attr.offset,
+                attr.stride,
+                || {
+                    shader_inputs
+                        .get_or_insert_with(|| VertexInputWidths::from_spirv(vert_spirv))
+                        .at(attr.location)
+                },
+            ) {
                 Ok(binding) => binding,
                 Err(translate_reason) => {
                     let err = DrawError::Unsupported(super::reason::DrawReason::VertexFormat(
                         translate_reason,
                     ));
+                    crate::observe::Emit::decline("vk_engine_vertex_format", &translate_reason)
+                        .fail_once(
+                            (u64::from(attr.location) << 32) | u64::from(translate_reason.value()),
+                        );
                     self.pipelines.insert_negative(key.clone(), err.clone());
                     return Err(err);
                 }
             };
             if let Some(narrow) = binding.widened_from {
-                // Fail-visible because a widened attribute is a real difference
-                // from what the guest asked for, even though it reads the same
-                // bytes: without this line a device-specific substitution is
-                // invisible in a bug report from a host nobody here owns.
+                // Fail-visible because a widened attribute is a device-specific
+                // difference from what the guest asked for, even though
+                // `resolve` has just established that no shader input can
+                // observe it: without this line a substitution is invisible in
+                // a bug report from a host nobody here owns.
                 let decline = VertexFormatWidenDecline {
                     from: narrow,
                     to: binding.format,
@@ -1320,7 +1344,9 @@ mod object_cache_tests {
         use crate::observe::Decline as _;
         let narrow = translate::vertex::vertex_layout(VertexAttributeFormat::UChar3Normalized).vk;
         let binding = translate::VertexFormatSupport::with_unsupported(&[narrow])
-            .resolve(VertexAttributeFormat::UChar3Normalized, 12, 32)
+            .resolve(VertexAttributeFormat::UChar3Normalized, 12, 32, || {
+                crate::runtime::spirv_vertex_input::InputWidth::Components(3)
+            })
             .unwrap();
         let decline = VertexFormatWidenDecline {
             from: binding.widened_from.unwrap(),

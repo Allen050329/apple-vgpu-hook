@@ -28,13 +28,25 @@
 //!   build the path — never to stop advertising the capability, unless *no host*
 //!   could ever serve it. [`crate::model::DEVICE_INFO_KEY_FRAMEBUFFER_READ`]
 //!   carries that rule and the pair of cases that establish it.
+//! - **The value is in contract, this backend has a path, and the path would
+//!   answer something else.** `VertexFormatWidenReadAsFour`,
+//!   `VertexFormatWidenShaderUnreadable` — the only two, and both belong to the
+//!   vertex-format widening fallback in [`super::support`]. What makes them a
+//!   class of their own is that the alternative to refusing is not losing the
+//!   work, it is *executing a different command*: the substitute format binds
+//!   fine and hands the shader a fourth component the guest's own format would
+//!   have defaulted to 1.0. Refusing is the faithful answer, and the repair is
+//!   not to widen the fallback but to narrow when it applies.
 //!
-//! **None of the second class has fired on any archived boot of this rig** —
-//! x86/PCI/Vulkan, driven under the window-drag and web-content probes as well
-//! as idle. Each names a real Metal feature this workload does not reach, which
-//! is the reading that makes leaving them open a measurement rather than a bet.
-//! It says nothing about the arm64 pathway, which this checkout cannot boot, and
-//! a firing is the signal that one has become worth building.
+//! **None of the second or third class has fired on any archived boot of this
+//! rig** — x86/PCI/Vulkan, driven under the window-drag and web-content probes
+//! as well as idle. For the second, each names a real Metal feature this
+//! workload does not reach, which is the reading that makes leaving them open a
+//! measurement rather than a bet. For the third the zero is structural on this
+//! rig and says less: no host here declines a three-component vertex format, so
+//! the fallback is never entered and neither variant is reachable. It says
+//! nothing about the arm64 pathway, which this checkout cannot boot, and a
+//! firing is the signal that one has become worth building.
 
 use crate::observe::Decline;
 
@@ -134,6 +146,25 @@ pub enum TranslateReason {
     /// buffer format, and no portable substitute exists for it.
     /// Payload is the `VkFormat` raw value.
     FormatNotVertexBuffer(i32),
+    /// The device declined a three-component vertex format, its four-component
+    /// substitute would fit, **and the shader reads all four components** — so
+    /// binding the substitute would supply a fourth component out of the vertex
+    /// buffer where the guest's own format defaults it to 1.0.
+    ///
+    /// Distinct from [`Self::FormatNotVertexBuffer`]: there a substitute does
+    /// not exist or does not fit, here it exists and fits and is still the
+    /// wrong answer. Payload is the `VkFormat` raw value the guest asked for.
+    VertexFormatWidenReadAsFour(i32),
+    /// The same substitution, declined because the shader's declared width
+    /// could not be read: an input type that is not a scalar or a vector, or a
+    /// module whose instruction stream did not parse.
+    ///
+    /// Its own slug because the repair is different. A firing of
+    /// [`Self::VertexFormatWidenReadAsFour`] is this device correctly refusing
+    /// something it cannot represent; a firing of this one means
+    /// [`crate::runtime::spirv_vertex_input`] met a module shape it does not
+    /// handle, and the repair is to teach it that shape.
+    VertexFormatWidenShaderUnreadable(i32),
     /// `MTLVisibilityResultMode` value outside the SDK enum. Note that `0`
     /// (`Disabled`) is **not** one of these: it is the guest disarming the
     /// query, which translates to "no query" rather than to a refusal.
@@ -178,6 +209,8 @@ impl crate::observe::Decline for TranslateReason {
             Self::UnknownSamplerBorderColor(_) => "unknown_sampler_border_color",
             Self::UnknownSwizzleSelector(_) => "unknown_swizzle_selector",
             Self::FormatNotVertexBuffer(_) => "format_not_vertex_buffer",
+            Self::VertexFormatWidenReadAsFour(_) => "vertex_format_widen_read_as_four",
+            Self::VertexFormatWidenShaderUnreadable(_) => "vertex_format_widen_shader_unreadable",
             Self::UnknownVisibilityResultMode(_) => "unknown_visibility_result_mode",
         }
     }
@@ -217,7 +250,9 @@ impl TranslateReason {
             | Self::UnknownSamplerBorderColor(v)
             | Self::UnknownVisibilityResultMode(v) => v,
             Self::UnknownSwizzleSelector(v) => u32::from(v),
-            Self::FormatNotVertexBuffer(v) => v as u32,
+            Self::FormatNotVertexBuffer(v)
+            | Self::VertexFormatWidenReadAsFour(v)
+            | Self::VertexFormatWidenShaderUnreadable(v) => v as u32,
         }
     }
 }
@@ -267,6 +302,8 @@ mod tests {
         TranslateReason::UnknownSamplerBorderColor(0),
         TranslateReason::UnknownSwizzleSelector(0),
         TranslateReason::FormatNotVertexBuffer(0),
+        TranslateReason::VertexFormatWidenReadAsFour(0),
+        TranslateReason::VertexFormatWidenShaderUnreadable(0),
         TranslateReason::UnknownVisibilityResultMode(0),
     ];
 
@@ -309,7 +346,9 @@ mod tests {
                 TranslateReason::UnknownSamplerBorderColor(_) => 21,
                 TranslateReason::UnknownSwizzleSelector(_) => 22,
                 TranslateReason::FormatNotVertexBuffer(_) => 23,
-                TranslateReason::UnknownVisibilityResultMode(_) => 24,
+                TranslateReason::VertexFormatWidenReadAsFour(_) => 24,
+                TranslateReason::VertexFormatWidenShaderUnreadable(_) => 25,
+                TranslateReason::UnknownVisibilityResultMode(_) => 26,
             }
         }
         let mut seen: Vec<usize> = ALL.iter().map(|r| index(*r)).collect();
