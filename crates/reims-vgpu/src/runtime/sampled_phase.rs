@@ -3,37 +3,58 @@
 //!
 //! # Why
 //!
-//! `sampled_us` is the largest column in `chain_phase` that nothing divides.
-//! `binds_us` is larger and already splits into [`crate::runtime::bind_phase`];
-//! `engine_us` is larger and already splits into `draw_phase`, whose twelve
-//! phases sum to it exactly. On a driven x86/PCI second, coverage-instrumented:
-//!
-//! ```text
-//! chain_phase  binds_us=115363  engine_us=88749  sampled_us=54106  store_us=14895
-//! bind_phase   vertex_us=65972  fragment_us=43398  attrs_us=732
-//! ```
-//!
-//! So the sampled phase is 17% of the draw and 3.6x the Store routing, and one
-//! `sampled_us` bar could not choose between the four things inside it. That is
-//! the same mistake `draw_phase`'s doc records having made once with `setup_us`,
-//! and the same one `bind_phase` was built to undo for `binds_us`.
-//!
 //! A stale comment inside `push_tex` asked for exactly this division — it
 //! described a "measure-only setup_tex sub-split" against a post-resolve stats
 //! scan that no longer exists. This is that measurement, against the code as it
-//! is now.
+//! is now. One `sampled_us` bar could not choose between the four things inside
+//! it, which is the mistake `draw_phase`'s doc records having made once with
+//! `setup_us` and the one `bind_phase` undid for `binds_us`.
+//!
+//! # This column is fourth, and reading it as second is a measured trap
+//!
+//! It is **not** the largest undivided column, and the boot that said it was had
+//! this device's own coverage instrumentation attached. Both boots below are
+//! driven x86/PCI Safari drags on the same tree; the only difference is the
+//! instrumentation, and it inverts the ranking of the two columns nothing
+//! divided:
+//!
+//! ```text
+//!                   engine_us  binds_us  store_us  sampled_us
+//! coverage boot         88749    115363     14895       54106
+//! clean boot           106083     51234     38314       21487
+//! ```
+//!
+//! `sampled_us` reads 2.5x high under coverage and `store_us` 2.5x low, so the
+//! instrumented boot ranks the sampled phase 3.6x *above* the Store routing and
+//! the clean boot ranks it 1.8x *below*. `AGENTS.md` warns that contention
+//! "inverts the ranking between the device's two largest costs"; coverage
+//! instrumentation does the same to two smaller ones, and the log is well-formed
+//! and self-consistent either way, so nothing in it says which you have. Rank
+//! columns from a clean boot only. `scripts/runtime-dead`'s reports answer "what
+//! never ran", which survives instrumentation; they do not answer "what costs
+//! most", which does not.
+//!
+//! So on a clean driven second `sampled_us` is 21 ms of a 249 ms chain — 8.6%,
+//! fourth behind `engine_us`, `binds_us` and `store_us`. The split still earns
+//! its line, because it says where inside those 21 ms to look and the answer is
+//! lopsided enough to act on: `resolve_us` is 72% of the phase and the other
+//! three share 25%.
 //!
 //! # Why these split points
 //!
 //! Same rule the other two use: split where the fix changes, not where the code
 //! happens to be indented.
 //!
-//! | part | what it brackets | what would fix it |
-//! |---|---|---|
-//! | [`Part::Lookup`] | `lookup_list_entry` + `resolve_texture_view`, per texture bind | caching the guest object-list walk and the type-8 view descriptor read |
-//! | [`Part::Resolve`] | the attachment-alias branch and `resolve_sampled_source`, per texture bind | the sampled content cache and the gather witness |
-//! | [`Part::Samplers`] | `load_vulkan_sampler` over the record's own sampler binds | a sampler object cache keyed on the guest sampler ref |
-//! | [`Part::Reflect`] | the AIR constexpr static-sampler walk and the residual SPIR-V `sampler_bindings` scan | computing both at translate time and holding them in `m2v_cache` |
+//! The `us/s` column is twelve steady-state windows of the clean driven boot
+//! above, and it is why the split was worth building: one lever carries the
+//! phase and the other three together do not reach a sixth of it.
+//!
+//! | part | us/s | % | what it brackets | what would fix it |
+//! |---|---|---|---|---|
+//! | [`Part::Resolve`] | 15498 | 72.1 | the attachment-alias branch and `resolve_sampled_source`, per texture bind | the sampled content cache and the gather witness |
+//! | [`Part::Reflect`] | 2556 | 11.9 | the AIR constexpr static-sampler walk and the residual SPIR-V `sampler_bindings` scan | computing both at translate time and holding them in `m2v_cache` |
+//! | [`Part::Lookup`] | 1526 | 7.1 | `lookup_list_entry` + `resolve_texture_view`, per texture bind | caching the guest object-list walk and the type-8 view descriptor read |
+//! | [`Part::Samplers`] | 1263 | 5.9 | `load_vulkan_sampler` over the record's own sampler binds | a sampler object cache keyed on the guest sampler ref |
 //!
 //! The last two are one part on purpose. They are different data structures —
 //! a small reflection `Vec` and a full SPIR-V word array — but they answer the
@@ -50,6 +71,16 @@
 //! axes and pushes the engine resources, none of which is bracketed. Divide
 //! against `chain_phase`'s `sampled_us` by hand; what the parts do not cover is
 //! the answer to "is there a fifth".
+//!
+//! On the clean boot they cover **97.0%** — 20844 of 21487 µs/s — so the answer
+//! is no, and the 3.0% is the unbracketed reflection read and pushes. Had a
+//! computed `rest_us` been emitted instead, that 3.0% would have been reported
+//! as a fifth cost centre with a name, which is the failure mode leaving it out
+//! avoids.
+//!
+//! `sampled` equals `chain_phase`'s `chains` in every window of that boot, so
+//! every draw chain reaches this phase; a chain declining earlier would show up
+//! here as a gap between the two, and none did.
 //!
 //! Like every phase census here it reports no loss. A slow resolve is not a
 //! declined one, and the decline paths inside the phase keep their own typed
