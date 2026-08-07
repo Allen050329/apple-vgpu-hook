@@ -37,6 +37,31 @@
 //! This module owns none of that. It takes an [`AnnounceStamp`] hook the device
 //! layer installs, so the engine keeps knowing nothing about `BoundDevice`.
 //!
+//! # What it measured
+//!
+//! Back-to-back on one machine against the parent commit, testufo animating,
+//! 30 census windows each:
+//!
+//! ```text
+//!                      before     after
+//! presents/s             44.0      64.0     +45%
+//! draws/s              3206.0    3346.5
+//! busy_us/s          909958.5  830495.0      -9%
+//! max_tranche_us      37250.5   25458.0     -32%
+//! ```
+//!
+//! The presents ranges do not overlap — 41-47 against 54-69 — which is what
+//! makes this readable at all, because the same config measured across an hour
+//! of other work read 51, 53 and 63. Take a reading from this rail only against
+//! a run of its own parent on the same quiet machine.
+//!
+//! **The drain worker's block did not go away, and the gain is not from its
+//! removal.** `fence/s` still tracks `flushes/s` (399 -> 421), because root slot
+//! 0 stays on the blocking rail. What changed is what that block costs: by the
+//! time a root stamp quiesces, the child stamps ahead of it have already ordered
+//! the same copies on the queue, so the wait finds them done. The worker does 9%
+//! less work and delivers 45% more frames.
+//!
 //! # Why a timeline semaphore rather than a fence
 //!
 //! A second waiter cannot use the ring's fences. `ResourcePools` owns every one
