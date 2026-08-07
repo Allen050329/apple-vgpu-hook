@@ -771,6 +771,35 @@ fn packet_snapshot_len(header: &[u8], available: u32, ring_capacity: u32) -> u32
 /// *shape* census and the *verdict* census answer different questions: this one
 /// says which commands carry records and how many, once per shape, and is what
 /// a reader compares a new workload against.
+///
+/// # How many of those orderings this device actually violates
+///
+/// Second driven x86/PCI/Vulkan boot, same Safari-drag workload:
+///
+/// ```text
+/// packet_stamps_none      31057
+/// packet_stamps_present    2863
+/// packet_stamp_wait_met    1658
+/// packet_stamp_wait_unmet  1278      44 % of every wait the guest sent
+/// ```
+///
+/// So this is not a rare race that the drain order happens to get right. Nearly
+/// half of all waits are unsatisfied at the moment this device runs the packet
+/// anyway, on the four shapes the fail log named:
+///
+/// ```text
+/// 0x37 EXEC_INDIRECT2  ch1   index=2  awaited=0x12   current=0xe    behind=4
+/// 0x37 EXEC_INDIRECT2  ch1   index=4  awaited=0x3    current=0x2    behind=1
+/// 0x22 UNMAP_MEMORY    ch2   index=4  awaited=0x1    current=0x0    behind=1
+/// 0x20 DELETE_TASK     root  index=2  awaited=0x1ce  current=0x1cd  behind=1
+/// ```
+///
+/// Two readings matter. First, `behind` is *small* — one submission, four at the
+/// worst. The producing work is already queued or about to be, which is what
+/// says a deferral would clear in the next tranche rather than parking a channel
+/// indefinitely. Second, the root `DELETE_TASK` waiting one submission behind a
+/// child FIFO's slot is the use-after-free named above, caught in the act: the
+/// task is torn down while the work that sources it has not been drained.
 fn note_packet_stamp_records(opcode: u16, waits: &[StampWait]) {
     if waits.is_empty() {
         note_store_route("packet_stamps_none");
@@ -972,6 +1001,46 @@ fn read_ring_bytes<M: HostMemory>(
     Ok(out)
 }
 
+/// Report a completion stamp that moves its slot **backwards**.
+///
+/// [`write_stamp`] writes the packet header's `completion_stamp` field into the
+/// slot without looking at what is already there, so a packet carrying zero — or
+/// any value behind the slot — rewinds the guest's fence. That is not a cosmetic
+/// slip: [`StampWait`] is decided against this same slot, so a rewind unsatisfies
+/// every wait between the old value and the new one, and the guest's own polls
+/// see work it had been told was finished become unfinished.
+///
+/// Which makes it the first thing to rule out before reading an unmet-wait count
+/// as an ordering problem: a device rewinding its own fences produces unmet waits
+/// that have nothing to do with drain order. Same-value writes are the expected
+/// case and stay quiet — a packet that does not signal repeats the slot's value
+/// rather than clearing it, and repeating is idempotent.
+fn note_stamp_direction<H: HostMemory + HostOps>(host: &H, gpa: u64, index: u32, value: u32) {
+    let Ok(current) = crate::runtime::host::read_u32(host, gpa) else {
+        return;
+    };
+    if value == current {
+        note_store_route("stamp_write_repeat");
+        return;
+    }
+    // The same signed wrapping difference `StampWait::satisfied_by` uses, so the
+    // reading here and the wait's verdict cannot disagree about which way round
+    // two values are.
+    if (value.wrapping_sub(current) as i32) > 0 {
+        note_store_route("stamp_write_forward");
+        return;
+    }
+    note_store_route("stamp_write_backward");
+    if crate::observe::first_sight("stamp_write_backward", u64::from(index)) {
+        crate::observe::fail(format!(
+            "stamp_write_backward index={index} was={current:#x} now={value:#x} \
+             back={} (the guest's fence for this slot moves backwards, which \
+             unsatisfies every wait between the two values)",
+            current.wrapping_sub(value)
+        ));
+    }
+}
+
 /// Write stamp value to FIFO base page slot and set status bit.
 pub fn write_stamp<H: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -1005,6 +1074,7 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     };
     let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;
     let page_size = state.page_size() as usize;
+    note_stamp_direction(host, gpa, index, stamp_value);
     if gpa_map::write_u32(host, gpa, stamp_value, page_size).is_ok() {
         // The guest's fence has moved. Everything it allocated for the work this
         // stamp completes may be freed from here on, so any deferred window

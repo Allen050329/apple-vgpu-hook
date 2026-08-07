@@ -203,7 +203,7 @@ const ROWS: &[(&str, usize, Guarded, &str)] = &[
     ),
     (
         "reims-vgpu/src/runtime/drain/mod.rs",
-        13,
+        14,
         Guarded::EmitsOnly,
         "packet and doorbell reporters plus cursor_glyph_fail and its six \
          callers. cursor_glyph_fail is the best-shaped site in the tree and \
@@ -219,7 +219,10 @@ const ROWS: &[(&str, usize, Guarded, &str)] = &[
          rule in the tree: that function's *return value* is the count of \
          unmet waits, and it is accumulated outside both latched blocks. A \
          latch pulled up around the `unmet += 1` would make the caller's \
-         verdict depend on whether this shape had been seen before",
+         verdict depend on whether this shape had been seen before. The \
+         fourteenth is `note_stamp_direction`, which returns `()` and whose \
+         three counters are all raised outside the latch, so only the line for \
+         a slot moving backwards dedupes",
     ),
     (
         "reims-vgpu/src/runtime/draw/metal_icb.rs",
