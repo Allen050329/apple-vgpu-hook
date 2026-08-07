@@ -64,17 +64,34 @@
 //! gw_audit_unsound          0
 //! ```
 //!
-//! The guest hardly writes the windows it samples. **This device writes them**,
-//! and every such write costs the next bind a full re-gather — 68 % of that
-//! rail's misses on the same boot, against 32 % that were a retained image the
-//! cache had dropped. So the witness is not being over-cautious and the cache
-//! is not the lever; the device is writing a surface into guest pages through
-//! the deferred writeback and then reading those same pages back to sample
-//! them. `gw_audit_unsound` at 0 says it is at least sound while doing it.
+//! The guest hardly writes the windows it samples; something on this device's
+//! side is what refuses them, and each refusal costs the next bind a full
+//! re-gather — 68 % of that rail's misses on the same boot, against 32 % that
+//! were a retained image the cache had dropped. So the cache is not the lever.
+//! `gw_audit_unsound` at 0 says the witness stayed sound throughout.
 //!
-//! Both halves are load-bearing and neither may be weakened to raise the vouch
-//! rate: dropping the host-write half would vouch for exactly these 5156 binds,
-//! and they are the ones whose bytes really did move.
+//! **`gw_refused_host_write` is not yet "this device wrote these pages".**
+//! [`crate::runtime::host_writes::HostWrites::wrote_any_since`] answers "written"
+//! for four different reasons and only one of them is a write that landed in the
+//! window: the other three are its fail-closed rule — a writer that named no
+//! pages, a ring too short to still hold the writes being asked about, and a
+//! mapping-named write whose page list has since moved. Three of those are
+//! bookkeeping this device could fix without changing what it writes at all.
+//! The `gw_hw_*` routes below split them, and until a boot reads them the 5156
+//! is an upper bound on real overlap rather than a measurement of it:
+//!
+//! | route | meaning |
+//! |---|---|
+//! | `gw_hw_quiet` | nothing recorded touched the window — the vouchable case |
+//! | `gw_hw_overlap` | a recorded write names one of these pages; the bytes moved |
+//! | `gw_hw_unnamed` | a writer could not say where it landed, so all readers assume it |
+//! | `gw_hw_aged` | the ring no longer holds the writes this reader asks about |
+//! | `gw_hw_unresolvable` | a mapping-named write whose page list cannot be rebuilt |
+//!
+//! Both halves stay load-bearing and neither may be weakened to raise the vouch
+//! rate. Whatever the split says, the repair is to make the record *sharper* —
+//! a writer naming its pages rules itself out of windows it never touched —
+//! never to let an undecidable read as quiet.
 //!
 //! # A device-wide `gw_refused_guest_store` is the hypervisor rail, not the guest
 //!
@@ -420,8 +437,13 @@ struct HostWriteCounts {
     /// `HostWrites::epoch()` now, to be recorded for the next bind to ask against.
     pages_epoch: u64,
     /// Whether this device wrote any of this window's pages since the previous
-    /// bind. `None` when there is no previous bind to ask about.
-    pages_wrote: Option<bool>,
+    /// bind, and on what grounds. `None` when there is no previous bind to ask
+    /// about.
+    ///
+    /// Carried as the verdict rather than a `bool` because three of its four
+    /// non-quiet values are this device declining to rule the write out rather
+    /// than a write that landed here, and the three want different repairs.
+    pages_wrote: Option<crate::runtime::host_writes::HostWriteVerdict>,
 }
 
 /// The resolved window one gather will read.
@@ -601,6 +623,15 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
             .previous_pages_epoch(&key)
             .map(|since| state.host_writes.wrote_any_since(state, since, window.gpas)),
     };
+    // Report the host-write half's grounds, not just its answer. Three of its
+    // four non-quiet values are this device declining to rule a write out rather
+    // than one that landed here, and they want different repairs — name the
+    // writer's pages, widen the ring, or stop writing the window at all. Taken
+    // for every bind that had a previous one to ask about, so the split covers
+    // the vouched binds too and `gw_hw_quiet` is the denominator.
+    if let Some(verdict) = counts.pages_wrote {
+        note_store_route(verdict.route());
+    }
     // A generation is issued from the device-global counter and never reused, so
     // it is taken before the witness runs and spent only if the witness refuses
     // to vouch for the previous one. An unspent generation is not a leak: the
@@ -799,17 +830,20 @@ fn observe<M: crate::runtime::host::HostOps>(
     // A generation of 0 on either side is "cannot tell": the token is unarmed,
     // was released with its pages, or has not survived the two harvests the
     // dirty adapter needs before it can answer at all.
+    // `pages_wrote == None` cannot happen beside a live entry, and reading a
+    // missing answer as quiet would vouch on the strength of not having asked.
+    // Taken once: the vouch arm and the refusal arm below want exact complements
+    // of this, and two spellings of it is one edit away from a witness that
+    // vouches and reports a host write in the same breath.
+    let host_quiet = pages_wrote.is_some_and(|seen| !seen.wrote());
     let verdict = if gen == 0 || entry.gen == 0 {
         GatherVerdict::Unarmed
-    } else if gen == entry.gen && pages_wrote == Some(false) {
-        // `pages_wrote == None` cannot happen beside a live entry, and reading a
-        // missing answer as quiet would vouch on the strength of not having
-        // asked.
+    } else if gen == entry.gen && host_quiet {
         GatherVerdict::Vouched
     } else {
         GatherVerdict::Refused {
             guest_wrote: gen != entry.gen,
-            host_wrote_pages: pages_wrote != Some(false),
+            host_wrote_pages: !host_quiet,
         }
     };
     let vouched = matches!(verdict, GatherVerdict::Vouched);
@@ -894,7 +928,7 @@ mod tests {
     /// This device wrote none of the window's pages since the previous bind.
     const QUIET: HostWriteCounts = HostWriteCounts {
         pages_epoch: 1,
-        pages_wrote: Some(false),
+        pages_wrote: Some(crate::runtime::host_writes::HostWriteVerdict::Quiet),
     };
 
     /// One bind, discarding the audit — for the tests that are about the verdict.
@@ -1032,7 +1066,7 @@ mod tests {
             KEY,
             one_page(&GPAS, &runs),
             HostWriteCounts {
-                pages_wrote: Some(true),
+                pages_wrote: Some(crate::runtime::host_writes::HostWriteVerdict::Overlap),
                 ..QUIET
             },
             12,

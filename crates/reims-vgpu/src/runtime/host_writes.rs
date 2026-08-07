@@ -84,6 +84,53 @@ enum Wrote {
     Unknown,
 }
 
+/// Why [`HostWrites::wrote_any_since`] could not call a window quiet.
+///
+/// Four causes used to share one `true`, and only the first of them means the
+/// bytes under the reader's pages actually moved. The other three are this
+/// type's fail-closed rule firing — a correct answer to "can you rule this out",
+/// and a very different thing to report. A boot that reads mostly `Unnamed` says
+/// its writers are not naming their pages; one that reads mostly `Aged` says
+/// [`RING`] is too small for the write rate; one that reads mostly `Overlap`
+/// says the device really is writing the windows it samples, and only then is
+/// there nothing to reclaim here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostWriteVerdict {
+    /// Nothing this device recorded touched these pages.
+    Quiet,
+    /// A recorded write names one of these pages — the bytes moved.
+    Overlap,
+    /// A writer that could not say which pages it landed in, so every reader
+    /// older than it must assume its own.
+    Unnamed,
+    /// The ring no longer holds the writes this reader is asking about, so it
+    /// cannot be told that nothing touched it.
+    Aged,
+    /// A mapping-named write whose page list can no longer be reconstructed:
+    /// the mapping is gone, or has been re-pointed since the write named it.
+    Unresolvable,
+}
+
+impl HostWriteVerdict {
+    /// True for everything except [`Self::Quiet`] — the sense the caller needs
+    /// when it is deciding whether to vouch, spelled once so a new variant
+    /// cannot be silently read as quiet.
+    pub fn wrote(self) -> bool {
+        !matches!(self, Self::Quiet)
+    }
+
+    /// Census route naming this verdict, for the witness that reports it.
+    pub fn route(self) -> &'static str {
+        match self {
+            Self::Quiet => "gw_hw_quiet",
+            Self::Overlap => "gw_hw_overlap",
+            Self::Unnamed => "gw_hw_unnamed",
+            Self::Aged => "gw_hw_aged",
+            Self::Unresolvable => "gw_hw_unresolvable",
+        }
+    }
+}
+
 /// Recent host writes into guest RAM, newest last.
 #[derive(Default, Debug)]
 pub struct HostWrites {
@@ -150,19 +197,23 @@ impl HostWrites {
             .unwrap_or(self.epoch);
     }
 
-    /// Has this device written any of `pages` since `since`?
+    /// Has this device written any of `pages` since `since`, and if so on what
+    /// grounds?
     ///
-    /// `since` is a value previously returned by [`Self::epoch`]. Answers `true`
-    /// for everything it cannot decide: a dropped ring entry, an unknown write,
-    /// or a mapping whose page list has moved since the write named it.
+    /// `since` is a value previously returned by [`Self::epoch`]. Everything it
+    /// cannot decide answers as written, and names which of the three
+    /// undecidables it was: a dropped ring entry, an unnamed write, or a mapping
+    /// whose page list has moved since the write named it. Only
+    /// [`HostWriteVerdict::Overlap`] says a recorded write actually covers one
+    /// of `pages`.
     pub fn wrote_any_since(
         &self,
         state: &crate::model::DeviceState,
         since: u64,
         pages: &[u64],
-    ) -> bool {
+    ) -> HostWriteVerdict {
         if since < self.answers_from {
-            return true;
+            return HostWriteVerdict::Aged;
         }
         let mut asked: Option<BTreeSet<u64>> = None;
         for (epoch, what) in self.recent.iter().rev() {
@@ -171,10 +222,10 @@ impl HostWrites {
             }
             let want = asked.get_or_insert_with(|| pages.iter().copied().collect());
             match what {
-                Wrote::Unknown => return true,
+                Wrote::Unknown => return HostWriteVerdict::Unnamed,
                 Wrote::Pages(written) => {
                     if written.iter().any(|p| want.contains(p)) {
-                        return true;
+                        return HostWriteVerdict::Overlap;
                     }
                 }
                 Wrote::Mapping {
@@ -184,22 +235,22 @@ impl HostWrites {
                     let Some(m) = state.mappings.get(mid) else {
                         // The mapping is gone, so its page list cannot be
                         // reconstructed to be ruled out.
-                        return true;
+                        return HostWriteVerdict::Unresolvable;
                     };
                     if m.map_generation != *map_generation {
-                        return true;
+                        return HostWriteVerdict::Unresolvable;
                     }
                     let shift = state.page_shift;
                     if m.page_entries.iter().any(|&e| {
                         crate::contract::iosurface_pages::entry_gpa_shift(e, shift)
                             .is_some_and(|gpa| want.contains(&gpa))
                     }) {
-                        return true;
+                        return HostWriteVerdict::Overlap;
                     }
                 }
             }
         }
-        false
+        HostWriteVerdict::Quiet
     }
 }
 
@@ -216,8 +267,14 @@ mod tests {
         let mut w = HostWrites::default();
         let mark = w.epoch();
         w.note_pages(vec![9 * P, 10 * P]);
-        assert!(!w.wrote_any_since(&state, mark, &[3 * P, 4 * P]));
-        assert!(w.wrote_any_since(&state, mark, &[4 * P, 10 * P]));
+        assert_eq!(
+            w.wrote_any_since(&state, mark, &[3 * P, 4 * P]),
+            HostWriteVerdict::Quiet
+        );
+        assert_eq!(
+            w.wrote_any_since(&state, mark, &[4 * P, 10 * P]),
+            HostWriteVerdict::Overlap
+        );
     }
 
     /// The reader asks about writes *after* its own mark, so the write it
@@ -229,9 +286,15 @@ mod tests {
         let mut w = HostWrites::default();
         w.note_pages(vec![4 * P]);
         let after = w.epoch();
-        assert!(!w.wrote_any_since(&state, after, &[4 * P]));
+        assert_eq!(
+            w.wrote_any_since(&state, after, &[4 * P]),
+            HostWriteVerdict::Quiet
+        );
         w.note_pages(vec![4 * P]);
-        assert!(w.wrote_any_since(&state, after, &[4 * P]));
+        assert_eq!(
+            w.wrote_any_since(&state, after, &[4 * P]),
+            HostWriteVerdict::Overlap
+        );
     }
 
     /// A write that could not name its pages must invalidate everything, and a
@@ -243,19 +306,28 @@ mod tests {
         let mut w = HostWrites::default();
         let mark = w.epoch();
         w.note_unknown();
-        assert!(w.wrote_any_since(&state, mark, &[999 * P]));
+        assert_eq!(
+            w.wrote_any_since(&state, mark, &[999 * P]),
+            HostWriteVerdict::Unnamed,
+            "a writer that named no pages must be reported as unnamed and not as \
+             a write that landed in this window"
+        );
 
         let mut w = HostWrites::default();
         let stale = w.epoch();
         for i in 0..(RING as u64 + 5) {
             w.note_pages(vec![(100 + i) * P]);
         }
-        assert!(
+        assert_eq!(
             w.wrote_any_since(&state, stale, &[3 * P]),
+            HostWriteVerdict::Aged,
             "a mark older than the ring must not be answered from what is left of it"
         );
         let fresh = w.epoch();
-        assert!(!w.wrote_any_since(&state, fresh, &[3 * P]));
+        assert_eq!(
+            w.wrote_any_since(&state, fresh, &[3 * P]),
+            HostWriteVerdict::Quiet
+        );
     }
 
     /// A mapping-named write is resolved through the mapping's live page list, so
@@ -274,16 +346,23 @@ mod tests {
         let mut w = HostWrites::default();
         let mark = w.epoch();
         w.note_mapping(4, generation);
-        assert!(w.wrote_any_since(&state, mark, &[7 * P]));
-        assert!(!w.wrote_any_since(&state, mark, &[8 * P]));
+        assert_eq!(
+            w.wrote_any_since(&state, mark, &[7 * P]),
+            HostWriteVerdict::Overlap
+        );
+        assert_eq!(
+            w.wrote_any_since(&state, mark, &[8 * P]),
+            HostWriteVerdict::Quiet
+        );
 
         // Re-point the mapping at a page the write never touched. The write's
         // page set is no longer reconstructible, so it can rule out nothing.
         let m = state.mappings.get_mut(&4).expect("still mapped");
         m.page_entries = vec![(8u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
         m.map_generation = generation.wrapping_add(1);
-        assert!(
+        assert_eq!(
             w.wrote_any_since(&state, mark, &[3 * P]),
+            HostWriteVerdict::Unresolvable,
             "a write named by a mapping that has since moved must not be ruled out"
         );
     }
