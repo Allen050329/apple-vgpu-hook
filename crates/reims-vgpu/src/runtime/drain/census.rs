@@ -1394,8 +1394,45 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         // second census.
         emit_chain_phase();
         emit_object_cache_levels();
+        emit_guest_import_levels();
     }
 }
+
+/// How many RAMBlocks this device has imported, and how many bytes they cover,
+/// as **levels** rather than per-window deltas.
+///
+/// This is the reading that says whether the one-import-per-RAMBlock model held.
+/// The count should be one or two for a whole boot and flat across every window;
+/// a count that tracks the workload is the per-resource import the model exists
+/// to avoid, which `VK_EXT_external_memory_host` does not guarantee works twice
+/// over one allocation and which would pay the driver's page pinning thousands
+/// of times a second for an answer that never changes.
+///
+/// Flat is therefore the healthy reading and a rise is the alarm — the opposite
+/// polarity to most lines here, which is why the count is emitted every window
+/// rather than once at import time. A single line at import time could not
+/// distinguish "imported once" from "imported once per window".
+///
+/// `bytes` is the same level and is not a rate: it is guest RAM the device can
+/// currently reach, so it tracks the count and not the workload.
+#[cfg(feature = "backend-vulkan")]
+fn emit_guest_import_levels() {
+    let (bytes, count) = crate::backend::vulkan::engine::guest_import_census();
+    // An engine that never imported emits nothing, so a host on a negative
+    // `host_pointer` rung — or a boot before the first guest window — costs no
+    // line, and a zero here always means the copying rails rather than silence.
+    if count == 0 {
+        return;
+    }
+    crate::observe::off(format!(
+        "guest_import_levels (levels, not per-interval) ramblocks={count} \
+         mib={} (flat is healthy; a rising count is a per-resource import)",
+        bytes / (1024 * 1024),
+    ));
+}
+
+#[cfg(not(feature = "backend-vulkan"))]
+fn emit_guest_import_levels() {}
 
 /// Live entry counts of the caches that hold one entry per distinct guest
 /// object, as **levels** rather than per-window deltas.
