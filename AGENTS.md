@@ -398,13 +398,24 @@ SSH on `localhost:2222` (`macos-vm` in `~/.ssh/config`) for its whole life, so a
 its own boot:
 
 ```sh
+pkill -f 'qemu-system-x86_64.*reims-vgpu'; rm -f /tmp/reims-vgpu-fail.log
 vm/boot-x86.sh --device reims-vgpu-pci --testing &     # ~7 min before its own hard kill
-ssh macos-vm true                                      # wait for the guest to answer
+until [ -f /tmp/reims-vgpu-fail.log ] && ssh macos-vm true; do sleep 5; done
 scripts/window-drag-probe/window-drag-probe.sh --seconds 25 --app Safari
 ```
 
 That produces real window-server compositing, against 0 draws/s idle. The probe refuses a verdict if
 the window never moved, so a run that produced no motion cannot be mistaken for a slow device.
+
+**Wait on the fail log, not on SSH alone.** The previous boot's QEMU outlives its script by long
+enough to still hold `localhost:2222`, and a new boot that loses that race dies on the `hostfwd` rule
+alone — the script prints one line about it and every other line looks like a normal start. `ssh
+macos-vm true` then answers at once, from the **old** VM, and the probe drives the guest running the
+*previous build*. It fails in the direction that hides it: you get a driven boot, self-consistent
+counters and a screenshot of a working desktop, all from the binary you were trying to replace.
+Only a live device creates `/tmp/reims-vgpu-fail.log`, so waiting on it catches the case, and
+killing any surviving QEMU first avoids the race. Confirm afterwards that the log is a boot's and
+not the test suite's, by the presence of `store_routes`/`present_page_identity`.
 
 ### A boot measured next to your own subagents measures the contention
 
