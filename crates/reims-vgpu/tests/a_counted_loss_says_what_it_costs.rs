@@ -163,10 +163,14 @@ const ROWS: &[(&str, Counted, &str)] = &[
         Counted::Denominator,
         "the denominator of `note_pass_extent_coverage`'s bands, not an alarm. \
          Those bands answer whether ignoring the extent lost anything, and they \
-         have: `pass_extent_full` takes 11826 of 11827 scored passes on \
-         arm64/Vulkan and every scored pass on x86. The extent is the attachment \
-         restated. This is the only one of the seventeen that fires in volume — \
-         1615 in a window — and it is the one that costs nothing",
+         have, for all but a handful of passes a boot: `pass_extent_full` takes \
+         11826 of 11827 scored passes on arm64/Vulkan and 10537 of 10540 on x86 \
+         — the extent is the attachment restated. The three that are not full \
+         are a real sub-rect this device renders past, and they are priced in \
+         `note_pass_extent_coverage`'s own doc rather than here, because what \
+         they cost is a property of the bands and not of this count. This is \
+         the only one of the seventeen that fires in volume — 1615 in a window \
+         — and for 99.97 % of passes it costs nothing",
     ),
     (
         "render_color_subresource_unsupported",

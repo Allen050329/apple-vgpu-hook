@@ -321,37 +321,49 @@ pub(super) fn note_pass_extent_for_slot(
 /// at `full` means the extent is the surface and there is nothing to bound, and
 /// one with mass below `le50` is a writeback that could be halved.
 ///
-/// # The answer is `full`, and it closes the question
+/// # The answer is `full` for all but a handful, which is not the same as all
 ///
-/// Driven x86/Vulkan boot, 60 s Safari drag, once both resolve arms scored:
+/// Driven arm64/Vulkan boot, 60 s Safari drag, once both resolve arms scored:
 ///
 /// ```text
 /// pass_extent_full 11826      pass_extent_le5 1      every other band 0
 /// ```
 ///
-/// **The extent is the attachment, 99.99 % of the time.** The small numbers in
+/// Driven x86/Vulkan boot, 25 s Safari drag:
+///
+/// ```text
+/// pass_extent_full 10537      pass_extent_le5 2      pass_extent_le50 1
+/// ```
+///
+/// **The extent is the attachment, 99.97 % of the time.** The small numbers in
 /// the log — 242x5, 1920x24, the many under 110 px — are small *surfaces*, not
 /// sub-rects of large ones. The window server states `renderTargetWidth/Height`
 /// on nearly every pass and states them equal to the target it is rendering
 /// into.
 ///
-/// Two things follow, and both are conclusions rather than leads:
+/// One conclusion and one open lead:
 ///
 /// - **There is nothing to bound.** The pass extent is not a second source of
 ///   damage; it is the attachment's own geometry restated on the wire. That
 ///   earlier conclusion — a damage-bounded flush needs a different source of
 ///   damage than the draw stream, and none is currently decoded —
-///   survives having this one decoded and measured. Do not re-open damage
-///   bounding on the strength of the raw extent values in the fail log — they
-///   look like damage and are not.
-/// - **Ignoring the extent is not a defect.** Every consumer here uses the
-///   attachment's extent, which is what the guest asked for. See
-///   [`note_pass_target_extent`], whose "only a defect when the two differ" is
-///   now answered: they do not differ.
+///   survives having this one decoded and measured. Three passes in a boot
+///   cannot found a damage rail. Do not re-open damage bounding on the strength
+///   of the raw extent values in the fail log — they look like damage and are
+///   not.
+/// - **The handful is a real sub-rect, and this device renders past it.** The
+///   x86 reading above is what this doc previously recorded as "every scored
+///   pass on x86/Vulkan is full"; it is not, and the bands are what said so.
+///   A pass stating a 50 % or 5 % extent with `loadAction = Clear` has its whole
+///   attachment cleared here, which destroys content outside the rect the guest
+///   named — the class two arms of this same decode now refuse rather than
+///   commit. It is **not** fixed by mapping the extent onto Vulkan's
+///   `renderArea`: `loadOp` applies inside that area, but the spec leaves the
+///   contents outside it undefined rather than preserved, so the mapping that
+///   looks equivalent is not one. Establishing what Metal guarantees outside a
+///   constrained render target comes before any change here.
 ///
-/// The bands stay. They are what would say so if a future guest build, a
-/// different app, or the arm64 pathway ever states a real sub-rect, and nothing
-/// else in the device would notice.
+/// The bands stay, and they are now a live reading rather than a healthy zero.
 ///
 /// A pass that states no extent at all is not scored — there is no fraction to
 /// take — and neither is one whose attachment has no geometry yet.
@@ -394,7 +406,9 @@ pub(super) fn pass_extent_band(pct: u64) -> usize {
 /// decide whether ignoring the extent lost anything. That reader is now
 /// `note_pass_extent_coverage`, it has the geometry, and it has answered:
 /// `pass_extent_full` takes 11 826 of 11 827 scored passes on arm64/Vulkan and
-/// every scored pass on x86/Vulkan. The extent is the attachment restated.
+/// 10 537 of 10 540 on x86/Vulkan. The extent is the attachment restated, for
+/// all but a handful of passes a boot — see that function for what the handful
+/// costs and why it is not fixed by the obvious mapping.
 ///
 /// The line is gone because it was reporting a non-loss on the channel reserved
 /// for lost guest work, and doing so at 85 % of that channel's whole volume —
