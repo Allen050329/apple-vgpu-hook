@@ -917,6 +917,11 @@ pub enum EncodeStatus {
     /// Metal feature not built (vulkan boot), or nothing landed on the Vulkan
     /// rail — `exec` treats both as "honour the pass clear instead".
     NoMetal(&'static str),
+    /// The record was well-formed and this device implements no answer for it on
+    /// any pathway. Recovery is `NoMetal`'s — nothing was encoded, so honour the
+    /// pass clear — but the class is not, and a reader triaging a black frame on
+    /// a Metal host needs to know the difference between a stub and a gap.
+    Unsupported(&'static str),
 }
 
 impl crate::observe::Refusal for EncodeStatus {
@@ -932,7 +937,8 @@ impl crate::observe::Refusal for EncodeStatus {
             | Self::MetalFailed(slug)
             | Self::WritebackFailed(slug)
             | Self::BadArgs(slug)
-            | Self::NoMetal(slug) => Some(slug),
+            | Self::NoMetal(slug)
+            | Self::Unsupported(slug) => Some(slug),
         }
     }
 
@@ -970,6 +976,7 @@ impl EncodeStatus {
             Self::WritebackFailed(_) => "writeback_failed",
             Self::BadArgs(_) => "bad_args",
             Self::NoMetal(_) => "no_metal",
+            Self::Unsupported(_) => "unsupported",
         }
     }
 }

@@ -633,6 +633,7 @@ fn render_icb_declined(
         IcbStatus::Args(_) | IcbStatus::BadDescriptor(_) | IcbStatus::MetalFailed(_) => {
             EncodeStatus::MetalFailed(slug)
         }
+        IcbStatus::Unsupported(_) => EncodeStatus::Unsupported(slug),
     }
 }
 

@@ -970,7 +970,12 @@ fn handle_info_record<M: HostMemory + HostOps>(
         // whose command memory never bound looked identical whether the payload
         // was malformed, the type-1 buffer was short, or the pathway has no ICB
         // execution at all. Latched per ICB ref — the guest re-sends `0x1d1`
-        // for the same buffer, so an unlatched line would be one per frame.
+        // for the same ICB, so an unlatched line would be one per frame.
+        //
+        // `apply_icb_host_resource_info` now always refuses: `0x1d1` is a query
+        // whose answer this device does not compute. The reply pair is logged
+        // because it is where the answer *would* go, not because anything reads
+        // it — the previous reading bound it as the ICB's command memory.
         match decode_icb_host_resource_info(bytes) {
             Ok(info) => match apply_icb_host_resource_info(state, host, task_id, &info) {
                 Ok(_) => {}
@@ -978,7 +983,8 @@ fn handle_info_record<M: HostMemory + HostOps>(
                     crate::observe::Emit::decline("icb_backing", &e)
                         .field("task", task_id)
                         .field("icb", info.icb_ref)
-                        .field("buffer", info.buffer_ref)
+                        .field("reply_buf", info.reply_buffer_ref)
+                        .field("reply_off", info.reply_offset)
                         .fail_once(info.icb_ref as u64);
                 }
             },

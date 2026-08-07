@@ -15,15 +15,16 @@ use crate::runtime::decode::resource::{
     ICB_DESC_MAX_FRAGMENT_BINDS, ICB_DESC_MAX_KERNEL_BINDS, ICB_DESC_MAX_VERTEX_BINDS,
     ICB_DESC_OPTIONS, ICB_FLAG_INHERIT_BUFFERS, ICB_LAYOUT_LEN,
     MTL_INDIRECT_CMD_CONCURRENT_DISPATCH, MTL_INDIRECT_CMD_DRAW, MTL_INDIRECT_CMD_DRAW_INDEXED,
-    OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TYPE7, PIPELINE_TAG_FRAGMENT_FUNC, PIPELINE_TAG_VERTEX_FUNC,
+    OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, OBJECT_TYPE_TYPE7, PIPELINE_TAG_FRAGMENT_FUNC,
+    PIPELINE_TAG_VERTEX_FUNC,
     RESOURCE_PAGE_SHIFT, TYPE7_OBJECT_ICB, TYPE7_OBJECT_RENDER_PIPELINE,
 };
-/// Compute-pipeline and buffer-object descriptor constants, used only by the
+/// Compute-pipeline and function descriptor constants, used only by the
 /// Metal-arm execute tests below. Kept in their own gated `use` so the Vulkan arm
 /// does not carry unused imports.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::decode::resource::{
-    OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS,
+    OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS,
     TYPE7_OBJECT_COMPUTE_PIPELINE,
 };
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
@@ -795,9 +796,9 @@ fn put_function_object(
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 /// Publish an encoded ICB command-memory `slot` at `cmd_handle`'s page, wrap it
-/// in buffer object 10, and associate that buffer with ICB object 9 through
-/// opcode 0x1d1 — the sequence `execute` performs before any fill, spelled in
-/// thirteen test bodies before this.
+/// in buffer object 10, and associate that buffer with ICB object 9 — the
+/// sequence `execute` performs before any fill, spelled in thirteen test bodies
+/// before this.
 ///
 /// `cmd_handle` is the caller's because it is the slot's GVA page index and must
 /// not collide with the other fixtures a given test has already placed; refs 9
@@ -817,17 +818,13 @@ fn associate_icb_command_memory(
     put_object(host, state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
     // `&*host`, not `host`: this takes `&M` while `put_object` above needs
     // `&mut FakeHost`, and the reborrow is what lets one binding serve both.
-    apply_icb_host_resource_info(
-        state,
-        &*host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1 associate ICB command memory");
+    //
+    // Straight to the association rather than through `0x1d1`. That record is a
+    // query this device refuses — see `apply_icb_host_resource_info` — so
+    // routing every ICB fixture through it would have made this helper the one
+    // thing keeping the old misreading alive.
+    associate_icb_backing_buffer_ref(state, &*host, 1, 9, 10)
+        .expect("associate ICB command memory");
 }
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
@@ -2019,8 +2016,8 @@ fn icb_host_resource_info_decode_and_apply() {
     st64(&mut p[8..], 0x4000);
     let info = decode_icb_host_resource_info(&p).unwrap();
     assert_eq!(info.icb_ref, 9);
-    assert_eq!(info.buffer_ref, 10);
-    assert_eq!(info.gpu_address, 0x4000);
+    assert_eq!(info.reply_buffer_ref, 10);
+    assert_eq!(info.reply_offset, 0x4000);
     // Full record form
     let mut rec = [0u8; 24];
     st32(&mut rec[0..], INFO_OP_ICB_HOST_RESOURCE);
@@ -2030,9 +2027,23 @@ fn icb_host_resource_info_decode_and_apply() {
     assert_eq!(info2, info);
 }
 
+/// `0x1d1` is a query, and answering it by binding its reply pair was worse
+/// than refusing it.
+///
+/// The record names an ICB and a scratch `(buffer, offset)` pair for the two
+/// `u64`s the guest is waiting to be handed. This device used to read that pair
+/// as the ICB's command backing, so a guest whose stream allocator returned a
+/// resolvable type-1 ref would have had its own reply staging area bound as an
+/// ICB's command slots — and the next `executeCommandsInBuffer:` would have
+/// decoded whatever sat there and run it as real work.
+///
+/// The fixture is built to be exactly that trap: object 11 is a well-formed
+/// type-1 buffer whose pages hold a *valid* encoded command slot, so the old
+/// code path succeeds on it. Both halves are asserted, because the refusal
+/// alone would still pass if the bind happened first and the error came later:
+/// the call refuses, **and** the ICB still has no command memory afterwards.
 #[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn apply_0x1d1_auto_binds_backing() {
+fn a_0x1d1_query_is_refused_and_binds_nothing() {
     let _guard = icb_test_guard();
     let (mut host, state) = icb_device();
 
@@ -2040,6 +2051,9 @@ fn apply_0x1d1_auto_binds_backing() {
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
     put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    // Record the create body, as `execute` would, so the decode below refuses
+    // for want of command memory rather than for want of the ICB itself.
+    resolve_icb_record(&state, &host, 1, 9).expect("record the ICB create body");
 
     let slot = encode_compute_command_slot(
         &layout,
@@ -2062,19 +2076,25 @@ fn apply_0x1d1_auto_binds_backing() {
     let bdesc_gva = 0x200u64;
     put_object(&mut host, &state, 11, OBJECT_TYPE_BUFFER, bdesc_gva, &bdesc);
 
-    let mem = apply_icb_host_resource_info(
+    let refused = apply_icb_host_resource_info(
         &state,
         &host,
         1,
         &IcbHostResourceInfo {
             icb_ref: 9,
-            buffer_ref: 11,
-            gpu_address: 0,
+            reply_buffer_ref: 11,
+            reply_offset: 0,
         },
     )
-    .expect("0x1d1 apply");
-    assert_eq!(mem.gva, cmd_gva);
-    assert_eq!(mem.byte_len, layout.command_size as u64);
+    .expect_err("0x1d1 is a query this device does not answer");
+    assert_eq!(refused, IcbStatus::Unsupported("icb_info_query_unanswered"));
+
+    // The trap: object 11 resolves and its pages hold a decodable slot, so the
+    // old reading would have bound it here and this walk would have returned a
+    // command the guest never put in an ICB.
+    let after = decode_icb_command_range(&state, &host, 1, 9, 0, 1)
+        .expect_err("the query must not have bound the reply buffer as command memory");
+    assert_eq!(after, IcbStatus::Missing("icb_fill_no_command_memory"));
 }
 
 /// Product DrawIndexed ICB fill + execute: oracle fullscreen triangle via

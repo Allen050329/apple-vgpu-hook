@@ -76,6 +76,12 @@ pub enum IcbStatus {
     /// The decoded arguments do not satisfy the contract: a span past the end,
     /// a zero count, an unknown wire tag.
     Args(&'static str),
+    /// The record decoded and is well-formed, and this device does not
+    /// implement what it asks for on any pathway. Distinct from
+    /// [`Self::NoMetal`], which is one pathway's stub, and from [`Self::Args`],
+    /// which says the guest's bytes were the problem — here the guest is
+    /// blameless and the answer is simply not built.
+    Unsupported(&'static str),
 }
 
 impl crate::observe::Decline for IcbStatus {
@@ -85,7 +91,8 @@ impl crate::observe::Decline for IcbStatus {
             | Self::BadDescriptor(s)
             | Self::MetalFailed(s)
             | Self::NoMetal(s)
-            | Self::Args(s) => s,
+            | Self::Args(s)
+            | Self::Unsupported(s) => s,
         }
     }
 
@@ -98,6 +105,7 @@ impl crate::observe::Decline for IcbStatus {
                 Self::MetalFailed(_) => "metal_failed",
                 Self::NoMetal(_) => "no_metal",
                 Self::Args(_) => "args",
+                Self::Unsupported(_) => "unsupported",
             }
             .to_string(),
         )]
@@ -120,7 +128,9 @@ impl From<IcbStatus> for crate::runtime::compute_exec::ComputeStatus {
         let slug = e.slug();
         match e {
             IcbStatus::Missing(_) => Self::MissingBuffer(slug),
-            IcbStatus::BadDescriptor(_) | IcbStatus::Args(_) => Self::Unsupported(slug),
+            IcbStatus::BadDescriptor(_) | IcbStatus::Args(_) | IcbStatus::Unsupported(_) => {
+                Self::Unsupported(slug)
+            }
             IcbStatus::MetalFailed(_) => Self::MetalFailed(slug),
             IcbStatus::NoMetal(_) => Self::NoMetal(slug),
         }
@@ -1512,25 +1522,38 @@ pub fn resolve_metal_icb<M: HostMemory + HostOps>(
 /// itself a buffer with a different ref — so it cannot be that object's backing
 /// buffer.
 ///
-/// Left standing rather than half-repaired. Renaming the fields is not the fix:
-/// this record does not say where an ICB's command memory is, so
-/// [`apply_icb_host_resource_info`] cannot do its job from it and should
-/// decline by name — and the device separately never writes the answer the
-/// guest asked for, though `runtime::heap_query` shows the pattern for that.
-/// The rail is dormant, which is why the wrong reading survived: `runtime::icb`
-/// reads 0.00% on a driven boot.
-pub const INFO_OP_ICB_HOST_RESOURCE: u32 = 0x1d1;
-pub const INFO_OP_ICB_HOST_RESOURCE_RECORD_LEN: u32 = 0x18;
-pub const INFO_OP_ICB_HOST_RESOURCE_PAYLOAD_LEN: usize = 0x10;
+/// Repaired: [`apply_icb_host_resource_info`] now declines by name rather than
+/// binding the reply pair, and [`IcbHostResourceInfo`] carries the wire crate's
+/// field names. The device still never writes the answer the guest asked for —
+/// the two `u64`s are unattributed, and `runtime::heap_query` shows the shape a
+/// reply takes. The rail is dormant, which is why the wrong reading survived
+/// as long as it did: `runtime::icb` reads 0.00% on a driven boot.
+///
+/// The three constants below are the wire crate's, aliased rather than spelled,
+/// so this file cannot drift from the declaration the fixtures pin.
+pub const INFO_OP_ICB_HOST_RESOURCE: u32 = reims_vgpu_wire::ops::info::OPCODE_ICB_HOST_RESOURCE_INFO;
+pub const INFO_OP_ICB_HOST_RESOURCE_RECORD_LEN: u32 = reims_vgpu_wire::ops::info::QUERY_TOTAL_LEN;
+pub const INFO_OP_ICB_HOST_RESOURCE_PAYLOAD_LEN: usize =
+    std::mem::size_of::<reims_vgpu_wire::ops::info::Query>();
 
-/// Decoded `0x1d1` icbHostResourceInfo payload (sync path for ICB backing).
+/// Decoded `0x1d1` `icbHostResourceInfo:info:` payload.
+///
+/// The field names are [`reims_vgpu_wire::ops::info::Query`]'s, because this
+/// record *is* that record — ten selectors write the identical 24 bytes and
+/// differ only in opcode. This device used to declare the same three offsets a
+/// second time under two other names, `buffer_ref` and `gpu_address`, which is
+/// the drift the wire crate exists to catch: the offsets agreed and the meanings
+/// did not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IcbHostResourceInfo {
+    /// The ICB being asked about.
     pub icb_ref: u32,
-    /// Type-1 object-list ref of the ICB command backing buffer.
-    pub buffer_ref: u32,
-    /// Guest GPU/VA of the backing (`AppleParavirtBuffer._gpuAddress`), or 0.
-    pub gpu_address: u64,
+    /// Where the *answer* goes: the scratch buffer the guest's command stream
+    /// returned from `-getBufferBytes:alignment:buffer:offset:`.
+    pub reply_buffer_ref: u32,
+    /// Offset into [`Self::reply_buffer_ref`] for the two `u64`s the guest is
+    /// asking the host to write.
+    pub reply_offset: u64,
 }
 
 /// Decode `0x1d1` payload (16 bytes) or full record (24 bytes including header).
@@ -1544,16 +1567,20 @@ pub fn decode_icb_host_resource_info(bytes: &[u8]) -> Result<IcbHostResourceInfo
     } else {
         return Err(IcbStatus::Args("icb_host_resource_info_short"));
     };
-    let icb_ref = ld32(&payload[0..]);
-    let buffer_ref = ld32(&payload[4..]);
-    let gpu_address = ld64(&payload[8..]);
+    // The three offsets are taken from the wire declaration rather than spelled
+    // again, so a layout change there fails this build instead of silently
+    // re-slicing the same bytes into different fields.
+    use reims_vgpu_wire::ops::info::Query;
+    let icb_ref = ld32(&payload[std::mem::offset_of!(Query, object_ref)..]);
+    let reply_buffer_ref = ld32(&payload[std::mem::offset_of!(Query, reply_buffer_ref)..]);
+    let reply_offset = ld64(&payload[std::mem::offset_of!(Query, reply_offset)..]);
     if icb_ref == 0 {
         return Err(IcbStatus::Args("icb_host_resource_info_ref_zero"));
     }
     Ok(IcbHostResourceInfo {
         icb_ref,
-        buffer_ref,
-        gpu_address,
+        reply_buffer_ref,
+        reply_offset,
     })
 }
 
@@ -1613,39 +1640,35 @@ pub fn associate_icb_backing_buffer_ref<M: HostMemory + HostOps>(
     Ok(mem)
 }
 
-/// Apply info-segment `0x1d1` (icbHostResourceInfo) — auto-bind backing GVA.
+/// Refuse info-segment `0x1d1` (`icbHostResourceInfo:info:`) by name.
 ///
-/// Prefers type-1 `buffer_ref` for GVA; if buffer_ref is 0, uses `gpu_address`
-/// with size from the ICB create layout.
+/// **This record is a question, and this device has no answer for it.** The
+/// selector's type encoding is `v32@0:8@16^{?=QQ}24`, so `info:` is a pointer to
+/// two `u64` out-parameters: the guest names an ICB and a place to write two
+/// words, and waits. Nothing here writes them — see
+/// [`INFO_OP_ICB_HOST_RESOURCE`] for the full derivation and
+/// [`reims_vgpu_wire::ops::info`] for the fixtures that settle it.
+///
+/// It used to read the reply pair as an answer instead of a question, and that
+/// was worse than refusing. `reply_buffer_ref` went to
+/// [`associate_icb_backing_buffer_ref`] as the ICB's command backing and
+/// `reply_offset` became a command-memory GVA — so a guest whose scratch
+/// allocator happened to return a resolvable type-1 ref would have had *its own
+/// reply staging area* bound as an ICB's command slots, and the next
+/// `executeCommandsInBuffer:` would decode whatever sat there and run it as
+/// draws. A refusal loses the guest's query; that lost the query and then
+/// executed guest scratch as geometry.
+///
+/// What it would take to answer: the two words are unattributed. Nothing in the
+/// captured fixtures varies them, because in a capture the stream *is* the
+/// oracle. `runtime::heap_query` shows the shape a real reply takes.
 pub fn apply_icb_host_resource_info<M: HostMemory + HostOps>(
-    state: &DeviceState,
-    host: &M,
-    task_id: u32,
-    info: &IcbHostResourceInfo,
+    _state: &DeviceState,
+    _host: &M,
+    _task_id: u32,
+    _info: &IcbHostResourceInfo,
 ) -> Result<IcbCommandMemory, IcbStatus> {
-    if info.buffer_ref != 0 {
-        return associate_icb_backing_buffer_ref(
-            state,
-            host,
-            task_id,
-            info.icb_ref,
-            info.buffer_ref,
-        );
-    }
-    if info.gpu_address == 0 {
-        return Err(IcbStatus::Args("icb_apply_info_no_gpu_address"));
-    }
-    let (desc, _) = resolve_metal_icb(state, host, task_id, info.icb_ref)?;
-    let need = (desc.layout.command_size as u64).saturating_mul(desc.max_command_count as u64);
-    if need == 0 {
-        return Err(IcbStatus::Args("icb_apply_info_zero_layout_span"));
-    }
-    let mem = IcbCommandMemory {
-        gva: info.gpu_address,
-        byte_len: need,
-    };
-    bind_icb_command_memory(task_id, info.icb_ref, mem)?;
-    Ok(mem)
+    Err(IcbStatus::Unsupported("icb_info_query_unanswered"))
 }
 
 /// Read attribute-stride u64 at `attributeStrideOffset + index*8`.
