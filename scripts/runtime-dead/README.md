@@ -48,8 +48,36 @@ for its target; the ROM build fails and the boot never starts. Use
 **QEMU has to exit, not be killed.** The counters are written by an atexit hook,
 so SIGKILL loses the run. The script sends SIGTERM and waits. Continuous mode
 (`LLVM_PROFILE_FILE=...%c...`) would survive a kill but needs runtime counter
-relocation, which this toolchain does not build — it silently produces a 0-byte
-file, which is how you will notice.
+relocation, which this toolchain does not build.
+
+**A 0-byte profile is not how you notice.** This README used to say it was, and
+that was wrong in the direction that costs a session. The boot's own QEMU can
+write a 0-byte `.profraw` while the run still produces a complete-looking
+report, because it is not the only process writing to `$OUT_DIR`: the crate's
+build scripts write one each, and the boot script's own short-lived
+`qemu-system-x86_64` probe invocations each dump the *full* function table with
+every counter at zero — 4.3 MB of records that are all misses. The script's
+`-size +0c` filter drops the empty file that mattered, keeps the all-zero ones
+that did not, `merge -sparse` discards their zero records, and the report is
+then built from whatever a build script happened to touch. The observed result
+was six functions of coverage, `TOTAL 0.00 %`, and a `never-ran.txt` naming all
+3360 functions in the crate — produced by a boot that reached the desktop and
+passed the drag probe's did-the-window-move verdict.
+
+Nothing about that output says it is broken. It is a kill list for the entire
+device, in the format a reader is invited to act on. So there are two guards,
+and both refuse to write rather than warn:
+
+- **The boot's own raw must exist and be non-empty**, checked by pid before the
+  merge. This names the real failure exactly, because the script already knows
+  which process it SIGTERMed.
+- **Not every function of ours may read zero**, checked before `never-ran.txt`
+  is opened. This is the backstop for the case where the pid check passes on a
+  raw that is present but all misses.
+
+Do not gate on `llvm-profdata show`'s `Instrumentation level:`. It reports
+`Front-end` on this toolchain even for the genuinely-instrumented dumps, so a
+check for `IR` refuses good runs.
 
 Also note the boot script re-runs `qemu-build` itself, so the instrumentation
 env has to be exported for the *boot*, not just for a build beforehand.

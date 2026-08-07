@@ -165,6 +165,32 @@ if [ "${#raws[@]}" -eq 0 ]; then
     exit 1
 fi
 
+# The boot's own QEMU is the only process in this directory whose counters are
+# the measurement. Everything else that writes here — the build scripts, and the
+# short-lived `qemu-system-x86_64` invocations the boot script makes to query
+# devices and machines — exits before the device runs, so its records are
+# present and its counts are all zero.
+#
+# That is why "no profile data" above cannot be the only guard, and why the
+# README's claim that a bad toolchain leaves "a silently 0-byte file, which is
+# how you will notice" was wrong. The 0-byte file *was* written, by the one
+# process that mattered; `-size +0c` dropped it, four 4.3 MB all-zero probe
+# dumps stayed, `merge -sparse` discarded their zero records, and what reached
+# the report was six functions from a build script. The run then declared the
+# entire crate — 3360 functions, TOTAL 0.00 % — never executed, on a boot that
+# had drawn a desktop and driven Safari for 25 seconds. A list like that is
+# indistinguishable from a kill list, so refuse by name.
+boot_raw="$OUT_DIR/reims-$qemu_pid.profraw"
+if [ ! -s "$boot_raw" ]; then
+    echo "runtime-dead: the boot's own profile is missing or empty ($boot_raw)." >&2
+    echo "runtime-dead: QEMU pid $qemu_pid did not complete the atexit profile write," >&2
+    echo "runtime-dead: so nothing here measured the device. The other raw files are" >&2
+    echo "runtime-dead: build scripts and the boot script's own QEMU probes; their" >&2
+    echo "runtime-dead: counters are all zero and merging them reports the whole crate" >&2
+    echo "runtime-dead: as never-ran. Refusing to write a report." >&2
+    exit 1
+fi
+
 echo "runtime-dead: merging ${#raws[@]} raw profile(s) ..."
 llvm-profdata merge -sparse "${raws[@]}" -o "$OUT_DIR/merged.profdata"
 
@@ -199,10 +225,25 @@ for export in data["data"]:
         files = ", ".join(sorted({f.split(MARK)[-1] for f in spans}))
         rows.append((files, fn["name"]))
 rows.sort()
+
+# A boot that answered on SSH and survived the drag probe's did-the-window-move
+# verdict executed this device. So "every function in the crate is cold" is not
+# a measurement of the guest, it is a measurement of a broken profile, and the
+# difference is invisible once the list is on disk. Write nothing rather than
+# hand the next reader a kill list with the whole crate on it.
+if ours and not rows:
+    sys.exit("runtime-dead: the export has no functions of ours at all — "
+             "the coverage mapping does not match this binary")
+if ours and len(rows) == ours:
+    sys.exit(f"runtime-dead: all {ours} of our functions read zero, on a driven "
+             "boot that reached the desktop. The profile is wrong, not the "
+             "crate. Refusing to write a never-ran list.")
+
 with open(sys.argv[2], "w") as out:
     for path, name in rows:
         out.write(f"{path}\t{name}\n")
-print(f"runtime-dead: {len(rows)} of {ours} functions never ran")
+print(f"runtime-dead: {len(rows)} of {ours} functions never ran "
+      f"({ours - len(rows)} ran)")
 PY
 
 echo
