@@ -615,7 +615,7 @@ fn a_scissor_covers_its_target_only_when_every_term_says_so() {
 #[test]
 fn every_field_of_the_attachment_prefix_decides_bindability() {
     assert!(
-        depth_stencil_is_bindable(AttachSubresource::default()),
+        attachment_subresource_is_bindable(AttachSubresource::default()),
         "the whole texture at level 0, slice 0, plane 0 with no resolve is bindable"
     );
 
@@ -650,7 +650,7 @@ fn every_field_of_the_attachment_prefix_decides_bindability() {
         ),
     ] {
         assert!(
-            !depth_stencil_is_bindable(sub),
+            !attachment_subresource_is_bindable(sub),
             "a non-default {name} must refuse the attachment on its own"
         );
     }

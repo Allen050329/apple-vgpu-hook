@@ -9,7 +9,7 @@
 //! The two copies had already drifted. Both tested `level` and
 //! `resolve_texture_ref` and neither tested `slice` or `depth_plane`, while the
 //! owning rule they were copies of
-//! ([`depth_stencil_is_bindable`](crate::runtime::decode::render::depth_stencil_is_bindable))
+//! ([`attachment_subresource_is_bindable`](crate::runtime::decode::render::attachment_subresource_is_bindable))
 //! tests all four; and both refused in silence, so an attachment this rail
 //! could not carry vanished with nothing in the log.
 
@@ -19,7 +19,7 @@ use crate::contract::pass_action::{
     MTL_STORE_ACTION_STORE,
 };
 use crate::runtime::decode::render::{
-    depth_stencil_is_bindable, AttachSubresource, DepthAttachment, StencilAttachment,
+    attachment_subresource_is_bindable, AttachSubresource, DepthAttachment, StencilAttachment,
 };
 use crate::runtime::host::HostMemory;
 use crate::runtime::{mapper, mapping_write, objects, HostOps};
@@ -153,7 +153,7 @@ impl HostDepthStencil {
 /// Build the host-side buffer for one depth or stencil attachment.
 ///
 /// `None` means this rail refused the attachment, having named why. The
-/// subresource half of the admission is [`depth_stencil_is_bindable`], which
+/// subresource half of the admission is [`attachment_subresource_is_bindable`], which
 /// the stream decode already applied — it is re-asked here because nothing but
 /// this call records that the two arms use one rule. The action half is this
 /// rail's own: a host-side buffer carries the three `MTLLoadAction`s and the
@@ -176,7 +176,7 @@ pub(super) fn seed_host_depth_stencil<M: HostMemory + HostOps>(
     // it as `<= STORE`, one rule in two forms with nothing comparing them.
     let actions_ok = is_declared_load_action(attach.load_action)
         && is_declared_store_action(attach.store_action);
-    if !depth_stencil_is_bindable(attach.sub) || !actions_ok {
+    if !attachment_subresource_is_bindable(attach.sub) || !actions_ok {
         if degrade_log_first(req.pipeline_ref, spec.actions_refused) {
             crate::observe::fail(format!(
                 "shader_state_degraded reason={} pipe={} task={} ds_ref={} \

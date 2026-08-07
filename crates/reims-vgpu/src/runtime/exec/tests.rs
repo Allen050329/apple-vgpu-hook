@@ -869,21 +869,29 @@ fn an_unsupported_depth_attachment_is_named_not_just_dropped() {
 /// The `slice` and `depth_plane` arms are the ones that could not have been
 /// written before: those fields did not exist, because the decoder read
 /// `level` thirty-two bits wide and swallowed the slice into it.
+///
+/// The `resolve` arm is the one this check did not make at all. Its depth and
+/// stencil siblings have tested it since they were written; the colour arm
+/// spelled its own three-term copy of the rule instead of the shared predicate
+/// — so a multisample colour pass, which names its resolve target here and
+/// nowhere else, was admitted and rendered at one sample into the attachment
+/// with the resolve target never written.
 #[test]
 fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_draws() {
     use crate::contract::endian::st32;
     use crate::runtime::decode::render::{
-        PASS_ATTACH_DEPTH_PLANE, PASS_ATTACH_LEVEL, PASS_ATTACH_SLICE, PASS_ATTACH_TEXREF,
-        PASS_COLOR_ATTACH_OFF, PASS_MIN_PAYLOAD,
+        PASS_ATTACH_DEPTH_PLANE, PASS_ATTACH_LEVEL, PASS_ATTACH_RESOLVEREF, PASS_ATTACH_SLICE,
+        PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF, PASS_MIN_PAYLOAD,
     };
 
-    let pass = |level: u16, slice: u16, plane: u16| {
+    let pass_resolving = |level: u16, slice: u16, plane: u16, resolve: u32| {
         let total = OP_HEADER_LEN + PASS_MIN_PAYLOAD;
         let mut cmd = vec![0u8; total];
         st32(&mut cmd[0..], wire_pass::OPCODE_RENDER_PASS);
         st32(&mut cmd[4..], total as u32);
         let slot = OP_HEADER_LEN + PASS_COLOR_ATTACH_OFF;
         st32(&mut cmd[slot + PASS_ATTACH_TEXREF..], 77);
+        st32(&mut cmd[slot + PASS_ATTACH_RESOLVEREF..], resolve);
         cmd[slot + PASS_ATTACH_LEVEL..slot + PASS_ATTACH_LEVEL + 2]
             .copy_from_slice(&level.to_le_bytes());
         cmd[slot + PASS_ATTACH_SLICE..slot + PASS_ATTACH_SLICE + 2]
@@ -892,6 +900,7 @@ fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_
             .copy_from_slice(&plane.to_le_bytes());
         cmd
     };
+    let pass = |level: u16, slice: u16, plane: u16| pass_resolving(level, slice, plane, 0);
     let run = |cmd: &[u8]| {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
@@ -941,6 +950,24 @@ fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_
         );
     }
 
+    // The base subresource with a resolve target named: every coordinate is 0,
+    // so the three-term check this arm used to carry admitted it. What the guest
+    // asked for is a multisample colour pass whose single-sampled result lands
+    // in texture 0x99, and this device writes nothing there.
+    let acc = run(&pass_resolving(0, 0, 0, 0x99));
+    assert_eq!(acc.color_slots.len(), 1);
+    assert!(
+        matches!(
+            acc.bind_snapshot(),
+            Err(StreamRefusal::Pass(
+                StreamDrawDrop::ColorSubresourceUnsupported { .. }
+            ))
+        ),
+        "a colour attachment naming a multisample resolve target must refuse \
+         the stream's draws: rendering it at one sample leaves the texture the \
+         guest reads from holding whatever it held before"
+    );
+
     let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
     assert!(
         log.contains("stream_color_subresource_unsupported"),
@@ -954,6 +981,12 @@ fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_
     assert!(
         log.contains("plane=2"),
         "the line must carry the depth plane"
+    );
+    assert!(
+        log.contains("resolve=0x99"),
+        "the line must name the resolve target, the way its depth and stencil \
+         siblings do: without it the reader cannot tell a multisample pass from \
+         a mip-bound one, and they are refused under the same slug"
     );
 }
 

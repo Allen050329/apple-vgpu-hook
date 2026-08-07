@@ -571,19 +571,39 @@ impl From<StencilAttachment> for AttachSubresource {
     }
 }
 
-/// Whether this device can honour a depth or stencil attachment as decoded.
+impl From<ColorAttachment> for AttachSubresource {
+    fn from(a: ColorAttachment) -> Self {
+        Self {
+            level: a.level,
+            slice: a.slice,
+            depth_plane: a.depth_plane,
+            resolve_texture_ref: a.resolve_texture_ref,
+        }
+    }
+}
+
+/// Whether this device can honour an attachment's subresource as decoded.
 ///
 /// Only the whole texture at level 0, slice 0, plane 0 with no multisample
 /// resolve. `slice` and `depth_plane` joined the test when they became
 /// decodable: a depth buffer bound at slice 5 was previously read as slice 0 and
-/// silently accepted, which is the same defect the colour arm had.
+/// silently accepted.
 ///
-/// It lives beside the structs it reads because two modules apply it — the
-/// stream decode that admits an attachment into a pass, and the Metal rail that
-/// builds a host-side buffer for one. The rail used to carry its own copy
-/// testing `level` and `resolve_texture_ref` only, so the two `u16` fields above
-/// `level` were checked in one place and not the other.
-pub fn depth_stencil_is_bindable(s: AttachSubresource) -> bool {
+/// It lives beside the structs it reads because four arms apply it — the stream
+/// decode that admits an attachment into a pass, once per aspect, and the Metal
+/// rail that builds a host-side buffer for one. **Every hand-written copy of it
+/// that has existed was missing a term.** The rail's tested `level` and
+/// `resolve_texture_ref` only, so the two `u16` fields above `level` were
+/// checked in one place and not the other. The colour arm's tested `level`,
+/// `slice` and `depth_plane` and not `resolve_texture_ref`, so a multisample
+/// colour pass — the attachment multisampled, `storeAction =
+/// MultisampleResolve`, `resolveTexture` naming where the single-sampled result
+/// goes — was admitted, rendered at one sample into the attachment, and left
+/// the resolve target the guest goes on to read holding whatever it held.
+///
+/// That is why it takes [`AttachSubresource`] rather than any one attachment
+/// type: a fifth arm gets the whole rule or does not compile.
+pub fn attachment_subresource_is_bindable(s: AttachSubresource) -> bool {
     s.level == 0 && s.slice == 0 && s.depth_plane == 0 && s.resolve_texture_ref == 0
 }
 

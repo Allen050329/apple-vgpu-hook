@@ -27,7 +27,7 @@ use crate::runtime::decode::fifo::{
 };
 use crate::runtime::decode::render::{
     self, decode_color_attachment, decode_depth_attachment, decode_stencil_attachment,
-    depth_stencil_is_bindable, ColorAttachment, DepthAttachment, Kind as RenderKind, ScissorRect,
+    attachment_subresource_is_bindable, ColorAttachment, DepthAttachment, Kind as RenderKind, ScissorRect,
     Stage, StencilAttachment, PASS_MAX_COLOR_ATTACHMENTS,
 };
 use crate::runtime::decode::stream::{
@@ -307,11 +307,20 @@ enum StreamDrawDrop {
     /// gets its work — into the wrong subresource, overwriting face 0 every
     /// time. That is wrong pixels rather than missing ones, which is why it is
     /// fail-visible: nothing downstream can tell it happened.
+    ///
+    /// `resolve_texture_ref` is the fourth shape and it was the last to be
+    /// tested. [`Self::DepthStencilUnsupported`] carried it from the start; this
+    /// arm did not, so a multisample colour pass — attachment texture
+    /// multisampled, `storeAction = MultisampleResolve`, `resolveTexture` naming
+    /// where the single-sampled result goes — was admitted, rendered at one
+    /// sample into the attachment, and its resolve target left holding whatever
+    /// it held before. The guest reads the resolve target.
     ColorSubresourceUnsupported {
         slot: u32,
         level: u32,
         slice: u32,
         depth_plane: u32,
+        resolve_texture_ref: u32,
     },
 }
 
@@ -345,11 +354,13 @@ impl crate::observe::Decline for StreamDrawDrop {
                 level,
                 slice,
                 depth_plane,
+                resolve_texture_ref,
             } => vec![
                 ("slot", slot.to_string()),
                 ("level", level.to_string()),
                 ("slice", slice.to_string()),
                 ("plane", depth_plane.to_string()),
+                ("resolve", format!("{resolve_texture_ref:#x}")),
             ],
         }
     }
@@ -393,8 +404,16 @@ impl StreamDrawDrop {
                 level,
                 slice,
                 depth_plane,
+                resolve_texture_ref,
             } => {
-                u64::from(slot) << 48
+                // The resolve ref contributes whether it is set, not which
+                // texture it names, on the same reading its sibling above takes:
+                // what this latch separates is which *shape* of attachment a
+                // guest asks for, and one bit is the whole answer for a field
+                // with no coordinate in it. Bit 63, above the slot, so it cannot
+                // collide with a coordinate.
+                u64::from(resolve_texture_ref != 0) << 63
+                    | u64::from(slot) << 48
                     | u64::from(level) << 32
                     | u64::from(slice) << 16
                     | u64::from(depth_plane)
@@ -1712,7 +1731,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 // guest that wanted none also produces.
                 let depth = decode_depth_attachment(payload);
                 if depth.texture_ref != 0 {
-                    if depth_stencil_is_bindable(depth.into()) {
+                    if attachment_subresource_is_bindable(depth.into()) {
                         acc.depth_attach = Some(depth);
                     } else {
                         let drop = note_depth_stencil_unsupported(task_id, "depth", &depth.into());
@@ -1722,7 +1741,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 }
                 let stencil = decode_stencil_attachment(payload);
                 if stencil.texture_ref != 0 {
-                    if depth_stencil_is_bindable(stencil.into()) {
+                    if attachment_subresource_is_bindable(stencil.into()) {
                         acc.stencil_attach = Some(stencil);
                     } else {
                         let drop =
@@ -1757,7 +1776,15 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     // while `render_pass_target_extent_unapplied` — decoded from
                     // the same record — fires in the thousands, so the fields are
                     // being read and are genuinely zero rather than unreached.
-                    if att.level != 0 || att.slice != 0 || att.depth_plane != 0 {
+                    //
+                    // Through the shared predicate rather than a fourth term
+                    // written out here, which is what this arm used to carry and
+                    // is how `resolve_texture_ref` went untested: a colour
+                    // attachment with `resolveTexture` set is a multisample
+                    // colour pass, and this device rendered it single-sampled
+                    // into the attachment and never wrote the resolve target the
+                    // guest goes on to read.
+                    if !attachment_subresource_is_bindable(att.into()) {
                         let drop = note_color_subresource_unsupported(task_id, slot, &att);
                         acc.unrepresentable
                             .get_or_insert(StreamRefusal::Pass(drop));

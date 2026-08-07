@@ -409,12 +409,13 @@ pub(super) fn note_pass_target_extent() {
     crate::runtime::drain::note_store_route("render_pass_target_extent_unapplied");
 }
 
-/// A colour attachment naming a mip, a slice or a depth plane this device
-/// renders past. See [`StreamDrawDrop::ColorSubresourceUnsupported`].
+/// A colour attachment naming a mip, a slice, a depth plane or a multisample
+/// resolve target this device renders past.
+/// See [`StreamDrawDrop::ColorSubresourceUnsupported`].
 ///
-/// Deduped on the three coordinates and the slot rather than on the texture,
-/// because the question is which *shape* of subresource a guest asks for, not
-/// how many textures it asks for it on.
+/// Deduped on the shape and the slot rather than on the texture, because the
+/// question is which *shape* of subresource a guest asks for, not how many
+/// textures it asks for it on.
 /// Returns the drop it reported, so the caller can refuse the stream's draws
 /// with it rather than rebuilding the same arm from the same fields.
 pub(super) fn note_color_subresource_unsupported(
@@ -428,6 +429,7 @@ pub(super) fn note_color_subresource_unsupported(
         level: att.level,
         slice: att.slice,
         depth_plane: att.depth_plane,
+        resolve_texture_ref: att.resolve_texture_ref,
     };
     crate::observe::Emit::decline("stream_pass", &drop)
         .field("task", task_id)
