@@ -1061,3 +1061,167 @@ void main() {{
     );
     engine::test_quiesce_ring();
 }
+
+/// **The rail a real workload never reaches: bound in place.**
+///
+/// A `GuestRuns` window has three dispositions on a host that can import guest
+/// RAM, and `stage_buffer_content` documents them in decreasing order of cost:
+/// bound in place, gathered by the GPU, gathered by the CPU. The other two now
+/// have tests that read the assembled bytes back out of a shader. This one is
+/// the first, and it is the one that most needs a test, because it is the one
+/// production never exercises: the guest backs a surface in 16 KiB granules, so
+/// a driven boot put 98.5 % of these windows at 9-32 stretches and **none at
+/// all** at one. `buffer_guest_imports` reads 0 for a whole boot.
+///
+/// That makes it a decoded-but-untaken rail — contract fidelity, kept because a
+/// guest that hands over one contiguous stretch must get the cheapest path
+/// rather than a copy. Kept code with no workload behind it is exactly the kind
+/// that rots silently, and the only assertion this crate previously made about
+/// `buffer_guest_imports` was that it stayed *zero*.
+///
+/// One run at window offset 0 covering the whole window, so `single_run` admits
+/// it and the draw reads the guest's bytes where the guest wrote them, with
+/// nothing copied in either direction. The window is laid out so the expected
+/// colour is the *same* one the gathered and CPU-fallback tests expect: three
+/// rails, one picture.
+#[test]
+fn a_single_stretch_window_is_bound_in_place_and_the_shader_reads_the_guest_bytes() {
+    use reims_vgpu::runtime::guest_ram::{granularity, GuestRamImport, GuestRamRegion, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::GuestWindowRun;
+
+    const STRETCH: u64 = 256;
+    const WORDS_PER_STRETCH: usize = (STRETCH / 4) as usize;
+    const WINDOW: u64 = STRETCH * 3;
+
+    let _guard = engine_test_lock().lock().unwrap();
+
+    let vert = translate_words("render_tri.air", Stage::Vertex);
+    let Some(frag) = glsl_words(
+        &format!(
+            r#"#version 450
+layout(set = 0, binding = 0) readonly buffer Gathered {{ uint words[]; }} gathered;
+layout(location = 0) out vec4 color;
+void main() {{
+    color = vec4(
+        float(gathered.words[{a}] & 0xFFu) / 255.0,
+        float(gathered.words[{b}] & 0xFFu) / 255.0,
+        float(gathered.words[{c}] & 0xFFu) / 255.0,
+        1.0);
+}}
+"#,
+            a = 0,
+            b = WORDS_PER_STRETCH,
+            c = WORDS_PER_STRETCH * 2,
+        ),
+        "fragment",
+        "inplace_readback",
+    ) else {
+        return;
+    };
+
+    let identity = TargetIdentity::Surface {
+        id: 990_410,
+        width: W,
+        height: H,
+        generation: 1,
+    };
+
+    let (warm_vert, warm_frag) = triangle_spirv();
+    let warm = batch_req(&warm_vert, &warm_frag, &identity, false, half_scissor(true));
+    if let Err(e) = engine::execute_draw_request(&warm) {
+        let msg = e.to_string();
+        if skip_if_no_gpu(&msg) {
+            eprintln!("skipping: {msg}");
+            return;
+        }
+        panic!("warm-up draw: {msg}");
+    }
+    let Some(align) = granularity() else {
+        eprintln!("skipping: this host cannot import guest RAM, so nothing binds in place");
+        engine::test_quiesce_ring();
+        return;
+    };
+
+    let block_len = align * 4;
+    let mut backing = vec![0xA5u8; (block_len + align) as usize];
+    let pad = (backing.as_ptr() as u64).next_multiple_of(align) - backing.as_ptr() as u64;
+    let base = backing.as_ptr() as u64 + pad;
+
+    // Laid out in *window* order inside the one stretch, so the shader reading
+    // words 0, 64 and 128 sees the same (0x33, 0x22, 0x11) the other two tests
+    // expect. There is no reordering to detect here — one contiguous run has no
+    // placement to get wrong — so what this asserts is that binding in place
+    // reads the guest's bytes at all, and reads them from the right offset.
+    const FILL: [u8; 3] = [0x11, 0x22, 0x33];
+    for (slot, fill) in [FILL[2], FILL[1], FILL[0]].iter().enumerate() {
+        let start = (pad + STRETCH * slot as u64) as usize;
+        backing[start..start + STRETCH as usize].fill(*fill);
+    }
+
+    let import = std::sync::Arc::new(
+        GuestRamImport::new(
+            GuestRamRegion {
+                gpa_base: 0x1_0000_0000,
+                host_va: base,
+                len: block_len,
+            },
+            align,
+        )
+        .expect("an aligned, non-empty region"),
+    );
+
+    let pages = vec![GuestWindowRun {
+        window_offset: 0,
+        guest: GuestRef::new(
+            std::sync::Arc::clone(&import),
+            import.slice(0, WINDOW).expect("inside the import"),
+        )
+        .expect("the slice came from this import"),
+    }];
+    let runs = vec![GuestRun {
+        host_ptr: base as usize,
+        len: WINDOW,
+    }];
+
+    let before = engine::counter_snapshot();
+    let mut req = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    req.storage_buffers.push(StorageBufferResource {
+        binding: 0,
+        content: BufferContent::GuestRuns(GuestRunSource {
+            runs: std::sync::Arc::new(runs),
+            total_len: WINDOW,
+            row_length_texels: 0,
+            pages: Some(std::sync::Arc::new(pages)),
+        }),
+    });
+    engine::execute_draw_request(&req).expect("the in-place draw");
+    let px = engine::read_target(&identity)
+        .expect("read_target flushes the batch")
+        .into_rgba8();
+
+    let d = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        d.buffer_guest_imports, 1,
+        "one stretch at window offset 0 is the whole window; it must bind in place: {d:?}"
+    );
+    assert_eq!(
+        d.buffer_guest_gathers, 0,
+        "nothing to gather when the window is already contiguous: {d:?}"
+    );
+    assert_eq!(
+        d.buffer_snapshot_binds, 0,
+        "and the CPU must not have copied it: {d:?}"
+    );
+
+    let i = (((H / 2) * W + W / 4) * 4) as usize;
+    let got = &px[i..i + 4];
+    assert!(
+        near(got[0], FILL[2]) && near(got[1], FILL[1]) && near(got[2], FILL[0]),
+        "in-place bind read back as {got:?}; expected ({}, {}, {}) — the same \
+         picture the gathered and CPU-fallback rails produce.",
+        FILL[2],
+        FILL[1],
+        FILL[0],
+    );
+    engine::test_quiesce_ring();
+}
