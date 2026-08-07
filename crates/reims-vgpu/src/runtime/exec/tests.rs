@@ -4495,3 +4495,117 @@ fn an_armed_visibility_query_and_its_buffer_both_reach_the_accumulator() {
         "MTLVisibilityResultModeDisabled disarms; it is not a third mode"
     );
 }
+
+/// A visibility count lands in the guest's buffer, at the offset the guest
+/// named, in the width and byte order it will read.
+///
+/// The two ends of this path each had a test and the middle had none: the
+/// engine's counts are pinned against real hardware in `vk_engine_parity`, and
+/// `an_armed_visibility_query_and_its_buffer_both_reach_the_accumulator` pins
+/// the decode. Between them sits the part a guest actually depends on — that
+/// the number reaches `base + offset` of the buffer the *pass* named, as a
+/// little-endian `u64`. Every one of those four is a way to write a plausible
+/// wrong answer into memory the guest will cull on, and none of them shows up
+/// as a wrong picture.
+///
+/// Two offsets, because several are legal in one pass and are independent
+/// questions: a writeback that kept one result per pass would pass a
+/// single-offset fixture.
+#[test]
+fn a_visibility_count_lands_at_the_guest_offset_the_pass_named() {
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, RESOURCE_PAGE_SHIFT,
+    };
+    use crate::runtime::gva_mem;
+    use crate::runtime::host::HostMemory;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+
+    // A task with a one-level page directory, the same shape the ICB fixtures
+    // build: without it no GVA resolves and the writeback would refuse for a
+    // reason that has nothing to do with what is under test.
+    let (dir_pfn, root_pfn) = (2u32, 3u32);
+    let dir_gpa = u64::from(dir_pfn) << PAGE_SHIFT_ARM64E;
+    let root_gpa = u64::from(root_pfn) << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    for i in 0..8u32 {
+        let pfn = 4 + i;
+        host.map_range(u64::from(pfn) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        let _ = host.write_gpa(root_gpa + u64::from(i) * 4, &pte);
+    }
+    state.define_task(1, 0x1000, dir_pfn);
+    assert!(state.set_object_list(1, 0, 32));
+
+    // A type-1 buffer of one page at handle 5, named by object ref 7 — the
+    // `handle << page_shift` shape `resolve_buffer_span` decodes.
+    const BUF_REF: u32 = 7;
+    const BUF_HANDLE: u32 = 5;
+    const BUF_SIZE: u64 = 64;
+    let buf_gva = u64::from(BUF_HANDLE) << RESOURCE_PAGE_SHIFT;
+    let desc_gva = 0x1a0u64;
+    let mut bdesc = vec![0u8; 16];
+    st64(&mut bdesc[0..], BUF_SIZE);
+    st64(&mut bdesc[8..], u64::from(BUF_HANDLE));
+    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &bdesc);
+    let entry_off = list_object_entry_offset(BUF_REF, 32).unwrap();
+    let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(&mut le[0..], u32::from(OBJECT_TYPE_BUFFER) | ((bdesc.len() as u32) << 8));
+    le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], entry_off, &le);
+
+    let mut acc = StreamAccum {
+        visibility_buffer_ref: BUF_REF,
+        ..Default::default()
+    };
+    let mut counts = std::collections::BTreeMap::new();
+    counts.insert(0u64, 64u64);
+    counts.insert(16u64, 4095u64);
+    write_visibility_results(&mut state, &mut host, 1, &acc, &counts);
+
+    let mut got = [0u8; 8];
+    gva_mem::read_task_gva(&host, &state.tasks[1], buf_gva, &mut got, PAGE_SHIFT_ARM64E)
+        .expect("read the guest's visibility buffer back");
+    assert_eq!(
+        u64::from_le_bytes(got),
+        64,
+        "the count for offset 0 lands at the buffer's base, little-endian"
+    );
+    gva_mem::read_task_gva(&host, &state.tasks[1], buf_gva + 16, &mut got, PAGE_SHIFT_ARM64E)
+        .expect("read the second offset back");
+    assert_eq!(
+        u64::from_le_bytes(got),
+        4095,
+        "a second offset in the same pass is its own independent answer"
+    );
+
+    // A word that would run past the guest's allocation is refused rather than
+    // written. The offset and the buffer arrive in different records, so this
+    // pairing is checked nowhere else.
+    let before = crate::runtime::drain::store_route_count("visibility_result_offset_past_buffer");
+    let mut past = std::collections::BTreeMap::new();
+    past.insert(BUF_SIZE - 4, 1u64);
+    write_visibility_results(&mut state, &mut host, 1, &acc, &past);
+    assert_eq!(
+        crate::runtime::drain::store_route_count("visibility_result_offset_past_buffer"),
+        before + 1,
+        "a word straddling the end of the buffer is refused, and says so"
+    );
+
+    // Armed with no buffer named: nowhere to write, and it must not be silent.
+    let quiet = crate::runtime::drain::store_route_count("visibility_result_no_buffer");
+    acc.visibility_buffer_ref = 0;
+    write_visibility_results(&mut state, &mut host, 1, &acc, &counts);
+    assert_eq!(
+        crate::runtime::drain::store_route_count("visibility_result_no_buffer"),
+        quiet + 1
+    );
+}
