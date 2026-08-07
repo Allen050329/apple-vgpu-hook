@@ -1674,7 +1674,8 @@ fn emit_stage_phase() {
     crate::observe::off(format!(
         "stage_phase acquire_us={} acquires={} bytes_us={} bytes_n={} bytes_b={} \
          runs_us={} runs_n={} runs_b={} swap_us={} swap_n={} swap_b={} \
-         shift_us={} shift_n={} shift_b={}",
+         shift_us={} shift_n={} shift_b={} \
+         gather_us={} gather_n={} gather_b={}",
         w.acquire_us,
         w.acquires,
         w.bytes_us,
@@ -1689,6 +1690,9 @@ fn emit_stage_phase() {
         w.shift_us,
         w.shift_n,
         w.shift_b,
+        w.gather_us,
+        w.gather_n,
+        w.gather_b,
     ));
 }
 

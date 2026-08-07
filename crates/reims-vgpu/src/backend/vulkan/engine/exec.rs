@@ -191,9 +191,10 @@ unsafe fn stage_buffer_content(
                 pools.note_guest_read_recorded();
                 counters.note_buffer_guest_import(src.total_len);
                 bound
-            } else if let Some((bound, pending)) =
+            } else if let Some((bound, pending)) = {
+                let _s = stage_phase::Span::moving(stage_phase::Part::Gather, src.total_len);
                 unsafe { gather_guest_buffer_window(ctx, pools, counters, src, usage)? }
-            {
+            } {
                 // The copies read guest RAM when the CB executes, exactly as a
                 // direct bind does, so this owes the same quiesce.
                 pools.note_guest_read_recorded();
@@ -342,10 +343,7 @@ unsafe fn gather_guest_buffer_window(
         .fail_once(src.total_len);
         return Ok(None);
     }
-    let slot = {
-        let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-        pools.acquire_guest_gather(ctx, src.total_len, usage, counters)?
-    };
+    let slot = pools.acquire_guest_gather(ctx, src.total_len, usage, counters)?;
     Ok(Some((
         BoundBuffer::from(slot),
         PendingGuestGather {

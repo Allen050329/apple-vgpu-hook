@@ -103,9 +103,20 @@ pub(crate) enum Part {
     /// prefix. This is the one part that is neither a pool call nor a staging
     /// write — it is a `Vec` allocation and a copy before either.
     Shift = 4,
+    /// A scattered guest window was assembled by the GPU rather than by the
+    /// CPU: the per-stretch import binds, the region planning and the
+    /// device-local destination acquire.
+    ///
+    /// The one part that charges work the CPU does *not* spend moving bytes —
+    /// the copy it plans runs later, in the draw's command buffer — so its
+    /// `_b` is what the GPU will move and its rate is not a memcpy rate. It is
+    /// here rather than left unmeasured because it is what `runs` gives way to,
+    /// and a swap that traded 105 ms of memcpy for 105 ms of planning would
+    /// otherwise show up only as `stage_us` not moving.
+    Gather = 5,
 }
 
-const PARTS: usize = 5;
+const PARTS: usize = 6;
 
 /// Nanoseconds, per [`crate::observe::phase_clock`]. This census opens a span
 /// per staging operation at tens of thousands a second, which is exactly the
@@ -131,6 +142,9 @@ pub struct StagePhaseWindow {
     pub shift_us: u64,
     pub shift_n: u64,
     pub shift_b: u64,
+    pub gather_us: u64,
+    pub gather_n: u64,
+    pub gather_b: u64,
 }
 
 /// Take and clear the window. `None` when nothing staged, so an idle second
@@ -155,11 +169,14 @@ pub fn take_window() -> Option<StagePhaseWindow> {
         shift_us: us(Part::Shift),
         shift_n: n(Part::Shift),
         shift_b: b(Part::Shift),
+        gather_us: us(Part::Gather),
+        gather_n: n(Part::Gather),
+        gather_b: b(Part::Gather),
     };
     // `Acquire` carries no bytes, so it is swapped and dropped rather than
     // left to accumulate into a number nothing reads.
     let _ = b(Part::Acquire);
-    let staged = w.acquires + w.bytes_n + w.runs_n + w.swap_n + w.shift_n;
+    let staged = w.acquires + w.bytes_n + w.runs_n + w.swap_n + w.shift_n + w.gather_n;
     (staged > 0).then_some(w)
 }
 
@@ -218,11 +235,32 @@ mod tests {
         drop(Span::moving(Part::Bytes, 4096));
         drop(Span::moving(Part::Bytes, 1024));
         drop(Span::moving(Part::Runs, 8192));
+        drop(Span::moving(Part::Gather, 65536));
         let w = take_window().expect("something was staged");
         assert_eq!((w.acquires, w.bytes_n, w.bytes_b), (1, 2, 5120));
         assert_eq!((w.runs_n, w.runs_b), (1, 8192));
         assert_eq!((w.swap_n, w.shift_n), (0, 0));
+        // A part that is charged and not reported reads exactly like a part
+        // nothing reached — which is how three counters once sat at zero for a
+        // whole boot because they were never wired into the census.
+        assert_eq!((w.gather_n, w.gather_b), (1, 65536));
         assert_eq!(take_window(), None, "a taken window must not repeat");
+    }
+
+    /// A window carrying only a gather is still a window.
+    ///
+    /// `take_window` answers `None` on an idle second so nothing publishes a
+    /// line of zeros, and that test is a sum over the parts — so a part left
+    /// out of it makes a second that did nothing *but* gather indistinguishable
+    /// from an idle one. On a host that can import, that is now the common
+    /// second.
+    #[test]
+    fn a_second_that_only_gathered_still_reports() {
+        let _ = take_window();
+        drop(Span::moving(Part::Gather, 4096));
+        let w = take_window().expect("a gather is staging work");
+        assert_eq!(w.gather_n, 1);
+        assert_eq!((w.acquires, w.bytes_n, w.runs_n), (0, 0, 0));
     }
 
     /// A staging operation is sub-microsecond and there are tens of thousands
