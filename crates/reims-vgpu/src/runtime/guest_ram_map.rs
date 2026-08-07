@@ -81,6 +81,25 @@ pub enum MapRefusal {
     /// apart, and a count of *refusals* tells them apart even less: both read as
     /// one line here. Sampled at the point of refusal, so it bands the reach
     /// actually requested rather than the reach some other rail asked for.
+    ///
+    /// # What it measured, on an x86 guest
+    ///
+    /// A driven boot — Safari window drag, 25 s, PCI attach — put **every**
+    /// window at almost exactly four pages per run, across three orders of
+    /// magnitude of size: 2025 pages in 507 runs for each 1920x1080 writeback,
+    /// 813/204, 630/158, 588/147, 256/65, 128/32, 45/12. The ratio holds
+    /// because it is not a ratio: the runs are 16 KiB each, and the guest backs
+    /// a surface in 16 KiB physically-contiguous granules that are unrelated to
+    /// each other. Four 4 KiB x86 pages is what one of those granules looks
+    /// like from this side.
+    ///
+    /// Two consequences worth carrying, because both contradict the obvious
+    /// guess. Scattering is **not** a fragmentation artifact that a longer
+    /// uptime or a quieter guest would improve — it is the allocator's
+    /// granularity, so it is the steady state. And the run count scales with
+    /// the surface, so the widening this field exists to price is ~500 ranges
+    /// for a full-screen flush and not the handful the word "scattered"
+    /// suggests.
     Scattered {
         pages: usize,
         runs: usize,
