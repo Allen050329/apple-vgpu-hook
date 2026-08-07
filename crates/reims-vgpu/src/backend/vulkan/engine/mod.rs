@@ -642,6 +642,32 @@ pub fn resident_presentable(identity: &TargetIdentity, width: u32, height: u32) 
         .is_some_and(|slot| pools::slot_presentable(slot, width, height))
 }
 
+/// Why this present cannot come from a resident, as a census route name, or
+/// `None` when it can.
+///
+/// The direct present is the point of owning the window on the engine's own
+/// device: the fallback copies the whole framebuffer through host memory every
+/// frame, so losing it is a throughput cliff. Four conditions collapsed into one
+/// `bool` here and the caller fell through without naming any of them, so a boot
+/// reading `direct_frac=0.00` in every census window — against a documented
+/// expectation of `1.00` — said only that it had stopped, never why.
+pub fn resident_present_decline_route(
+    identity: &TargetIdentity,
+    width: u32,
+    height: u32,
+) -> Option<&'static str> {
+    let guard = lock_engine();
+    let Some(slot) = guard.pools.registry_get(identity) else {
+        return Some("winpub_no_resident");
+    };
+    match pools::slot_present_decline(slot, width, height) {
+        None => None,
+        Some(pools::ResidentPresentDecline::ContentNotReady) => Some("winpub_content_not_ready"),
+        Some(pools::ResidentPresentDecline::ScanoutOrder) => Some("winpub_scanout_order"),
+        Some(pools::ResidentPresentDecline::Geometry) => Some("winpub_geometry"),
+    }
+}
+
 pub fn resident_content_ready(identity: &TargetIdentity) -> bool {
     let guard = lock_engine();
     guard

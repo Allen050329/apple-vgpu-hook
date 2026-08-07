@@ -1576,6 +1576,13 @@ impl ResourcePools {
                     .usage(
                         usage
                             | vk::BufferUsageFlags::TRANSFER_DST
+                            // TRANSFER_SRC unconditionally, because these slots
+                            // are recycled by size bucket and not by usage: the
+                            // sampled rail gathers into one and then copies it
+                            // into an image, so a slot first created for a
+                            // vertex window would be an invalid copy source the
+                            // second time it came out of `gather_free`.
+                            | vk::BufferUsageFlags::TRANSFER_SRC
                             | vk::BufferUsageFlags::VERTEX_BUFFER
                             | vk::BufferUsageFlags::INDEX_BUFFER
                             | vk::BufferUsageFlags::STORAGE_BUFFER,

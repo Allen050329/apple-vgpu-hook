@@ -435,12 +435,21 @@ enum GuestTexels {
     /// see [`crate::backend::vulkan::engine::quiesce_guest_reads`], which is
     /// what makes that legal.
     Imported { buffer: vk::Buffer, offset: u64 },
+    /// The GPU assembled the window out of the import: one `vkCmdCopyBuffer` per
+    /// guest stretch into a device-local slot, recorded ahead of the pass, and
+    /// the buffer→image copy then names that slot.
+    ///
+    /// The arm a real workload takes. The guest backs a surface in 16 KiB
+    /// physically-contiguous granules, so a sampled window is a handful of
+    /// stretches and essentially never one — which made [`Self::Imported`]
+    /// unreachable and sent every bind to the CPU.
+    Gathered(BufferSlot),
     /// The CPU packed the texels into a pooled staging span, because this host
     /// could not reach the pages (no `VK_EXT_external_memory_host`, the rail
-    /// switched off, a driver that declined the pointer, or a run list that is
-    /// not one contiguous stretch) or the copy could not name them at the offset
-    /// they sit at. Always available, which is why the import is allowed to
-    /// decline for any reason at all.
+    /// switched off, a driver that declined the pointer, or a window too
+    /// scattered to be worth the copy regions) or the copy could not name them
+    /// at the offset they sit at. Always available, which is why the import is
+    /// allowed to decline for any reason at all.
     Scratch(BufferSlot),
 }
 
@@ -448,14 +457,16 @@ impl GuestTexels {
     fn buffer(&self) -> vk::Buffer {
         match self {
             Self::Imported { buffer, .. } => *buffer,
-            Self::Scratch(slot) => slot.buffer,
+            Self::Gathered(slot) | Self::Scratch(slot) => slot.buffer,
         }
     }
 
     fn offset(&self) -> u64 {
         match self {
             Self::Imported { offset, .. } => *offset,
-            Self::Scratch(_) => 0,
+            // Both start at the beginning of a pooled slot the window was
+            // assembled into, so the first texel is byte zero.
+            Self::Gathered(_) | Self::Scratch(_) => 0,
         }
     }
 }
@@ -550,39 +561,100 @@ const GUEST_IMPORT_COPY_OFFSET_ALIGN: u64 = 16;
 unsafe fn import_sampled_guest_window(
     ctx: &super::context::DeviceContext,
     pools: &mut ResourcePools,
+    counters: &EngineCounters,
     src: &super::types::GuestRunSource,
-) -> Option<GuestTexels> {
+    gathers: &mut Vec<PendingGuestGather>,
+) -> Result<Option<GuestTexels>, DrawError> {
     if !ctx.caps.host_pointer.is_available() {
-        return None;
+        return Ok(None);
     }
-    // One stretch only. The buffer rail assembles a scattered window with a GPU
-    // copy per stretch; this rail does not, because its whole traffic for a boot
-    // (211 gathers, 254 MB) is two orders of magnitude below what the buffer
-    // rail moves in a second, and a second copy pool to serve it would be paid
-    // for by nothing.
-    let guest_ref = single_run(src.pages.as_ref()?)?;
-    let bound = match unsafe { pools.bind_guest_ram(ctx, guest_ref) } {
-        Ok(bound) => bound,
-        Err(inner) => {
-            crate::observe::Emit::decline("vk_sampled_import", &inner).fail_once(0);
-            return None;
-        }
+    let Some(runs) = src.pages.as_ref() else {
+        return Ok(None);
     };
-    // As on the buffer rail: the buffer spans the RAMBlock, so the first texel
-    // sits at the bound range's start plus the granularity widening.
-    let offset = bound.offset + bound.head;
-    if !offset.is_multiple_of(GUEST_IMPORT_COPY_OFFSET_ALIGN) {
+    // One stretch binds in place; anything longer is assembled by the GPU, the
+    // same two arms the buffer rail has.
+    //
+    // This rail used to stop at the first of them, on the grounds that its whole
+    // traffic for a boot (211 gathers, 254 MB) was two orders of magnitude below
+    // what the buffer rail moved in a second. Both halves of that were wrong.
+    // The guest backs a surface in 16 KiB physically-contiguous granules, so a
+    // sampled window is essentially never one stretch and the arm was
+    // unreachable — a driven Safari drag read 4 imports against 4514 CPU
+    // gathers moving 10.8 GB, while the buffer rail on the same boot imported
+    // 322 303 windows and gathered none on the CPU. It is not a small rail; it
+    // was a rail whose only zero-copy arm could not be taken.
+    if let Some(guest_ref) = single_run(runs) {
+        let bound = match unsafe { pools.bind_guest_ram(ctx, guest_ref) } {
+            Ok(bound) => bound,
+            Err(inner) => {
+                crate::observe::Emit::decline("vk_sampled_import", &inner).fail_once(0);
+                return Ok(None);
+            }
+        };
+        // As on the buffer rail: the buffer spans the RAMBlock, so the first
+        // texel sits at the bound range's start plus the granularity widening.
+        let offset = bound.offset + bound.head;
+        if !offset.is_multiple_of(GUEST_IMPORT_COPY_OFFSET_ALIGN) {
+            crate::observe::Emit::decline(
+                "vk_sampled_import",
+                &SampledImportDecline::CopyOffsetAlignment { offset },
+            )
+            .fail_once(offset % GUEST_IMPORT_COPY_OFFSET_ALIGN);
+            return Ok(None);
+        }
+        return Ok(Some(GuestTexels::Imported {
+            buffer: bound.buffer,
+            offset,
+        }));
+    }
+    if runs.len() > MAX_GUEST_GATHER_REGIONS {
+        crate::runtime::drain::note_store_route("zc_sampled_gather_wide");
+        return Ok(None);
+    }
+    // Plan before acquiring, so a window that turns out not to be gatherable
+    // does not take a destination slot out of the pool to abandon it.
+    let mut sources: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
+    let mut covered = 0u64;
+    for run in runs.iter() {
+        let bound = match unsafe { pools.bind_guest_ram(ctx, &run.guest) } {
+            Ok(bound) => bound,
+            Err(inner) => {
+                crate::observe::Emit::decline("vk_sampled_import", &inner).fail_once(0);
+                return Ok(None);
+            }
+        };
+        let copy = gather_region(&bound, run);
+        covered = covered.saturating_add(copy.size);
+        super::group_by_buffer(&mut sources, bound.buffer, copy);
+    }
+    // The runs tile the window exactly, so this holds by construction — but a
+    // short gather would hand the draw an image whose tail is whatever the
+    // previous user of the slot left there, which is wrong pixels rather than
+    // slow ones. Checked here because this is the last place that can see it.
+    if covered != src.total_len {
         crate::observe::Emit::decline(
             "vk_sampled_import",
-            &SampledImportDecline::CopyOffsetAlignment { offset },
+            &SampledImportDecline::GatherShort {
+                covered,
+                want: src.total_len,
+            },
         )
-        .fail_once(offset % GUEST_IMPORT_COPY_OFFSET_ALIGN);
-        return None;
+        .fail_once(src.total_len);
+        return Ok(None);
     }
-    Some(GuestTexels::Imported {
-        buffer: bound.buffer,
-        offset,
-    })
+    let slot = unsafe {
+        pools.acquire_guest_gather(
+            ctx,
+            src.total_len,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            counters,
+        )?
+    };
+    gathers.push(PendingGuestGather {
+        dst: slot.buffer,
+        sources,
+    });
+    Ok(Some(GuestTexels::Gathered(slot)))
 }
 
 /// A check that sent a guest-sourced sampled bind back to the CPU gather before
@@ -596,18 +668,28 @@ enum SampledImportDecline {
     /// The first texel does not sit at an offset `vkCmdCopyBufferToImage` can
     /// name. See [`GUEST_IMPORT_COPY_OFFSET_ALIGN`].
     CopyOffsetAlignment { offset: u64 },
+    /// The window's stretches did not tile it, so a GPU gather would have left
+    /// the tail of the destination holding the previous user's bytes. Fails
+    /// visible because the CPU gather that follows produces a correct image and
+    /// so nothing else would say the run list was malformed.
+    GatherShort { covered: u64, want: u64 },
 }
 
 impl crate::observe::Decline for SampledImportDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::CopyOffsetAlignment { .. } => "sampled_import_copy_offset_alignment",
+            Self::GatherShort { .. } => "sampled_import_gather_short",
         }
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::CopyOffsetAlignment { offset } => vec![("offset", offset.to_string())],
+            Self::GatherShort { covered, want } => vec![
+                ("covered", covered.to_string()),
+                ("want", want.to_string()),
+            ],
         }
     }
 }
@@ -2110,7 +2192,9 @@ pub(crate) unsafe fn execute_draw_inner(
                 // the `GuestRef` in `src.pages`: it is range-checked against its
                 // RAMBlock at construction and there is no other way to name a
                 // byte in one.
-                let source = match unsafe { import_sampled_guest_window(ctx, pools, src) } {
+                let source = match unsafe {
+                    import_sampled_guest_window(ctx, pools, counters, src, &mut guest_gathers)?
+                } {
                     Some(imported) => {
                         // The read is now the command buffer's, at execute time.
                         // `write_stamp` quiesces before telling the guest these
@@ -2630,18 +2714,24 @@ pub(crate) unsafe fn execute_draw_inner(
         // would be a list that has to be revisited whenever a new bind kind
         // reaches this rail, for a dependency the driver resolves against the
         // pass it actually recorded.
+        //
+        // `TRANSFER`/`TRANSFER_READ` is in the destination scope because a
+        // sampled window gathers into one of these slots and is then read by the
+        // buffer→image copy below, which is a transfer and not a graphics stage.
+        // Without it that copy races the gather that fills it.
         let barrier = [vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(
                 vk::AccessFlags::VERTEX_ATTRIBUTE_READ
                     | vk::AccessFlags::INDEX_READ
                     | vk::AccessFlags::UNIFORM_READ
-                    | vk::AccessFlags::SHADER_READ,
+                    | vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::TRANSFER_READ,
             )];
         ctx.device.cmd_pipeline_barrier(
             cb,
             vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::ALL_GRAPHICS,
+            vk::PipelineStageFlags::ALL_GRAPHICS | vk::PipelineStageFlags::TRANSFER,
             vk::DependencyFlags::empty(),
             &barrier,
             &[],

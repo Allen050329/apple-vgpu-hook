@@ -874,8 +874,43 @@ struct ResidentStorageImageSlot {
 /// elide the readback for a frame the presenter then refuses — a blank window
 /// with no CPU pixels behind it, and no single site able to see the
 /// disagreement.
+/// Why a resident cannot carry this present, or `None` when it can.
+///
+/// Four independent conditions used to collapse into one `bool`, and the caller
+/// fell through to the CPU-BGRA present path without saying which had failed —
+/// so a boot reading `direct_frac=0.00` in every census window, against a
+/// documented expectation of `1.00`, named no cause at all. Each present that
+/// takes the fallback copies the whole framebuffer through host memory, so this
+/// is a throughput cliff and not a cosmetic one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ResidentPresentDecline {
+    /// The image exists but nothing has vouched for its pixels yet.
+    ContentNotReady,
+    /// The image's texels are not in the byte order the scanout blit reads.
+    ScanoutOrder,
+    /// The resident's geometry is not the geometry being presented.
+    Geometry,
+}
+
+pub(crate) fn slot_present_decline(
+    slot: &ResidentTargetSlot,
+    width: u32,
+    height: u32,
+) -> Option<ResidentPresentDecline> {
+    if !slot.content_ready {
+        return Some(ResidentPresentDecline::ContentNotReady);
+    }
+    if !slot.scanout_order() {
+        return Some(ResidentPresentDecline::ScanoutOrder);
+    }
+    if slot.width != width || slot.height != height {
+        return Some(ResidentPresentDecline::Geometry);
+    }
+    None
+}
+
 pub(crate) fn slot_presentable(slot: &ResidentTargetSlot, width: u32, height: u32) -> bool {
-    slot.content_ready && slot.scanout_order() && slot.width == width && slot.height == height
+    slot_present_decline(slot, width, height).is_none()
 }
 
 /// The non-pinned resident population, and the attachment bytes it holds.

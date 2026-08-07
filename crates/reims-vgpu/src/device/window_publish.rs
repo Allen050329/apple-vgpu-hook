@@ -294,6 +294,19 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
         }
         return;
     }
+    // Say why the direct present was not taken, because the fallback below
+    // copies the whole framebuffer through host memory on every frame and the
+    // difference between the two is the window's frame rate. Silence here is
+    // what let `direct_frac` sit at 0.00 for a whole boot with no cause named.
+    if !crate::backend::vulkan::engine::window_present_attached() {
+        crate::runtime::drain::note_store_route("winpub_window_not_attached");
+    } else if let Some(route) = crate::backend::vulkan::engine::resident_present_decline_route(
+        &present_identity,
+        width,
+        height,
+    ) {
+        crate::runtime::drain::note_store_route(route);
+    }
     // No resident carries this present (firmware framebuffer, a mapping the
     // compositor cleared but never rendered into, the frames after a device
     // reset), or the window is driving its own device because the engine's
