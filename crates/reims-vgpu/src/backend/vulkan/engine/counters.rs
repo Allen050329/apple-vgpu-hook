@@ -258,13 +258,41 @@ engine_counters! {
         /// unvouched + unretained + skips == gathers + imports + skips
         /// ```
         ///
-        /// which is the identity `the_gather_dispositions_account_for_every_bind`
-        /// checks. The fixes are opposite, which is why one bar could not serve:
-        /// `unvouched` is the witness refusing (and `gw_refused_host_write`
-        /// against `gw_refused_guest_store` says whose write refuted it), while
+        /// which is the identity `the_unskipped_reason_is_exactly_one_counter_per_bind`
+        /// holds the emitter to. The fixes are opposite, which is why one bar
+        /// could not serve: `unvouched` is the witness refusing, while
         /// `unretained` is a vouch this device could not spend because no image
-        /// answered to it — a capped cache dropping a window it was about to be
-        /// asked for again.
+        /// answered to it.
+        ///
+        /// # The first boot answered it, and the witness is not the problem
+        ///
+        /// Driven x86/PCI Safari drag, quiesced, one `vk_caps`, 73 census
+        /// windows with a gather in them:
+        ///
+        /// ```text
+        /// sampled_gather_unvouched      0
+        /// sampled_gather_unretained  6296   (== gathers 6292 + imports 4)
+        /// ```
+        ///
+        /// **Zero, in every window of a whole boot.** The witness vouches for
+        /// every guest-run bind it is asked about; not one gather on that boot
+        /// happened because it refused. So the ~2.3 MB-per-bind traffic this
+        /// rail moves is entirely a *retention* result — the vouch is issued and
+        /// then has nothing to name, because no image under `(key, identity)`
+        /// survived to the next bind.
+        ///
+        /// This refutes the reading it was built to test. `gw_refused_host_write`
+        /// runs ~144 a window against `gw_refused_guest_store` at 0, which
+        /// invites the conclusion that this device's own writes are refuting the
+        /// windows it samples; on the gather rail they are not, because the
+        /// refusals never reach it. Those `gw_*` tallies are runtime-side and
+        /// span every rail, and subtracting them from an engine-side per-bind
+        /// count is the trap this split exists to close.
+        ///
+        /// The skip rate is a property of the workload and not of the rail, so
+        /// do not carry a number for it: one boot's drag ran 23 windows at 0%
+        /// while the next ran ~41% (168 skips against 244 gathers a window) on
+        /// the same build. What is stable across both is this split.
         sampled_gather_unvouched,
         /// Vouched by the witness, but the sampled cache held no image under
         /// `(key, identity)`. See [`sampled_gather_unvouched`].

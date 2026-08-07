@@ -163,17 +163,28 @@
 //!
 //! Note what the constancy says: 360 and 842.4 MB repeat to the digit across
 //! all eight windows, so this is the *same* content re-gathered every frame
-//! rather than a changing working set. The gather path has no content cache at
-//! all — `find_cached_sampled` serves the `Bytes` arm (420 identity hits a
-//! second in these same windows) and nothing serves this one.
+//! rather than a changing working set.
 //!
-//! That makes the repair shape clear, and it is a shape this tree has already
-//! used: a gather may be skipped when the guest has not written the source
-//! pages since the last one, which is what `guest_write_gen` /
-//! `mapping_guest_write_verdict` answer for the type-11 seed elision — the rung
-//! that took `type11_seed_uploaded` from 242 to 23. It is *not* established here
-//! that the same witness covers these run lists, which are task-GVA spans rather
-//! than mapping ids; that is the first thing to check before building on this.
+//! ## That repair was built, and it is the cache half that fails
+//!
+//! The paragraph this replaces said the gather path had no content cache at all
+//! and that it was *not* established whether the type-11 seed witness could
+//! cover these run lists, "the first thing to check before building on this".
+//! Both are answered. [`crate::runtime::gather_witness`] covers them —
+//! `GatherWindow` carries the window's `gpas` alongside its `runs`, so the
+//! page-set question the witness needs is asked in the address space it needs —
+//! and a vouch becomes a `GatheredIdentity` the engine binds a retained image
+//! on with nothing read and nothing compared. `sampled_gather_skips` counts it
+//! working.
+//!
+//! What the counters that came with it establish is that the witness is not the
+//! half that fails. On a driven x86/PCI drag, 73 windows:
+//! `sampled_gather_unvouched` is **0** and `sampled_gather_unretained` is 6296.
+//! Every gather on that boot had a vouch and could not spend it, because no
+//! image answered to its `(key, identity)`. So the remaining lever here is
+//! retention in the sampled cache, not the witness and not the guest — see
+//! [`super::counters::EngineCounters::sampled_gather_unvouched`] for the
+//! reading and for the `gw_*` misreading it closes.
 //!
 //! # And none of it holds when the guest is quiet
 //!
