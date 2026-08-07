@@ -3993,8 +3993,14 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
     let mut base_h = 0u32;
     for &(slot, att) in color_slots {
         if att.texture_ref == 0 {
+            // An empty colour slot is the guest declining to attach one, not a
+            // loss. Counted anyway, because it is the difference between the
+            // slots the pass *has* and the slots it *uses*, and the census
+            // below is unreadable without it.
+            crate::runtime::drain::note_store_route("mrt_slot_empty");
             continue;
         }
+        crate::runtime::drain::note_store_route("mrt_slot_attached");
         let Some(ResolvedRenderTarget {
             mapping_id,
             target_gva: gva,
@@ -4033,7 +4039,34 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             base_w = mw;
             base_h = mh;
         } else if mw != base_w || mh != base_h {
-            // Metal MRT requires matching dimensions; skip mismatched extras.
+            // An attachment whose geometry differs from the first one is
+            // dropped, and the draw goes on with the rest. **This is a loss the
+            // guest is not told about**: the shader still writes that
+            // `[[color(n)]]` output, the attachment it was aimed at never
+            // receives it, and a later sample of that texture reads whatever was
+            // there before. It is the same class `secondary_mrt_drop` reports
+            // one stage further on, and it used to be a bare `continue` with a
+            // comment — so a pass whose second attachment was skipped here
+            // arrived at that census as a single-attachment draw and was
+            // counted as `mrt_draw_single`, indistinguishable from a guest that
+            // never asked for MRT at all.
+            //
+            // Reported rather than refused, and reported before it is fixed,
+            // because the fix depends on which way the geometry differs and no
+            // boot has yet produced one: a Metal attachment larger than the
+            // render area is legal and should be rendered into at the pass's
+            // size, while a smaller one is a guest error Metal itself would
+            // reject.
+            crate::runtime::drain::note_store_route("mrt_slot_geometry_dropped");
+            if crate::observe::first_sight("mrt_slot_geometry_dropped", u64::from(slot)) {
+                crate::observe::fail(format!(
+                    "mrt_slot_geometry_dropped slot={slot} ref={} got={mw}x{mh} \
+                     want={base_w}x{base_h} (the attachment is dropped and the \
+                     draw runs without it, so the shader's output for this slot \
+                     goes nowhere and a later sample reads stale content)",
+                    att.texture_ref
+                ));
+            }
             continue;
         }
         let mut load_action = att.load_action;

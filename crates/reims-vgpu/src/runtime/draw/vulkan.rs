@@ -5782,6 +5782,26 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // the producer drops them. Those are different facts and the log could
         // not tell them apart. `mrt_draw_single` is the denominator that proves
         // this probe runs.
+        //
+        // **It is still not the earliest sampling point, and reading it as one
+        // is wrong.** `req.colors` is what `mrt_draw_request` *built*, not what
+        // the guest declared: that builder skips an attachment whose geometry
+        // differs from the first, so a two-attachment pass can arrive here with
+        // one colour and be counted `mrt_draw_single`. The counters that close
+        // the gap are `mrt_slot_attached` (what the guest declared) against
+        // `mrt_slot_empty` and `mrt_slot_geometry_dropped` beside it. Compare
+        // `mrt_slot_attached` with `mrt_draw_single + mrt_draw_multi` before
+        // concluding a workload issues no MRT.
+        //
+        // With that comparison available, a driven x86/PCI/Vulkan boot — Safari
+        // window drag plus System Settings and Spotlight, the vibrancy-bearing
+        // panes the `secondary_mrt_drop` census names as its driving case —
+        // reads `mrt_slot_attached=23112`, `mrt_slot_empty=0`,
+        // `mrt_slot_geometry_dropped=0`, `mrt_draw_single=70332` and no
+        // `mrt_draw_multi` at all. So this workload declares exactly one colour
+        // attachment per pass and the MRT rails below are unexercised rather
+        // than failing. Every `mrt_drop_*` reason reading zero is a statement
+        // about the workload, not about the producer.
         crate::runtime::drain::note_store_route(if req.colors.len() > 1 {
             "mrt_draw_multi"
         } else {

@@ -233,12 +233,15 @@ const ROWS: &[(&str, usize, Guarded, &str)] = &[
     ),
     (
         "reims-vgpu/src/runtime/draw/mod.rs",
-        4,
+        5,
         Guarded::EmitsOnly,
         "degrade_log_first's declaration and one caller. The declaration is the \
          latch helper this scan discovers and then hunts callers of, including \
          the two in draw/depth_stencil.rs that no name filter over this file \
-         would have found",
+         would have found. The fifth is `mrt_slot_geometry_dropped` in \
+         `mrt_draw_request`, where the `continue` that drops the attachment sits \
+         outside the latch and the counter beside it is raised outside too — \
+         only the line explaining the first slot to drop is deduped",
     ),
     (
         "reims-vgpu/src/runtime/draw/depth_stencil.rs",
