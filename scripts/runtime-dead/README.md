@@ -144,13 +144,27 @@ What has been ruled out, so the next attempt does not re-cover it:
   real compositing (`seconds below 100 Hz: 29/29`) and failed identically.
 - **It is not the probe failing to start.** That was a real and separate bug,
   fixed below; fixing it did not change this symptom.
+- **It is not the exit path.** The obvious suspect was QEMU leaving through
+  `qemu_system_killed` rather than returning from `main`, so the script now
+  stops it with a QMP `quit` and falls back to a signal only if that fails. The
+  `quit` went through, QEMU logged a clean `qemu exited`, and the profile was
+  still zero bytes. Worth keeping anyway — `quit` is the correct shutdown — but
+  it is not the bug.
+- **It is not a crash at exit.** No coredump was produced by any of the three
+  runs, and `vm/boot-x86.sh` reported `capture-then-revert (qemu exited)`.
+- **It is not disk space or inodes.** `/tmp` is a 47 G tmpfs at 5 % with 1 % of
+  inodes used.
 
-The remaining suspect is QEMU's `SIGTERM` path reaching process exit without
-running `atexit` handlers, on a build with a live Vulkan device and host-window
-thread. The file is created and left at zero length, which is what a skipped or
-interrupted writer looks like. The baseline below was taken on an older
-toolchain — this host is now LLVM 22 — so a toolchain change is the other
-candidate, and neither has been confirmed.
+What that leaves is narrow and worth stating precisely, because it is the whole
+remaining search space: **the writer ran.** Nothing but the profile runtime
+creates that file, and it opens it truncating — so a zero-length file means the
+handler was entered, the `fopen` succeeded, and the write did not complete. The
+same binary, in the same directory, on the same run, writes a complete
+4 310 352-byte table from the boot script's short-lived probe invocations. The
+difference between those and the one that fails is that the failing process ran
+the device: a live Vulkan instance, a host-window thread, and 30 seconds of
+guest work. The baseline below also predates this host's LLVM 22, so a toolchain
+change remains a candidate that has not been tested.
 
 ## The app has to have a window before the probe starts
 

@@ -199,8 +199,40 @@ if [ "$drive_ok" -eq 0 ]; then
     exit 1
 fi
 
-echo "runtime-dead: stopping QEMU (SIGTERM — the profile is written at exit) ..."
-kill -TERM "$qemu_pid" 2>/dev/null || true
+# QMP `quit` first, signal only as a fallback.
+#
+# The profile is written by an `atexit` hook, so how QEMU leaves decides whether
+# there is a measurement at all. `quit` sets the shutdown cause from inside the
+# monitor and lets `main` return normally; a signal reaches the same shutdown
+# through `qemu_system_killed`, and two driven runs that were SIGTERMed left a
+# zero-byte profile while short-lived probe QEMUs in the same directory wrote
+# complete ones. That is the difference the guard below kept catching.
+qmp_sock="$(sed -n 's/.*qmp → \([^ ]*\.sock\).*/\1/p' "$OUT_DIR/boot.log" | tail -1)"
+stopped=0
+if [ -n "$qmp_sock" ] && [ -S "$qmp_sock" ]; then
+    echo "runtime-dead: stopping QEMU (QMP quit — the profile is written at exit) ..."
+    if python3 - "$qmp_sock" <<'PY'
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(10)
+s.connect(sys.argv[1])
+f = s.makefile("rwb")
+f.readline()                                  # greeting
+for cmd in ({"execute": "qmp_capabilities"}, {"execute": "quit"}):
+    f.write((json.dumps(cmd) + "\r\n").encode())
+    f.flush()
+    f.readline()
+PY
+    then
+        stopped=1
+    else
+        echo "runtime-dead: QMP quit did not go through; falling back to SIGTERM." >&2
+    fi
+fi
+if [ "$stopped" -eq 0 ]; then
+    echo "runtime-dead: stopping QEMU (SIGTERM) ..."
+    kill -TERM "$qemu_pid" 2>/dev/null || true
+fi
 for _ in $(seq 1 60); do
     ps -p "$qemu_pid" >/dev/null 2>&1 || break
     sleep 2
