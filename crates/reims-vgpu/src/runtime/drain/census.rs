@@ -1430,12 +1430,34 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
 /// having gone missing against `-m 16G`, which is how it was first misread.
 ///
 /// The reported set is larger than `-m` — 16399 MiB against 16384 — because the
-/// shim walks the flat view rather than `-m`, and a board exposes smaller
-/// writable RAM regions besides the two halves of main memory. It is not
-/// over-reporting device memory: `reims_vgpu_shim_guest_ram_regions` excludes
-/// ROM, ROMD, `ram_device` and readonly regions by name, so everything counted
-/// here is memory the guest can store into. `guest_ram_span` names each one at
-/// build time, which is where to look when this denominator surprises you.
+/// shim walks the flat view rather than `-m`. `guest_ram_span` names each span
+/// at build time; on this boot they are:
+///
+/// ```text
+/// n=0/4 gpa=0x0          len=786432      (768 KiB, below the legacy VGA hole)
+/// n=1/4 gpa=0x100000     len=2146435072  (2047 MiB, 1 MiB up to the PCI hole)
+/// n=2/4 gpa=0x80000000   len=16777216    (16 MiB — this device's own BAR1)
+/// n=3/4 gpa=0x100000000  len=15032385536 (14336 MiB, above 4 GiB — imported)
+/// ```
+///
+/// Spans 0, 1 and 3 are the two halves of `-m 16G` either side of the PCI hole,
+/// with the low half split again by the legacy hole at `0xA0000`. Span 2 is the
+/// 15 MiB of "extra": it is `REIMS_VGPU_PCI_FB_SIZE`, the linear GOP framebuffer
+/// `reims-vgpu-pci.c` registers as BAR1 with `memory_region_init_ram`, assigned
+/// into the PCI hole at 2 GiB. A plain RAM BAR is not ROM, not ROMD, not a
+/// `ram_device` and not readonly, so it passes the shim's filter — that filter
+/// screens out memory the guest cannot store into, and the guest *can* store
+/// into a GOP framebuffer, which is what a GOP framebuffer is for.
+///
+/// It is reported and never imported: only span 3 has ever been referenced. The
+/// consequence worth knowing is that a GPA landing inside BAR1 would resolve
+/// rather than earning `GpaNotInAnyImport`, so it is bounded to this device's
+/// own framebuffer rather than refused. That is the host console's bytes, not
+/// another RAMBlock's and not this process's private state, and the guest
+/// already writes them through the BAR. Narrowing the filter is **not** an
+/// obvious improvement: the EFI console path exists precisely because the guest
+/// points at BAR1, so excluding it would need evidence that no legitimate
+/// reference lands there. Nothing has measured that.
 ///
 /// `mib` is the same level and is not a rate: it is guest RAM the device can
 /// currently reach, against what the machine reported.
