@@ -1427,6 +1427,42 @@ const RECLAIM_HISTORY: usize = 256;
 /// And at 256 the byte cap starts binding instead (658 evictions against 0),
 /// so the headroom the plan read as unused is real only while the entry count
 /// is small.
+///
+/// # The same answer for the gather rail, which the reading above could not see
+///
+/// `sampled_cache_misses` has exactly one writer, in `find_cached_sampled`.
+/// `find_gathered_sampled` misses through a `?` and bumps nothing, so the "miss
+/// count did not move" column above is blind to the guest-run gather rail — a
+/// different population, and the one that moves 424 MB/s. Its own miss is
+/// `sampled_gather_unretained` (see
+/// [`EngineCounters::sampled_gather_unvouched`]). Three driven x86/PCI Safari
+/// drags, quiesced, one `vk_caps` each, ratios rather than totals because the
+/// runs did unequal amounts of work:
+///
+/// ```text
+///                    unretained  skips  miss%   evict_count  evict_byte
+///   64 / 128 MB            6296   4164   60.2          5949           0
+///  256 / 128 MB            5591   3133   64.1          3736        4511
+///  256 / 768 MB            6212   4229   59.5          4791           0
+/// ```
+///
+/// **Not capacity.** Four times the entries and six times the bytes leave the
+/// miss rate where it started, 60.2 % against 59.5 %. The middle row is why both
+/// caps had to move together and is the trap in the four-line reading above:
+/// raising the count cap alone just hands the evictions to the byte cap, which
+/// at the ~2.29 MB a window this workload gathers binds at ~56 entries, so the
+/// effective capacity of rows one and two is the same number and the comparison
+/// measures nothing.
+///
+/// The bottom row is the one that settles it, and it also says where to look
+/// next: with no byte pressure at all, a 256-entry cache is *still* evicting
+/// 4791 times on the count cap. Entries are being written, never hit and
+/// dropped. That is the signature of a key that does not repeat rather than of a
+/// cache that is too small — the vouched `(key, generation)` an entry is
+/// retained under not being the one the next bind looks it up with. That is a
+/// **lead and not a finding**: nothing here has confirmed it, and
+/// `runtime::gather_witness`'s generation handling is where it would be
+/// confirmed or killed. Do not raise either constant on the strength of it.
 const SAMPLED_CACHE_CAP: usize = 64;
 const SAMPLED_CACHE_BYTE_CAP: usize = 128 * 1024 * 1024;
 /// Max recycled sampled slots retained per geometry key in `sampled_free`. A
