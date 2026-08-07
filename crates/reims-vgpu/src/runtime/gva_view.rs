@@ -14,7 +14,7 @@
 //!
 //! See [[map-memory2]] GPU-import model and HostOps `map_pages` / `unmap_pages`.
 
-use crate::contract::gva_resolve::{read_task_root, translate_root, Cache, ResolveStatus, Task};
+use crate::contract::gva_resolve::{read_task_root, translate_root_run, ResolveStatus, Task};
 use crate::model::{DeviceState, GvaHostView, TaskEntry, TaskTable};
 use crate::runtime::gva_mem::geometry_for_page_shift;
 use crate::runtime::host::{HostMemory, HostOps, MemError};
@@ -205,7 +205,7 @@ fn collect_span_gpas<M: HostMemory>(
         return Err(MemError::NoTaskDirectory);
     }
     let geom = geometry_for_page_shift(page_shift).ok_or(MemError::UnsupportedPageShift)?;
-    let page_size = geom.page_size as u64;
+    let page_size = geom.page_size();
     struct HostPhys<'a, M: HostMemory>(&'a M);
     impl<M: HostMemory> crate::contract::gva_resolve::PhysReader for HostPhys<'_, M> {
         fn read_phys(&self, gpa: u64, dst: &mut [u8]) -> bool {
@@ -218,26 +218,40 @@ fn collect_span_gpas<M: HostMemory>(
         directory_pfn: task.directory_pfn,
     };
     let root = read_task_root(&reader, &gr_task, geom).map_err(|_| MemError::TaskRootRead)?;
-    let mut cache = Cache::default();
-    let end = gva.saturating_add(length);
-    let mut page_gva = gva & !(page_size - 1);
-    let mut gpas = Vec::new();
-    while page_gva < end {
-        let t = translate_root(
-            &reader,
-            geom,
-            root.root_pfn,
-            root.depth,
-            page_gva,
-            Some(&mut cache),
-        );
-        if t.status != ResolveStatus::Ok {
-            return Err(MemError::Unresolved(t.status));
-        }
-        // HostOps map_pages expects page-aligned GPAs (page base, not +offset).
-        let gpa_base = t.gpa & !(page_size - 1);
-        gpas.push(gpa_base);
-        page_gva = page_gva.saturating_add(page_size);
+    // The run walker declines a zero root or depth by not visiting at all,
+    // which below would read as an empty span. Refuse them with the status the
+    // per-page walk used to return.
+    if root.root_pfn == 0 {
+        return Err(MemError::Unresolved(ResolveStatus::ErrZeroRootPfn));
+    }
+    if root.depth == 0 {
+        return Err(MemError::Unresolved(ResolveStatus::ErrZeroDepth));
+    }
+    let pages = crate::runtime::gva_mem::pages_spanned(gva, length, page_size);
+    let mut gpas = Vec::with_capacity(pages as usize);
+    let mut refused = None;
+    translate_root_run(
+        &reader,
+        geom,
+        root.root_pfn,
+        root.depth,
+        gva & !(page_size - 1),
+        pages,
+        &mut |_, r| match r {
+            Ok(gpa) => {
+                // HostOps map_pages expects page-aligned GPAs (page base, not
+                // +offset).
+                gpas.push(gpa & !(page_size - 1));
+                true
+            }
+            Err(status) => {
+                refused = Some(status);
+                false
+            }
+        },
+    );
+    if let Some(status) = refused {
+        return Err(MemError::Unresolved(status));
     }
     if gpas.is_empty() {
         return Err(MemError::BadArgs);

@@ -1,49 +1,16 @@
 //! Task GVA resolver (port of `host/utils/reims-vgpu-gva-resolve`).
+//!
+//! The page-table format and the descent live in
+//! [`reims_vgpu_wire::page_table`], which owns them — [`Geometry`] and the two
+//! pathway constants are re-exports, so there is no second declaration to
+//! drift. What this module adds is the device's side of the walk: task-root
+//! reads, the typed refusal statuses the failure channel reports, and the run
+//! form the span readers use.
 
-use crate::contract::endian::ld32;
-use crate::contract::gva::*;
 use reims_vgpu_wire::mem as wire_mem;
 use reims_vgpu_wire::page_table as wire_page_table;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Geometry {
-    pub page_shift: u32,
-    pub page_size: u32,
-    pub page_offset_mask: u32,
-    pub index_bits: u32,
-    pub index_mask: u32,
-    pub entries_per_table: u32,
-    pub pte_size: u32,
-    pub pte_flag_mask: u32,
-    pub pte_pfn_mask: u32,
-    pub max_depth: u32,
-}
-
-pub const ARM64E_GEOMETRY: Geometry = Geometry {
-    page_shift: PAGE_SHIFT_ARM64E,
-    page_size: PAGE_SIZE_ARM64E,
-    page_offset_mask: ARM64E_PAGE_OFFSET_MASK,
-    index_bits: ARM64E_INDEX_BITS,
-    index_mask: ARM64E_INDEX_MASK,
-    entries_per_table: ARM64E_ENTRIES_PER_TABLE,
-    pte_size: PTE_SIZE,
-    pte_flag_mask: PTE_FLAG_MASK,
-    pte_pfn_mask: PTE_PFN_MASK,
-    max_depth: ARM64E_MAX_DEPTH,
-};
-
-pub const X86_64_GEOMETRY: Geometry = Geometry {
-    page_shift: PAGE_SHIFT_X86,
-    page_size: PAGE_SIZE_X86,
-    page_offset_mask: X86_64_PAGE_OFFSET_MASK,
-    index_bits: X86_64_INDEX_BITS,
-    index_mask: X86_64_INDEX_MASK,
-    entries_per_table: X86_64_ENTRIES_PER_TABLE,
-    pte_size: PTE_SIZE,
-    pte_flag_mask: PTE_FLAG_MASK,
-    pte_pfn_mask: PTE_PFN_MASK,
-    max_depth: X86_64_MAX_DEPTH,
-};
+pub use wire_page_table::{Geometry, ARM64E as ARM64E_GEOMETRY, X86_64 as X86_64_GEOMETRY};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Task {
@@ -113,18 +80,9 @@ impl crate::observe::Refusal for ResolveStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CacheStatus {
-    Disabled = 0,
-    Hit,
-    Miss,
-    MissInserted,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Translation {
     pub status: ResolveStatus,
-    pub cache_status: CacheStatus,
     pub gva: u64,
     pub gpa: u64,
     pub gva_page_index: u64,
@@ -136,52 +94,6 @@ pub struct Translation {
     pub level: u32,
     pub entry_index: u32,
     pub raw_pte: u32,
-}
-
-impl Default for Translation {
-    fn default() -> Self {
-        Self {
-            status: ResolveStatus::Ok,
-            cache_status: CacheStatus::Disabled,
-            gva: 0,
-            gpa: 0,
-            gva_page_index: 0,
-            gpa_page: 0,
-            directory_pfn: 0,
-            root_pfn: 0,
-            depth: 0,
-            leaf_pfn: 0,
-            level: 0,
-            entry_index: 0,
-            raw_pte: 0,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CacheEntry {
-    pub valid: bool,
-    pub page_shift: u32,
-    pub index_bits: u32,
-    pub root_pfn: u32,
-    pub depth: u32,
-    pub page_index: u64,
-    pub gpa_page: u64,
-}
-
-#[derive(Clone, Debug)]
-pub struct Cache {
-    pub entries: [CacheEntry; CACHE_WAYS],
-    pub next: u32,
-}
-
-impl Default for Cache {
-    fn default() -> Self {
-        Self {
-            entries: [CacheEntry::default(); CACHE_WAYS],
-            next: 0,
-        }
-    }
 }
 
 /// Callback: read `len` guest physical bytes at `gpa` into `dst`.
@@ -200,19 +112,6 @@ struct PhysAsGuestMemory<'a>(&'a dyn PhysReader);
 impl wire_mem::GuestMemory for PhysAsGuestMemory<'_> {
     fn read_at(&self, addr: u64, out: &mut [u8]) -> bool {
         self.0.read_phys(addr, out)
-    }
-}
-
-/// This module's geometry as the wire crate's.
-///
-/// The wire crate derives fan-out, masks and page size from the page shift
-/// because a node is one page of four-byte entries. This module carries them as
-/// separate fields and [`validate_geometry`] checks they agree, so the
-/// conversion drops the derived ones rather than translating them.
-fn wire_geometry(geometry: &Geometry) -> wire_page_table::Geometry {
-    wire_page_table::Geometry {
-        page_shift: geometry.page_shift,
-        max_depth: geometry.max_depth,
     }
 }
 
@@ -254,96 +153,13 @@ pub fn resolve_status_name(status: ResolveStatus) -> &'static str {
     }
 }
 
-pub fn validate_geometry(geometry: &Geometry) -> ResolveStatus {
-    if geometry.page_shift >= 31 || geometry.index_bits >= 31 {
-        return ResolveStatus::ErrUnsupportedGeometry;
-    }
-    if geometry.page_shift != PAGE_SHIFT_ARM64E && geometry.page_shift != PAGE_SHIFT_X86 {
-        return ResolveStatus::ErrUnsupportedGeometry;
-    }
-    let page_size = 1u32 << geometry.page_shift;
-    let entries_per_table = 1u32 << geometry.index_bits;
-    if geometry.page_size != page_size
-        || geometry.page_offset_mask != page_size - 1
-        || geometry.entries_per_table != entries_per_table
-        || geometry.index_mask != entries_per_table - 1
-        || geometry.pte_size != PTE_SIZE
-        || geometry.pte_flag_mask != PTE_FLAG_MASK
-        || geometry.pte_pfn_mask != PTE_PFN_MASK
-        || geometry.max_depth == 0
-        || geometry.max_depth > MAX_DEPTH
-    {
-        return ResolveStatus::ErrUnsupportedGeometry;
-    }
-    if (geometry.entries_per_table as u64) * (geometry.pte_size as u64) != geometry.page_size as u64
-    {
-        return ResolveStatus::ErrUnsupportedGeometry;
-    }
-    if geometry.page_shift != geometry.index_bits + 2 {
-        return ResolveStatus::ErrUnsupportedGeometry;
-    }
-    ResolveStatus::Ok
-}
-
-fn read_u32_phys(reader: &dyn PhysReader, gpa: u64) -> Option<u32> {
-    let mut bytes = [0u8; 4];
-    if !reader.read_phys(gpa, &mut bytes) {
-        return None;
-    }
-    Some(ld32(&bytes))
-}
-
-fn cache_lookup(
-    cache: Option<&Cache>,
-    geometry: &Geometry,
-    root_pfn: u32,
-    depth: u32,
-    page_index: u64,
-) -> Option<u64> {
-    let cache = cache?;
-    for entry in &cache.entries {
-        if entry.valid
-            && entry.page_shift == geometry.page_shift
-            && entry.index_bits == geometry.index_bits
-            && entry.root_pfn == root_pfn
-            && entry.depth == depth
-            && entry.page_index == page_index
-        {
-            return Some(entry.gpa_page);
-        }
-    }
-    None
-}
-
-fn cache_insert(
-    cache: &mut Cache,
-    geometry: &Geometry,
-    root_pfn: u32,
-    depth: u32,
-    page_index: u64,
-    gpa_page: u64,
-) {
-    let slot = cache.next as usize % CACHE_WAYS;
-    cache.next = (cache.next + 1) % CACHE_WAYS as u32;
-    cache.entries[slot] = CacheEntry {
-        valid: true,
-        page_shift: geometry.page_shift,
-        index_bits: geometry.index_bits,
-        root_pfn,
-        depth,
-        page_index,
-        gpa_page,
-    };
-}
-
 pub fn read_task_root(
     reader: &dyn PhysReader,
     task: &Task,
-    geometry: &Geometry,
+    geometry: Geometry,
 ) -> Result<TaskRoot, ResolveStatus> {
-    let gs = validate_geometry(geometry);
-    if gs != ResolveStatus::Ok {
-        return Err(gs);
+    if geometry.validate().is_err() {
+        return Err(ResolveStatus::ErrUnsupportedGeometry);
     }
     if !task.active {
         return Err(ResolveStatus::ErrInactiveTask);
@@ -351,11 +167,12 @@ pub fn read_task_root(
     if task.directory_pfn == 0 {
         return Err(ResolveStatus::ErrNoDirectory);
     }
-    let dir_gpa = pfn_to_gpa(task.directory_pfn, geometry.page_shift);
-    let root_pfn = read_u32_phys(reader, dir_gpa + DIRECTORY_ROOT_PFN as u64)
-        .ok_or(ResolveStatus::ErrDirectoryRead)?;
-    let depth = read_u32_phys(reader, dir_gpa + DIRECTORY_DEPTH as u64)
-        .ok_or(ResolveStatus::ErrDirectoryRead)?;
+    let mem = PhysAsGuestMemory(reader);
+    // Geometry and the zero directory are checked above with this module's own
+    // statuses, so the only failure left for the wire read is the read itself.
+    let (root_pfn, depth) =
+        wire_page_table::read_directory(&mem, geometry, task.directory_pfn)
+            .map_err(|_| ResolveStatus::ErrDirectoryRead)?;
     Ok(TaskRoot {
         directory_pfn: task.directory_pfn,
         root_pfn,
@@ -365,11 +182,10 @@ pub fn read_task_root(
 
 pub fn translate_root(
     reader: &dyn PhysReader,
-    geometry: &Geometry,
+    geometry: Geometry,
     root_pfn: u32,
     depth: u32,
     gva: u64,
-    cache: Option<&mut Cache>,
 ) -> Translation {
     let mut out = Translation {
         gva,
@@ -377,101 +193,49 @@ pub fn translate_root(
         depth,
         ..Default::default()
     };
-    let gs = validate_geometry(geometry);
-    if gs != ResolveStatus::Ok {
-        out.status = gs;
+    if geometry.validate().is_err() {
+        out.status = ResolveStatus::ErrUnsupportedGeometry;
         return out;
     }
     out.gva_page_index = gva >> geometry.page_shift;
-    if root_pfn == 0 {
-        out.status = ResolveStatus::ErrZeroRootPfn;
-        return out;
-    }
-    if depth == 0 {
-        out.status = ResolveStatus::ErrZeroDepth;
-        return out;
-    }
-    if depth > geometry.max_depth {
-        out.status = ResolveStatus::ErrDepthTooDeep;
-        return out;
-    }
-
-    let page_off = gva & geometry.page_offset_mask as u64;
-    if let Some(cached_gpa_page) = cache_lookup(
-        cache.as_deref(),
-        geometry,
-        root_pfn,
-        depth,
-        out.gva_page_index,
-    ) {
-        out.status = ResolveStatus::Ok;
-        out.cache_status = CacheStatus::Hit;
-        out.gpa_page = cached_gpa_page;
-        out.gpa = cached_gpa_page + page_off;
-        out.leaf_pfn = (cached_gpa_page >> geometry.page_shift) as u32;
-        return out;
-    }
-    out.cache_status = if cache.is_none() {
-        CacheStatus::Disabled
-    } else {
-        CacheStatus::Miss
-    };
 
     // The descent itself lives in `reims_vgpu_wire::page_table`, which owns the
     // format. Keeping it there means there is one declaration rather than two
     // that could drift apart silently, and the tree walk gets exercised by that
     // crate's tests as well as by this module's.
-    //
-    // What stays here is everything that is not byte interpretation: the
-    // translation cache above, and the typed refusal statuses below that the
-    // device's failure channel reports.
-    let page_index = out.gva_page_index;
     let mem = PhysAsGuestMemory(reader);
-    let walked = wire_page_table::walk(&mem, wire_geometry(geometry), root_pfn, depth, gva);
-
-    let w = match walked {
-        Ok(w) => w,
+    match wire_page_table::walk(&mem, geometry, root_pfn, depth, gva) {
+        Ok(w) => {
+            // On success the walker reports the deepest level it read, which is
+            // where the loop this replaced left these fields.
+            out.level = depth - 1;
+            out.entry_index = (w.page_index & geometry.index_mask()) as u32;
+            out.raw_pte = w.raw_pte;
+            out.status = ResolveStatus::Ok;
+            out.leaf_pfn = w.leaf_pfn;
+            out.gpa_page = w.addr_page;
+            out.gpa = w.addr;
+        }
         Err(f) => {
             out.level = f.level;
             out.entry_index = f.entry_index;
             out.raw_pte = f.raw_pte;
             out.status = resolve_status_of(f.error);
-            return out;
         }
-    };
-
-    // On success the walker reports the deepest level it read, which is where
-    // the loop this replaced left these fields.
-    out.level = depth - 1;
-    out.entry_index = (page_index & geometry.index_mask as u64) as u32;
-    out.raw_pte = w.raw_pte;
-    let gpa_page = w.addr_page;
-    out.status = ResolveStatus::Ok;
-    out.leaf_pfn = w.leaf_pfn;
-    out.gpa_page = gpa_page;
-    out.gpa = gpa_page + page_off;
-    debug_assert_eq!(out.gpa, w.addr);
-    if let Some(c) = cache {
-        cache_insert(c, geometry, root_pfn, depth, page_index, gpa_page);
-        out.cache_status = CacheStatus::MissInserted;
     }
     out
 }
 
 /// Translate a run of consecutive pages under one root, calling `visit` with
-/// each page's GPA or `None` for a page the table cannot translate.
+/// each page's GPA or the walk's refusal for a page the table cannot
+/// translate.
 ///
 /// The run form of [`translate_root`], and it exists for one reason: the
-/// per-page form re-reads every upper level of the tree for every page, because
-/// the [`Cache`] it consults holds finished translations keyed by the exact page
-/// index and a run visits each index once. A 1080p surface's licence check walks
-/// 2 025 consecutive pages and paid `depth` guest-memory reads for each; the
-/// upper levels of all of them are the same three or four entries.
-///
-/// The descent still lives in `reims_vgpu_wire::page_table`, which owns the
-/// format — [`wire_page_table::walk_run`] is the same walk with the repeated
-/// upper reads elided, and that crate's tests assert it answers identically to
-/// [`wire_page_table::walk`] page for page.
+/// per-page form re-reads every upper level of the tree for every page, and a
+/// run visits each page index exactly once. A 1080p surface's licence check
+/// walks 2 025 consecutive pages; the upper levels of all of them are the same
+/// three or four entries, and the descent —
+/// [`wire_page_table::walk_run`] — reads each shared entry once.
 ///
 /// The visitor stops the run by answering `false`. It is not called at all when
 /// the root or geometry is unusable, so a caller must compare what it saw
@@ -479,37 +243,42 @@ pub fn translate_root(
 /// the same contract [`translate_root`] has by returning a status.
 pub fn translate_root_run(
     reader: &dyn PhysReader,
-    geometry: &Geometry,
+    geometry: Geometry,
     root_pfn: u32,
     depth: u32,
     first_gva: u64,
     pages: u64,
-    visit: &mut dyn FnMut(u64, Option<u64>) -> bool,
+    visit: &mut dyn FnMut(u64, Result<u64, ResolveStatus>) -> bool,
 ) {
-    if validate_geometry(geometry) != ResolveStatus::Ok || root_pfn == 0 || depth == 0 {
+    if geometry.validate().is_err() || root_pfn == 0 || depth == 0 {
         return;
     }
     let mem = PhysAsGuestMemory(reader);
     wire_page_table::walk_run(
         &mem,
-        wire_geometry(geometry),
+        geometry,
         root_pfn,
         depth,
         first_gva,
         pages,
-        &mut |index, walked| visit(index, walked.ok().map(|w| w.addr)),
+        &mut |index, walked| {
+            visit(
+                index,
+                walked
+                    .map(|w| w.addr)
+                    .map_err(|f| resolve_status_of(f.error)),
+            )
+        },
     );
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the walker exposes each page-table and span input explicitly"
-)]
 #[cfg(test)]
 mod tests {
 
     use super::*;
+    use crate::contract::gva::{pfn_to_gpa, DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::model::PAGE_SHIFT_ARM64E;
+    use reims_vgpu_wire::page_table::{PTE_FLAG_MASK, PTE_SIZE};
     use std::collections::HashMap;
 
     struct MapReader {
@@ -543,14 +312,11 @@ mod tests {
 
     #[test]
     fn geometry_defaults() {
-        assert_eq!(validate_geometry(&ARM64E_GEOMETRY), ResolveStatus::Ok);
-        assert_eq!(validate_geometry(&X86_64_GEOMETRY), ResolveStatus::Ok);
+        assert!(ARM64E_GEOMETRY.validate().is_ok());
+        assert!(X86_64_GEOMETRY.validate().is_ok());
         let mut bad = ARM64E_GEOMETRY;
         bad.page_shift = 13;
-        assert_eq!(
-            validate_geometry(&bad),
-            ResolveStatus::ErrUnsupportedGeometry
-        );
+        assert!(bad.validate().is_err());
     }
 
     #[test]
@@ -563,7 +329,7 @@ mod tests {
             active: true,
             directory_pfn: 2,
         };
-        let root = read_task_root(&r, &task, &ARM64E_GEOMETRY).unwrap();
+        let root = read_task_root(&r, &task, ARM64E_GEOMETRY).unwrap();
         assert_eq!(root.directory_pfn, 2);
         assert_eq!(root.root_pfn, 1);
         assert_eq!(root.depth, 1);
@@ -576,24 +342,46 @@ mod tests {
         // table at pfn 1: entry 0 = pfn 5
         let table_gpa = (1u64) << PAGE_SHIFT_ARM64E;
         r.put_u32(table_gpa, 5);
-        let t = translate_root(&r, &ARM64E_GEOMETRY, 1, 1, 0x100, None);
+        let t = translate_root(&r, ARM64E_GEOMETRY, 1, 1, 0x100);
         assert_eq!(t.status, ResolveStatus::Ok);
         assert_eq!(t.leaf_pfn, 5);
         assert_eq!(t.gpa, ((5u64) << PAGE_SHIFT_ARM64E) + 0x100);
-        assert_eq!(t.cache_status, CacheStatus::Disabled);
     }
 
+    /// The run form answers page for page what the single form answers, and
+    /// carries the same refusal for a page that does not translate.
     #[test]
-    fn cache_hit_miss() {
+    fn a_run_answers_as_the_single_form_does_and_keeps_the_refusal() {
         let mut r = MapReader::new();
         let table_gpa = (1u64) << PAGE_SHIFT_ARM64E;
+        // Pages 0 and 2 map; page 1 is absent (entry reads zero, which the
+        // reader models as an unreadable word — TableRead rather than
+        // NotPresent, and either way a refusal the visitor must see).
         r.put_u32(table_gpa, 5);
-        let mut cache = Cache::default();
-        let t1 = translate_root(&r, &ARM64E_GEOMETRY, 1, 1, 0x100, Some(&mut cache));
-        assert_eq!(t1.cache_status, CacheStatus::MissInserted);
-        let t2 = translate_root(&r, &ARM64E_GEOMETRY, 1, 1, 0x200, Some(&mut cache));
-        assert_eq!(t2.cache_status, CacheStatus::Hit);
-        assert_eq!(t2.gpa, ((5u64) << PAGE_SHIFT_ARM64E) + 0x200);
+        r.put_u32(table_gpa + 2 * PTE_SIZE as u64, 7);
+        let mut seen = Vec::new();
+        translate_root_run(&r, ARM64E_GEOMETRY, 1, 1, 0x100, 3, &mut |i, res| {
+            seen.push((i, res));
+            true
+        });
+        assert_eq!(seen.len(), 3);
+        for (i, res) in &seen {
+            let single = translate_root(
+                &r,
+                ARM64E_GEOMETRY,
+                1,
+                1,
+                ((*i) << PAGE_SHIFT_ARM64E) + 0x100,
+            );
+            match res {
+                Ok(gpa) => {
+                    assert_eq!(single.status, ResolveStatus::Ok);
+                    assert_eq!(*gpa, single.gpa);
+                }
+                Err(status) => assert_eq!(*status, single.status),
+            }
+        }
+        assert!(seen[1].1.is_err(), "the unmapped page carries its refusal");
     }
 
     /// A full-depth walk descends every level and takes the leaf from the last
@@ -629,7 +417,7 @@ mod tests {
         }
 
         let gva = (page_index << g.page_shift) | PAGE_OFF;
-        let t = translate_root(&r, &g, TABLE_PFN[0], 4, gva, None);
+        let t = translate_root(&r, g, TABLE_PFN[0], 4, gva);
 
         assert_eq!(t.status, ResolveStatus::Ok);
         assert_eq!(t.leaf_pfn, LEAF_PFN);
@@ -640,8 +428,8 @@ mod tests {
         assert_eq!(t.raw_pte, PTE_FLAG_MASK | LEAF_PFN);
     }
 
-    /// No address a walk can form overflows, at any geometry `validate_geometry`
-    /// accepts.
+    /// No address a walk can form overflows, at any geometry the wire crate's
+    /// `validate` accepts.
     ///
     /// The walk used to carry five `u64::MAX - x < y` guards and a fallible
     /// PFN-to-GPA helper, all of which were dead: a PFN is a `u32` and the
@@ -653,22 +441,27 @@ mod tests {
     #[test]
     fn accepted_geometries_cannot_form_an_address_that_overflows() {
         for g in [ARM64E_GEOMETRY, X86_64_GEOMETRY] {
-            assert_eq!(validate_geometry(&g), ResolveStatus::Ok);
+            assert!(g.validate().is_ok());
             // The widest table or leaf base a `u32` PFN can name.
             let max_base = pfn_to_gpa(u32::MAX, g.page_shift);
-            let max_entry_off = (g.index_mask as u64) * (g.pte_size as u64);
-            let max_page_off = g.page_offset_mask as u64;
+            let max_entry_off = g.index_mask() * (PTE_SIZE as u64);
+            let max_page_off = g.page_offset_mask();
             assert!(max_base.checked_add(max_entry_off).is_some());
             assert!(max_base.checked_add(max_page_off).is_some());
         }
 
         // And nothing wider is accepted. The shift alone decides this, so the
-        // rest of the geometry is left consistent-for-arm64e on purpose.
+        // depth bound is left at the shared maximum on purpose.
         for shift in 0..64u32 {
-            let mut g = ARM64E_GEOMETRY;
-            g.page_shift = shift;
-            if validate_geometry(&g) == ResolveStatus::Ok {
-                assert_eq!(shift, PAGE_SHIFT_ARM64E, "unexpected page shift accepted");
+            let g = Geometry {
+                page_shift: shift,
+                max_depth: ARM64E_GEOMETRY.max_depth,
+            };
+            if g.validate().is_ok() {
+                assert!(
+                    shift == PAGE_SHIFT_ARM64E || shift == X86_64_GEOMETRY.page_shift,
+                    "unexpected page shift accepted"
+                );
             }
         }
     }
@@ -681,10 +474,10 @@ mod tests {
             directory_pfn: 1,
         };
         assert_eq!(
-            read_task_root(&r, &task, &ARM64E_GEOMETRY).unwrap_err(),
+            read_task_root(&r, &task, ARM64E_GEOMETRY).unwrap_err(),
             ResolveStatus::ErrInactiveTask
         );
-        let t = translate_root(&r, &ARM64E_GEOMETRY, 0, 1, 0, None);
+        let t = translate_root(&r, ARM64E_GEOMETRY, 0, 1, 0);
         assert_eq!(t.status, ResolveStatus::ErrZeroRootPfn);
     }
 }

@@ -15,8 +15,6 @@
 
 use reims_vgpu_wire::page_table as wire;
 
-pub(crate) use wire::{MAX_DEPTH, PTE_FLAG_MASK, PTE_PFN_MASK, PTE_SIZE};
-
 /// Offsets within a task's directory page. Narrowed from the wire crate's `u64`
 /// because every consumer here indexes a `u32` field set.
 pub const DIRECTORY_ROOT_PFN: u32 = wire::DIRECTORY_ROOT_PFN as u32;
@@ -50,7 +48,6 @@ pub const X86_64_MAX_DEPTH: u32 = wire::X86_64.max_depth;
 // No bare `PAGE_SHIFT`, `PAGE_SIZE`, `INDEX_BITS`, `INDEX_MASK` or
 // `ENTRIES_PER_TABLE`. Every one of those silently meant arm64e and caused
 // cross-arch bugs. Use the arch-prefixed name or the device `page_shift`.
-pub const CACHE_WAYS: usize = 8;
 
 /// PFN → GPA at an explicit guest page shift (12 or 14). No default.
 ///

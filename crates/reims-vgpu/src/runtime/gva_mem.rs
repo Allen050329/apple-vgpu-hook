@@ -6,7 +6,7 @@
 //! 14 = arm64e). There is no arm-default overload — callers must choose.
 
 use crate::contract::gva_resolve::{
-    read_task_root, resolve_status_name, translate_root, Cache, Geometry, PhysReader,
+    read_task_root, resolve_status_name, translate_root, translate_root_run, Geometry, PhysReader,
     ResolveStatus, Task, ARM64E_GEOMETRY, X86_64_GEOMETRY,
 };
 use crate::model::{TaskEntry, TaskTable};
@@ -25,11 +25,11 @@ impl<M: HostMemory> PhysReader for HostPhys<'_, M> {
 /// Only 12 (x86_64) and 14 (arm64e) are valid. Unknown shifts return `None`
 /// (no silent arm fallback).
 #[inline]
-pub fn geometry_for_page_shift(page_shift: u32) -> Option<&'static Geometry> {
+pub fn geometry_for_page_shift(page_shift: u32) -> Option<Geometry> {
     if page_shift == X86_64_GEOMETRY.page_shift {
-        Some(&X86_64_GEOMETRY)
+        Some(X86_64_GEOMETRY)
     } else if page_shift == ARM64E_GEOMETRY.page_shift {
-        Some(&ARM64E_GEOMETRY)
+        Some(ARM64E_GEOMETRY)
     } else {
         None
     }
@@ -58,27 +58,41 @@ pub fn read_task_gva<M: HostMemory>(
         directory_pfn: task.directory_pfn,
     };
     let root = read_task_root(&reader, &gr_task, geom).map_err(|_| MemError::TaskRootRead)?;
-    let mut cache = Cache::default();
-    let mut filled = 0usize;
-    while filled < buf.len() {
-        let cur = gva.saturating_add(filled as u64);
-        let t = translate_root(
-            &reader,
-            geom,
-            root.root_pfn,
-            root.depth,
-            cur,
-            Some(&mut cache),
-        );
-        if t.status != ResolveStatus::Ok {
-            return Err(MemError::Unresolved(t.status));
-        }
-        let page_left = geom.page_size as u64 - (cur & geom.page_offset_mask as u64);
-        let n = (buf.len() - filled).min(page_left as usize);
-        host.read_gpa(t.gpa, &mut buf[filled..filled + n])?;
-        filled += n;
+    // The run walker declines a zero root or depth by not visiting at all,
+    // which here would read as a successful read of nothing. Refuse them with
+    // the status the per-page walk used to return.
+    if root.root_pfn == 0 {
+        return Err(MemError::Unresolved(ResolveStatus::ErrZeroRootPfn));
     }
-    Ok(())
+    if root.depth == 0 {
+        return Err(MemError::Unresolved(ResolveStatus::ErrZeroDepth));
+    }
+    let (page, mask) = (geom.page_size(), geom.page_offset_mask());
+    let pages = pages_spanned(gva, buf.len() as u64, page);
+    let mut filled = 0usize;
+    let mut result: Result<(), MemError> = Ok(());
+    translate_root_run(&reader, geom, root.root_pfn, root.depth, gva, pages, &mut |_, r| {
+        let gpa = match r {
+            Ok(gpa) => gpa,
+            Err(status) => {
+                result = Err(MemError::Unresolved(status));
+                return false;
+            }
+        };
+        let cur = gva.saturating_add(filled as u64);
+        // Every page's answer carries the first page's offset; rebase it onto
+        // this page's own read position.
+        let read_gpa = (gpa & !mask) + (cur & mask);
+        let page_left = page - (cur & mask);
+        let n = (buf.len() - filled).min(page_left as usize);
+        if let Err(e) = host.read_gpa(read_gpa, &mut buf[filled..filled + n]) {
+            result = Err(e);
+            return false;
+        }
+        filled += n;
+        true
+    });
+    result
 }
 
 /// Read `[gva, gva+len)` under the task the guest named. **That task, or an
@@ -267,33 +281,46 @@ pub fn write_task_gva<M: HostMemory>(
         active: true,
         directory_pfn: task.directory_pfn,
     };
-    let root = {
+    let (page, mask) = (geom.page_size(), geom.page_offset_mask());
+    // Resolve first, then write: the walk borrows the host to read page tables
+    // and the writes need it mutably, so the two cannot interleave.
+    let mut page_gpas = Vec::new();
+    let mut refused = None;
+    {
         let reader = HostPhys(&*host);
-        read_task_root(&reader, &gr_task, geom).map_err(|_| MemError::TaskRootRead)?
-    };
-    let mut cache = Cache::default();
-    let mut written = 0usize;
-    while written < buf.len() {
-        let cur = gva.saturating_add(written as u64);
-        let t = {
-            let reader = HostPhys(&*host);
-            translate_root(
-                &reader,
-                geom,
-                root.root_pfn,
-                root.depth,
-                cur,
-                Some(&mut cache),
-            )
-        };
-        if t.status != ResolveStatus::Ok {
-            return Err(MemError::Unresolved(t.status));
+        let root = read_task_root(&reader, &gr_task, geom).map_err(|_| MemError::TaskRootRead)?;
+        if root.root_pfn == 0 {
+            return Err(MemError::Unresolved(ResolveStatus::ErrZeroRootPfn));
         }
-        let page_left = geom.page_size as u64 - (cur & geom.page_offset_mask as u64);
+        if root.depth == 0 {
+            return Err(MemError::Unresolved(ResolveStatus::ErrZeroDepth));
+        }
+        let pages = pages_spanned(gva, buf.len() as u64, page);
+        translate_root_run(&reader, geom, root.root_pfn, root.depth, gva, pages, &mut |_, r| {
+            match r {
+                Ok(gpa) => {
+                    page_gpas.push(gpa & !mask);
+                    true
+                }
+                Err(status) => {
+                    refused = Some(status);
+                    false
+                }
+            }
+        });
+    }
+    if let Some(status) = refused {
+        return Err(MemError::Unresolved(status));
+    }
+    let mut written = 0usize;
+    for page_gpa in page_gpas {
+        let cur = gva.saturating_add(written as u64);
+        let page_left = page - (cur & mask);
         let n = (buf.len() - written).min(page_left as usize);
-        host.write_gpa(t.gpa, &buf[written..written + n])?;
+        host.write_gpa(page_gpa + (cur & mask), &buf[written..written + n])?;
         written += n;
     }
+    debug_assert_eq!(written, buf.len());
     Ok(())
 }
 
@@ -347,19 +374,10 @@ pub fn any_task_gva_page_resolves<M: HostMemory>(
     page_shift: u32,
 ) -> bool {
     let mut found = false;
-    visit_task_gva_page_gpas(
-        host,
-        tasks,
-        task_id,
-        gva,
-        span.max(1),
-        page_shift,
-        1,
-        &mut |_| {
-            found = true;
-            false
-        },
-    );
+    visit_task_gva_page_gpas(host, tasks, task_id, gva, span.max(1), page_shift, &mut |_| {
+        found = true;
+        false
+    });
     found
 }
 
@@ -490,12 +508,10 @@ pub fn write_task_gva_product_within<H: HostMemory + crate::runtime::host::HostO
 /// same selection as [`read_task_gva_by_id`] and
 /// [`crate::runtime::gva_view::write_span_within`]'s resolver — and call `visit` with
 /// each page-aligned GPA. Stops early when `visit` returns `false`.
-/// `stride_pages` visits every Nth page plus always the last (1 = every page);
-/// callers trade probe density against walk cost.
 ///
 /// This is a lookup, not a validator: pages that fail to translate are
 /// skipped silently — the content read that follows fails (and fail-logs) on
-/// its own terms. One page-walk cache and one root read span the whole range.
+/// its own terms. One root read and one descent span the whole range.
 ///
 /// **The named task, or no pages.** This was the last of four sites that fell
 /// back to `task_id >> 1` when the named slot had no page table to walk. The
@@ -518,10 +534,6 @@ pub fn write_task_gva_product_within<H: HostMemory + crate::runtime::host::HostO
 /// builder and the deferred-Store arm both compare the page count against the
 /// span and decline, and the compute rail reports its count as `pages=` on an
 /// always-on line.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the visitor API exposes task, span, page geometry, and callback state explicitly"
-)]
 pub fn visit_task_gva_page_gpas<M: HostMemory>(
     host: &M,
     tasks: &TaskTable,
@@ -529,22 +541,14 @@ pub fn visit_task_gva_page_gpas<M: HostMemory>(
     gva: u64,
     span: u64,
     page_shift: u32,
-    stride_pages: u64,
     visit: &mut dyn FnMut(u64) -> bool,
 ) {
-    visit_task_gva_pages(
-        host,
-        tasks,
-        task_id,
-        gva,
-        span,
-        page_shift,
-        stride_pages,
-        &mut |gpa| match gpa {
+    visit_task_gva_pages(host, tasks, task_id, gva, span, page_shift, &mut |gpa| {
+        match gpa {
             Some(gpa) => visit(gpa),
             None => true,
-        },
-    );
+        }
+    });
 }
 
 /// How many guest pages `[gva, gva+span)` touches, given `page_size`.
@@ -574,7 +578,7 @@ pub fn task_gva_page_gpas<M: HostMemory>(
     page_shift: u32,
 ) -> Vec<u64> {
     let mut out = Vec::new();
-    visit_task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift, 1, &mut |gpa| {
+    visit_task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift, &mut |gpa| {
         out.push(gpa);
         true
     });
@@ -596,21 +600,17 @@ pub fn task_gva_page_gpa_set<M: HostMemory>(
     page_shift: u32,
 ) -> std::collections::HashSet<u64> {
     let mut out = std::collections::HashSet::new();
-    visit_task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift, 1, &mut |gpa| {
+    visit_task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift, &mut |gpa| {
         out.insert(gpa);
         true
     });
     out
 }
 
-/// Shared page-table walk behind [`visit_task_gva_page_gpas`]: one root read and
-/// one walk cache for the whole range, visiting every `stride_pages`-th page
-/// plus the exact last page. Reports an unresolved page as `None` rather than
-/// dropping it, which is what a caller recording *which* pages it read needs.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the visitor API exposes task, span, page geometry, and callback state explicitly"
-)]
+/// Shared page-table walk behind [`visit_task_gva_page_gpas`]: one root read
+/// and one descent for the whole range, visiting every page in order. Reports
+/// an unresolved page as `None` rather than dropping it, which is what a caller
+/// recording *which* pages it read needs.
 fn visit_task_gva_pages<M: HostMemory>(
     host: &M,
     tasks: &TaskTable,
@@ -618,10 +618,9 @@ fn visit_task_gva_pages<M: HostMemory>(
     gva: u64,
     span: u64,
     page_shift: u32,
-    stride_pages: u64,
     visit: &mut dyn FnMut(Option<u64>) -> bool,
 ) {
-    if span == 0 || stride_pages == 0 {
+    if span == 0 {
         return;
     }
     let Some(geom) = geometry_for_page_shift(page_shift) else {
@@ -641,53 +640,23 @@ fn visit_task_gva_pages<M: HostMemory>(
     let Ok(root) = read_task_root(&reader, &gr_task, geom) else {
         return;
     };
-    let page = geom.page_size as u64;
-    let first = gva & !(page - 1);
-    let last = gva.saturating_add(span - 1) & !(page - 1);
-    let step = page.saturating_mul(stride_pages);
+    let page = geom.page_size();
     // Every page of the run, which is the shape the licence check and the
     // guest-run resolvers ask for. One descent is shared across the pages whose
-    // upper indices match, instead of `depth` guest reads per page — the cache
-    // below cannot do that, because it holds finished translations keyed by the
-    // exact page index and a run visits each index exactly once.
-    if stride_pages == 1 {
-        let pages = ((last - first) / page) + 1;
-        crate::contract::gva_resolve::translate_root_run(
-            &reader,
-            geom,
-            root.root_pfn,
-            root.depth,
-            first,
-            pages,
-            &mut |_, gpa| visit(gpa.map(|g| g & !(page - 1))),
-        );
-        return;
-    }
-    let mut cache = Cache::default();
-    let mut cur = first;
-    loop {
-        let t = translate_root(
-            &reader,
-            geom,
-            root.root_pfn,
-            root.depth,
-            cur,
-            Some(&mut cache),
-        );
-        let resolved = (t.status == ResolveStatus::Ok).then(|| t.gpa & !(page - 1));
-        if !visit(resolved) {
-            return;
-        }
-        if cur == last {
-            return;
-        }
-        // Always end on the exact last page so span tails are covered.
-        cur = cur.saturating_add(step).min(last);
-    }
+    // upper indices match, instead of `depth` guest reads per page.
+    translate_root_run(
+        &reader,
+        geom,
+        root.root_pfn,
+        root.depth,
+        gva & !(page - 1),
+        pages_spanned(gva, span, page),
+        &mut |_, gpa| visit(gpa.ok().map(|g| g & !(page - 1))),
+    );
 }
 
 /// Every page of `[gva, gva+span)` in order, resolved through one root read and
-/// one walk cache, with `None` for a page the table cannot translate.
+/// one descent, with `None` for a page the table cannot translate.
 ///
 /// [`visit_task_gva_page_gpas`] drops the unresolved pages; a caller checking a
 /// cached page list against the live table needs them, because "page 40 does not
@@ -709,7 +678,7 @@ pub fn visit_task_gva_pages_in_order<M: HostMemory>(
     page_shift: u32,
     visit: &mut dyn FnMut(Option<u64>) -> bool,
 ) {
-    visit_task_gva_pages(host, tasks, task_id, gva, span, page_shift, 1, visit);
+    visit_task_gva_pages(host, tasks, task_id, gva, span, page_shift, visit);
 }
 
 /// Translate one GVA to a GPA under the task directory (single page).
@@ -729,7 +698,7 @@ pub fn translate_task_gva<M: HostMemory>(
         directory_pfn: task.directory_pfn,
     };
     let root = read_task_root(&reader, &gr_task, geom).ok()?;
-    let t = translate_root(&reader, geom, root.root_pfn, root.depth, gva, None);
+    let t = translate_root(&reader, geom, root.root_pfn, root.depth, gva);
     if t.status != ResolveStatus::Ok {
         return None;
     }
@@ -776,7 +745,7 @@ pub fn diagnose_task_slot<M: HostMemory>(
             );
         }
     };
-    let t = translate_root(&reader, geom, root.root_pfn, root.depth, gva, None);
+    let t = translate_root(&reader, geom, root.root_pfn, root.depth, gva);
     if t.status == ResolveStatus::Ok {
         format!(
             "tid={task_id} act=1 dir={:#x} root={:#x} depth={} st=ok gpa={:#x} leaf_pfn={:#x}",
@@ -1240,35 +1209,17 @@ mod tests {
         // The donor really can serve it — otherwise this test would pass for the
         // wrong reason.
         let mut donor = Vec::new();
-        visit_task_gva_page_gpas(
-            &host,
-            &state.tasks,
-            2,
-            0x1000,
-            4,
-            PAGE_SHIFT_X86,
-            1,
-            &mut |gpa| {
-                donor.push(gpa);
-                true
-            },
-        );
+        visit_task_gva_page_gpas(&host, &state.tasks, 2, 0x1000, 4, PAGE_SHIFT_X86, &mut |gpa| {
+            donor.push(gpa);
+            true
+        });
         assert_eq!(donor, vec![data_gpa], "task 2 resolves GVA page 1");
 
         let mut pages = Vec::new();
-        visit_task_gva_page_gpas(
-            &host,
-            &state.tasks,
-            5,
-            0x1000,
-            4,
-            PAGE_SHIFT_X86,
-            1,
-            &mut |gpa| {
-                pages.push(gpa);
-                true
-            },
-        );
+        visit_task_gva_page_gpas(&host, &state.tasks, 5, 0x1000, 4, PAGE_SHIFT_X86, &mut |gpa| {
+            pages.push(gpa);
+            true
+        });
         assert!(
             pages.is_empty(),
             "no neighbour's pages may be indexed under task 5, got {pages:x?}"
