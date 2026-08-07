@@ -203,7 +203,7 @@ const ROWS: &[(&str, usize, Guarded, &str)] = &[
     ),
     (
         "reims-vgpu/src/runtime/drain/mod.rs",
-        14,
+        15,
         Guarded::EmitsOnly,
         "packet and doorbell reporters plus cursor_glyph_fail and its six \
          callers. cursor_glyph_fail is the best-shaped site in the tree and \
@@ -222,7 +222,11 @@ const ROWS: &[(&str, usize, Guarded, &str)] = &[
          verdict depend on whether this shape had been seen before. The \
          fourteenth is `note_stamp_direction`, which returns `()` and whose \
          three counters are all raised outside the latch, so only the line for \
-         a slot moving backwards dedupes",
+         a slot moving backwards dedupes. The fifteenth is \
+         `display_online_never_enabled`, where the latch is the second term of \
+         an `&&`: the first term is the wait bound and the `return` that ends \
+         that arm sits outside the whole block, so the latch decides the line \
+         and never whether the poll continues",
     ),
     (
         "reims-vgpu/src/runtime/draw/metal_icb.rs",

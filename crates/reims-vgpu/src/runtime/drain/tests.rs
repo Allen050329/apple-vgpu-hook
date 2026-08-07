@@ -1989,14 +1989,20 @@ fn display_lifecycle_events_are_always_logged() {
 /// channel, and both are latched because each recurs on every poll for the rest
 /// of the boot.
 ///
-/// The third exit, `mask & ONLINE == 0`, is deliberately absent from this test
-/// and from the log: that is the guest having published the page and not yet
-/// called `enable()`, which is exactly the state the poll exists to wait out.
+/// The third exit, `mask & ONLINE == 0`, has its own test below. It used to be
+/// described here as "deliberately absent from this test and from the log",
+/// and the second half of that stopped being true when it gained a bounded
+/// report of its own.
 #[test]
 fn the_two_ways_online_gives_up_are_both_fail_visible() {
     let index = 3u32;
 
-    // Exhaustion: the guest published the page and never enabled the display.
+    // Exhaustion. This case sets `online_tries` to the cap directly, and what
+    // that models is a guest that **enabled** the display and acked none of the
+    // 150 ONLINE pulses — not, as this comment used to say, one that never
+    // enabled. The increment sits past the enable-mask check, so a guest that
+    // never enables cannot reach this branch at all, which is what
+    // `a_guest_that_never_enables_cannot_reach_the_online_cap` pins.
     {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut host = FakeHost::new();
@@ -2048,6 +2054,64 @@ fn the_two_ways_online_gives_up_are_both_fail_visible() {
             unreadable + DISPLAY_SHARED_ENABLE_MASK
         )),
         "an unreadable enable mask must not look like a guest that declined"
+    );
+}
+
+/// A guest that publishes the display shared page and never enables it cannot
+/// reach the ONLINE cap, and now says so on its own.
+///
+/// This is the case `display_online_abandoned` was worded as covering and
+/// structurally cannot: `online_tries` is incremented at the tail of
+/// `try_display_online`, past the enable-mask check, so a guest sitting at that
+/// check leaves the counter at zero however long it polls. Before the report
+/// below it emitted nothing at all — no `signal`, no `abandoned` — so the state
+/// a user sees as a black screen was the one state with a clean log.
+///
+/// Both halves are asserted because each fails differently. The counter staying
+/// at zero is what makes the *old* wording impossible; the line appearing is
+/// what makes the state visible. A fix that only did the second would leave the
+/// abandon line still able to mean two things.
+#[test]
+fn a_guest_that_never_enables_cannot_reach_the_online_cap() {
+    // Its own display index: the report is latched per index by `first_sight`,
+    // so sharing one with another test would consume the latch and leave this
+    // asserting on a line some earlier test emitted.
+    let index = 21u32;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let gpa = 0x7d000000u64;
+    // Mapped and readable, and left as zeroes: a readable mask with the enable
+    // bit clear is exactly the state under test, and an *unmapped* page would
+    // take the unreadable arm instead.
+    host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+    state.display.shared_gpa = gpa;
+    state.display.display_index = index;
+
+    // Past the reporting bound, so the next acted poll is the one that reports.
+    // Poll the full divisor so the cadence gate is crossed rather than assumed.
+    state.display.poll_ctr = DISPLAY_ONLINE_MAX_TRIES * DISPLAY_ONLINE_POLL_DIVISOR + 1;
+    for _ in 0..DISPLAY_ONLINE_POLL_DIVISOR {
+        try_display_online(&mut state, &mut host);
+    }
+
+    assert_eq!(
+        state.display.online_tries, 0,
+        "no ONLINE pulse was sent, so the cap can never be reached this way — \
+         which is why the abandon line cannot mean what it used to say"
+    );
+    assert!(
+        host.actions.is_empty(),
+        "and nothing was asserted at the guest"
+    );
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.contains(&format!("display_online_never_enabled index={index}")),
+        "a display that never comes online must not leave a clean log"
+    );
+    assert!(
+        !log.contains(&format!("display_online_abandoned index={index}")),
+        "and it must not borrow the other exit's name"
     );
 }
 

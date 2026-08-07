@@ -3973,17 +3973,31 @@ pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host
         return;
     }
     if state.display.online_tries >= DISPLAY_ONLINE_MAX_TRIES {
-        // Reaching the cap means this device has stopped asserting ONLINE and
-        // will not assert it again for the life of the boot. If the guest has
-        // not acked by now it never will, and the desktop the user is waiting
-        // for is not coming — with, until this line, nothing in the log to say
-        // so. A give-up is the loudest thing a device can do quietly.
+        // Reaching the cap means this device has stopped asserting ONLINE for
+        // this shared-state generation. The desktop the user is waiting for is
+        // not coming — with, until this line, nothing in the log to say so. A
+        // give-up is the loudest thing a device can do quietly.
+        //
+        // **What it means is the opposite of what this line used to say.**
+        // `online_tries` is incremented at the tail of this function, past the
+        // `enable()` mask check, so it only counts ONLINE pulses delivered to a
+        // guest that *has* enabled. A guest that never enables returns at that
+        // check and never increments it, so it can never reach this cap — the
+        // one guest state the old wording named is the one state that cannot
+        // produce this line. What it actually reports is a guest that enabled,
+        // took 150 ONLINE pulses, and acked none of them.
+        //
+        // Nor is it "for the life of the boot": `apply_setup_shared_state`
+        // zeroes `online_tries` and `poll_ctr`, so a `setupSharedState` reinit
+        // hands the handshake a fresh 150. Both corrections matter to whoever
+        // is debugging a black screen, because each sent them at the wrong half
+        // of the rail.
         //
         // Latched on the display index rather than counted: the cap is crossed
-        // on every subsequent poll for the rest of the boot, so a per-crossing
-        // line would be a ~5 Hz flood of the same fact. `online_tries` is on the
-        // `display_online_signal` line at the other end of the same rail, so the
-        // pair brackets the whole handshake.
+        // on every subsequent poll until a reinit, so a per-crossing line would
+        // be a ~5 Hz flood of the same fact. `display_online_signal` fires on
+        // the *first* pulse of the same generation, so that line always precedes
+        // this one and the pair brackets the whole handshake.
         if crate::observe::first_sight(
             "display_online_abandoned",
             u64::from(state.display.display_index),
@@ -3991,8 +4005,8 @@ pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host
             crate::observe::fail(format!(
                 "display_online_abandoned index={} tries={DISPLAY_ONLINE_MAX_TRIES} \
                  divisor={DISPLAY_ONLINE_POLL_DIVISOR} \
-                 (the guest never enabled the display; ONLINE will not be \
-                 asserted again this boot)",
+                 (the guest enabled the display and acked none of the ONLINE \
+                 pulses; no more are sent until a setupSharedState reinit)",
                 state.display.display_index
             ));
         }
@@ -4013,9 +4027,14 @@ pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host
     {
         // The guest published this page's address itself, so a read of it that
         // the host cannot perform is not expected control flow — it is the
-        // handshake's only input becoming unreadable. Silently returning here
-        // spends one of the finite tries and then, at the cap, looks exactly
-        // like a guest that chose not to enable the display.
+        // handshake's only input becoming unreadable.
+        //
+        // It does **not** spend a try, which this comment used to claim: the
+        // return here is upstream of the increment at the tail, so an
+        // unreadable mask spends a *poll* and the cap is never reached. The
+        // handshake then polls forever with this one latched line as its only
+        // trace, which is why the line has to be here rather than left to the
+        // cap to report.
         //
         // Latched on the address, because whatever makes a GPA unreadable makes
         // it unreadable on every poll.
@@ -4033,6 +4052,34 @@ pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host
     // Not a failure: the guest has published the page but not yet called
     // `enable()`. This is the state the poll exists to wait out.
     if mask & DISPLAY_ONLINE_EVENT_MASK == 0 {
+        // Waiting it out has no end, though, and this is the state that had no
+        // instrument at all — the one `display_online_abandoned` was worded as
+        // though it covered and structurally cannot. A guest that publishes the
+        // shared page and never enables polls here at the divisor's cadence for
+        // the life of the generation, emitting nothing: no `signal`, no
+        // `abandoned`, and a black screen with a clean log.
+        //
+        // So the wait is bounded for *reporting* only — the poll continues
+        // afterwards, because the guest may still enable and there is no reason
+        // to stop offering. The bound is the same span the cap already spends,
+        // `MAX_TRIES` pulses at one per `DIVISOR` ticks, so no new number is
+        // introduced and the two halves of the handshake time out alike.
+        let waited = u64::from(DISPLAY_ONLINE_MAX_TRIES) * u64::from(DISPLAY_ONLINE_POLL_DIVISOR);
+        if u64::from(state.display.poll_ctr) > waited
+            && crate::observe::first_sight(
+                "display_online_never_enabled",
+                u64::from(state.display.display_index),
+            )
+        {
+            crate::observe::fail(format!(
+                "display_online_never_enabled index={} gpa={:#x} mask={mask:#x} polls={} \
+                 (the guest published the display shared page and has not set the \
+                 enable bit; ONLINE has never been asserted and the poll continues)",
+                state.display.display_index,
+                gpa + DISPLAY_SHARED_ENABLE_MASK,
+                state.display.poll_ctr,
+            ));
+        }
         return;
     }
     // pending word is atomic read-and-clear on the guest side.
