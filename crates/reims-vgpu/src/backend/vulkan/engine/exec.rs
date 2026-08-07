@@ -191,10 +191,9 @@ unsafe fn stage_buffer_content(
                 pools.note_guest_read_recorded();
                 counters.note_buffer_guest_import(src.total_len);
                 bound
-            } else if let Some((bound, pending)) = {
-                let _s = stage_phase::Span::moving(stage_phase::Part::Gather, src.total_len);
+            } else if let Some((bound, pending)) =
                 unsafe { gather_guest_buffer_window(ctx, pools, counters, src, usage)? }
-            } {
+            {
                 // The copies read guest RAM when the CB executes, exactly as a
                 // direct bind does, so this owes the same quiesce.
                 pools.note_guest_read_recorded();
@@ -312,6 +311,14 @@ unsafe fn gather_guest_buffer_window(
         crate::runtime::drain::note_store_route("zc_buf_gather_wide");
         return Ok(None);
     }
+    // From here on this window costs something, so from here on it is charged.
+    // Opening the span above would count every *attempt* — and on a host that
+    // cannot import, every attempt returns at the first line, so `gather_n`
+    // would report the CPU rail's whole traffic as gathers and `gather_b` would
+    // claim bytes the GPU never moved. A driven `REIMS_VGPU_GUEST_IMPORT=off`
+    // boot read `gather_n=288196` beside `buffer_guest_gathers=0` before this
+    // moved.
+    let _span = stage_phase::Span::moving(stage_phase::Part::Gather, src.total_len);
     // Plan before acquiring, so a window that turns out not to be gatherable
     // does not take a destination slot out of the pool to abandon it.
     let mut sources: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
