@@ -70,7 +70,34 @@
 //! were a retained image the cache had dropped. So the cache is not the lever.
 //! `gw_audit_unsound` at 0 says the witness stayed sound throughout.
 //!
-//! **`gw_refused_host_write` is not yet "this device wrote these pages".**
+//! # It was the ring, not the writes: `gw_hw_aged` 4275 against `gw_hw_overlap` 5
+//!
+//! The split below was measured on the next driven boot and the attribution
+//! above is **wrong**:
+//!
+//! ```text
+//! gw_hw_quiet          5706
+//! gw_hw_aged           4275     (gw_refused_host_write 4204)
+//! gw_hw_overlap           5
+//! gw_hw_unnamed           0
+//! gw_hw_unresolvable      0
+//! ```
+//!
+//! Five binds in 9986 had a recorded write that actually covers the window.
+//! Every other refusal is
+//! [`crate::runtime::host_writes::HostWrites`]'s ring having dropped the writes
+//! the reader is asking about, so it cannot say nothing touched them. This
+//! device is *not* writing the windows it samples; it is failing to remember
+//! that it did not. 43 % of every witness ask on that boot was refused for that
+//! one reason, and each refusal costs a full re-gather.
+//!
+//! `RING`'s own doc sized it from "~28 host writes a second against ~330 gathers
+//! a second, so the usual answer is zero entries to scan". That held for the
+//! workload it was measured on and does not hold under compositing. Band the
+//! requested reach before choosing a new size — the number wanted is how far
+//! back a reader asks, and nothing has measured it yet.
+//!
+//! **`gw_refused_host_write` is not "this device wrote these pages".**
 //! [`crate::runtime::host_writes::HostWrites::wrote_any_since`] answers "written"
 //! for four different reasons and only one of them is a write that landed in the
 //! window: the other three are its fail-closed rule — a writer that named no

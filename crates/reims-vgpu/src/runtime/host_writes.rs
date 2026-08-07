@@ -156,6 +156,26 @@ pub struct HostWrites {
 /// can fall between two binds of the same sampled window — one driven boot read
 /// ~28 host writes a second against ~330 gathers a second, so the usual answer is
 /// zero entries to scan and the tail is single digits.
+///
+/// # That sizing does not survive compositing, and this is the rail's largest cost
+///
+/// A driven x86/PCI Safari drag reads
+/// [`HostWriteVerdict::Aged`] **4275** times against
+/// [`HostWriteVerdict::Overlap`] **5**, out of 9986 asks. So 43 % of every
+/// question [`crate::runtime::gather_witness`] puts to this record is refused
+/// because the ring no longer holds the writes being asked about — not because
+/// anything wrote the window — and each refusal costs that window a full
+/// re-gather out of guest RAM. The paragraph above is what a quiet workload
+/// measures; under compositing the write rate between two binds of one window
+/// exceeds this.
+///
+/// **Do not simply raise the number.** What is wanted is the distribution of
+/// `epoch - since` at the moment a reader asks, and nothing measures it yet: a
+/// reach that is usually 70 and a reach that is usually 7000 both produce the
+/// reading above, and only one of them is fixed by a bigger ring. The other is
+/// fixed by writers that name their pages, since a `Pages` entry rules itself
+/// out of windows it never touched and an aged-out one cannot. Band the reach
+/// first.
 const RING: usize = 64;
 
 impl HostWrites {
