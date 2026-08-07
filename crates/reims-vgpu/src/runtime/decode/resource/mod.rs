@@ -2521,6 +2521,14 @@ pub fn decode_render_pipeline_descriptor(
 /// than property-list containers, so their fourth header word is a declared
 /// field of the struct and not a payload length. The relation would be false
 /// there, and asking it would be reading one format's rule into another.
+///
+/// **Both halves have now been booted, which is worth stating because a
+/// `kind=compute` zero could have meant the arm never ran.** The compute arm was
+/// added a commit after the render one and had no boot behind it; a later driven
+/// x86 boot reported `type7_pipeline_shape kind=compute` twice against
+/// `kind=render` four times, so the compute arm decoded two real descriptors and
+/// agreed on both. The denominator to quote for this instrument is that shape
+/// line, not this one, because this one is silent on success by construction.
 fn note_type7_payload_len(kind: &'static str, payload: u32, declared: usize) {
     let padded = (payload as usize).next_multiple_of(4);
     if TYPE7_FIRST_TLVS.checked_add(padded) == Some(declared) {
@@ -2554,6 +2562,17 @@ fn note_type7_payload_len(kind: &'static str, payload: u32, declared: usize) {
 /// guest state this device drops with no name for what it was — the loss class
 /// with the least to go on, because unlike a tag it cannot even be reported by
 /// number in a way that identifies the property.
+///
+/// **Its zero is not yet a measurement, and the denominator says so.** Both
+/// callers sit inside [`parse_compute_stage_input_block`], and on a driven x86
+/// boot — Safari composited over a Ventura desktop, 25 s of window drag —
+/// `type7_pipeline_shape` reported two compute pipelines while
+/// `compute_stage_input_decoded` reported **none**. Neither compute pipeline
+/// carried a stage-input block at all, so no entry word was ever offered to this
+/// function and its silence is an empty walk rather than a clean one. That is
+/// exactly the confusion the denominator was added to break, and it broke it on
+/// the first boot that had both halves compiled in. A workload that builds a
+/// stage-input compute pipeline is what would turn this zero into a reading.
 ///
 /// Latched per `(kind, unread bits)` rather than per word, so a field that
 /// varies within the read bits does not re-report, and a *new* unread bit does.
@@ -3637,6 +3656,12 @@ pub fn parse_compute_stage_input_block(
     // `note_color_entry_fields` states for the tag form; the bit form needs it
     // more, because a stage-input block is optional and this walk answers `None`
     // from six earlier returns.
+    //
+    // On the first driven x86 boot that carried both halves it read **absent**,
+    // against two decoded compute pipelines — so this guest's compute pipelines
+    // have no stage-input block and the walk above never runs. The split earned
+    // its keep immediately: without it the same boot would have been quoted as
+    // "no unread bits in a stage-input entry".
     if crate::observe::first_sight(
         "compute_stage_input_decoded",
         (u64::from(layout_count) << 32) | u64::from(attr_count),
