@@ -393,10 +393,12 @@ a revocation handle for a primitive that exists on all three hosts. If a host is
 migrating a page under a live import, that is a real defect with a measurement — it belongs in
 `kb/`, not in a retrofitted guarantee here.
 
-Guest RAM no longer has to be **fd-backed**: the import is over an ordinary mapping, so a plain `-m`
-allocation works. `memory-backend-memfd,share=on` stays in the boot scripts for a different reason —
-`storage_flush/fence.rs` records that the shared memfd is what makes uffd minor-fault mode
-applicable — and that reasoning is independent of how the GPU reaches the pages.
+Guest RAM is not **fd-backed**: the import is over an ordinary mapping, so `vm/boot-x86.sh` uses a
+plain `-m` allocation. `memory-backend-memfd,share=on` outlived the dma-buf rail it was for, on the
+grounds that a shared memfd is what makes uffd minor-fault mode applicable; it is gone, because uffd
+needs a privilege QEMU does not have on the dev host anyway. Restoring the backing is a
+prerequisite for ever wanting uffd here — `storage_flush/fence.rs` keeps what changes — but it buys
+nothing alone.
 
 So the deferred-flush rail — the device's largest cost — is retired by writing into guest pages
 directly, which is what `storage_flush` always said would retire it. Read that module's own

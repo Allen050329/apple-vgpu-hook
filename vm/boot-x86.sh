@@ -296,22 +296,11 @@ fi
 
 # --- Build the QEMU command line ------------------------------------------------
 # q35 + OVMF + AppleSMC + SATA OpenCore/HDD. Display is attached below.
-#
-# Guest RAM is memfd-backed rather than an anonymous mapping. The GPU rail no
-# longer needs it — guest pages reach the host GPU by importing the RAMBlock
-# mapping QEMU already holds, which works over an ordinary `-m` allocation — but
-# `storage_flush/fence.rs` records that a *shared* memfd is what makes uffd
-# minor-fault mode applicable, and that reasoning is independent of how the GPU
-# reads the pages.
-#
-# `share=on` is required rather than tidy: a private mapping is copy-on-write,
-# so the GPU's view and the guest's would diverge the first time either wrote.
 QEMU_ARGS=(
   -enable-kvm
   -m "$RAM"
-  -object "memory-backend-memfd,id=reims-ram,size=$RAM,share=on"
   -cpu "${CPU_MODEL},-hle,-rtm,kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,${CPU_OPTIONS}"
-  -machine q35,memory-backend=reims-ram
+  -machine q35
   -smp "$CPU_THREADS",cores="$CPU_CORES",sockets="$CPU_SOCKETS"
   -device qemu-xhci,id=xhci
   -device usb-kbd,bus=xhci.0

@@ -567,9 +567,9 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 ///   once.
 /// - Punching a page out loses whatever the guest had put there, so the content
 ///   to fill with has to be captured before the punch, not after. This one is
-///   `MISSING`-mode only; guest RAM here is a shared memfd, where minor-fault
-///   mode unmaps without evicting the page cache and there is nothing to
-///   capture. See "Which pages to register" below.
+///   `MISSING`-mode only, and `MISSING` is now the *only* mode available: guest
+///   RAM is a plain `-m` allocation, so the shmem minor-fault escape below is
+///   gone with the memfd backing. See "Which pages to register" below.
 ///
 /// ## What the rail is worth, and the second-order cost of not doing it
 ///
@@ -636,25 +636,27 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 ///   QEMU's own RAMBlock pointer, and answers `map_pages_stable = 1` for exactly
 ///   that reason. A registration on that range does trap the vCPU.
 ///
-///   Guest RAM is **shmem, not anonymous**, and that changes which uffd mode
-///   applies. Nothing about how the GPU reaches guest pages asks for that — a
-///   host-pointer import is taken over an ordinary mapping, so a plain `-m`
-///   allocation would serve it. `vm/boot-x86.sh` passes
-///   `memory-backend-memfd,share=on` for this section's own reason, and the
-///   consequence is favourable rather than not.
+///   Guest RAM is **anonymous, not shmem**, which decides the uffd mode and is
+///   the less favourable of the two. `vm/boot-x86.sh` allocates it with a plain
+///   `-m`: the GPU reaches guest pages by importing the RAMBlock mapping QEMU
+///   already holds, and that import is taken over an ordinary mapping, so
+///   nothing on the GPU rail asks for a backing file.
 ///
-///   `MISSING` mode over shmem needs the page punched out of the *file*, which
-///   is the third hazard below; but a shared memfd keeps the content in the
-///   page cache, so the applicable primitive is minor-fault mode
-///   (`UFFD_FEATURE_MINOR_SHMEM`, Linux 5.19+; this host runs 7.1.3). A page
-///   unmapped from the VMA but still in the page cache raises a *minor* fault,
-///   and `UFFDIO_CONTINUE` maps the cached page back with no copy and no
-///   content to have captured first. That is the mode post-copy uses for shared
-///   memory, and it is the one a rail re-arming the same pages every frame
-///   wants: arming costs an unmap, not a punch.
+///   It was `memory-backend-memfd,share=on` until that was removed, and this
+///   section is why it survived the dma-buf rail it was originally for. A
+///   shared memfd keeps content in the page cache, which makes minor-fault mode
+///   applicable (`UFFD_FEATURE_MINOR_SHMEM`, Linux 5.19+; this host runs
+///   7.1.3): a page unmapped from the VMA but still cached raises a *minor*
+///   fault, and `UFFDIO_CONTINUE` maps it back with no copy and no content to
+///   have captured first. Arming would cost an unmap rather than a punch, which
+///   is what a rail re-arming the same pages every frame wants.
 ///
-///   None of which makes uffd available here — see the privilege section below,
-///   which is unchanged and is what actually decides the mechanism.
+///   Over anonymous memory that mode does not exist, so this rail would be back
+///   to `MISSING` and to the capture-before-punch hazard below. **Restoring the
+///   memfd is a prerequisite for wanting uffd here, not a detail** — but it buys
+///   nothing on its own, because uffd is unavailable on this host for an
+///   unrelated reason: see the privilege section below, which is unchanged and
+///   is what actually decides the mechanism.
 /// - **arm64/MMIO cannot take this route at all**, for two independent reasons.
 ///   Its shim answers `map_pages_stable = 0` because a page list that is not
 ///   host-contiguous gets a packed `mach_vm_remap` view — a second alias, which
