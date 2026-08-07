@@ -207,8 +207,8 @@ fn collect_span_gpas<M: HostMemory>(
     let geom = geometry_for_page_shift(page_shift).ok_or(MemError::UnsupportedPageShift)?;
     let page_size = geom.page_size();
     struct HostPhys<'a, M: HostMemory>(&'a M);
-    impl<M: HostMemory> crate::contract::gva_resolve::PhysReader for HostPhys<'_, M> {
-        fn read_phys(&self, gpa: u64, dst: &mut [u8]) -> bool {
+    impl<M: HostMemory> reims_vgpu_wire::mem::GuestMemory for HostPhys<'_, M> {
+        fn read_at(&self, gpa: u64, dst: &mut [u8]) -> bool {
             self.0.read_gpa(gpa, dst).is_ok()
         }
     }
@@ -259,42 +259,7 @@ fn collect_span_gpas<M: HostMemory>(
     Ok(gpas)
 }
 
-/// Maximal packed-contig runs in a page-GPA list (product Linux `map_pages`).
-///
-/// Each run is a half-open index range `[start, end)` into `gpas` where
-/// `gpas[i+1] == gpas[i] + page_size`. Callers multi-import one run at a time.
-pub fn contig_page_runs(gpas: &[u64], page_size: u64) -> Vec<std::ops::Range<usize>> {
-    if gpas.is_empty() || page_size == 0 {
-        return Vec::new();
-    }
-    let mut runs = Vec::new();
-    let mut start = 0usize;
-    for i in 1..gpas.len() {
-        if gpas[i] != gpas[i - 1].wrapping_add(page_size) {
-            runs.push(start..i);
-            start = i;
-        }
-    }
-    runs.push(start..gpas.len());
-    runs
-}
-
-/// How many runs [`contig_page_runs`] would return, without building them.
-///
-/// The packed-view pre-check and the lines that report a fragmented decline
-/// both want only the count, and on this rail the fragmented answer is the
-/// common one: a compositor mapping of 2040 pages in 511 runs is asked hundreds
-/// of times a second, and materializing a 511-element `Vec` to read its `len()`
-/// was the entire cost of the check. Counting the breaks is the same traversal
-/// with no allocation.
-pub fn contig_run_count(gpas: &[u64], page_size: u64) -> usize {
-    if gpas.is_empty() || page_size == 0 {
-        return 0;
-    }
-    1 + (1..gpas.len())
-        .filter(|&i| gpas[i] != gpas[i - 1].wrapping_add(page_size))
-        .count()
-}
+pub use reims_vgpu_paging::runs::{contig_page_runs, contig_run_count};
 
 /// Build or reuse a contiguous host-VA view of guest pages for `[gva, gva+length)`.
 ///

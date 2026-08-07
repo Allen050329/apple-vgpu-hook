@@ -6,16 +6,21 @@
 //! 14 = arm64e). There is no arm-default overload — callers must choose.
 
 use crate::contract::gva_resolve::{
-    read_task_root, resolve_status_name, translate_root, translate_root_run, Geometry, PhysReader,
+    read_task_root, resolve_status_name, translate_root, translate_root_run, Geometry,
     ResolveStatus, Task, ARM64E_GEOMETRY, X86_64_GEOMETRY,
 };
 use crate::model::{TaskEntry, TaskTable};
 use crate::runtime::host::{HostMemory, MemError};
+use reims_vgpu_wire::mem::GuestMemory;
 
+pub use reims_vgpu_paging::span::pages_spanned;
+
+/// [`HostMemory`]'s guest-physical reads as the wire crate's guest-memory
+/// seam. One address space — guest-physical — per that trait's hard rule.
 struct HostPhys<'a, M: HostMemory>(&'a M);
 
-impl<M: HostMemory> PhysReader for HostPhys<'_, M> {
-    fn read_phys(&self, gpa: u64, dst: &mut [u8]) -> bool {
+impl<M: HostMemory> GuestMemory for HostPhys<'_, M> {
+    fn read_at(&self, gpa: u64, dst: &mut [u8]) -> bool {
         self.0.read_gpa(gpa, dst).is_ok()
     }
 }
@@ -551,17 +556,6 @@ pub fn visit_task_gva_page_gpas<M: HostMemory>(
     });
 }
 
-/// How many guest pages `[gva, gva+span)` touches, given `page_size`.
-///
-/// The `gva % page_size` term is the whole content: a span that starts
-/// mid-page reaches one page further than its length alone implies. Callers
-/// compare a walk's result against this to decide whether the *whole* span
-/// resolved, and getting it wrong reads as "fully covered" for exactly the
-/// windows that straddle a page boundary — which is most of them.
-pub fn pages_spanned(gva: u64, span: u64, page_size: u64) -> u64 {
-    ((gva % page_size) + span).div_ceil(page_size)
-}
-
 /// The resolved page GPAs of `[gva, gva+span)` under `task_id`'s page table, in
 /// GVA order, with unresolved pages dropped.
 ///
@@ -831,31 +825,6 @@ mod tests {
     use super::*;
     use crate::contract::endian::st32;
     use crate::observe::Decline;
-
-    /// A span's page count is decided by where it *starts*, not only by how long
-    /// it is.
-    ///
-    /// Four rails compare a walk's page count against this to decide whether the
-    /// whole span resolved. Drop the offset term and a window that straddles a
-    /// page boundary — which is most of them, since a texture row rarely starts
-    /// page-aligned — reports fully covered while missing its last page. The
-    /// gather then hands the GPU a short buffer, which is a wrong frame.
-    #[test]
-    fn pages_spanned_counts_the_page_the_offset_pushes_a_span_into() {
-        const PAGE: u64 = 4096;
-        // Page-aligned: exactly what the length implies.
-        assert_eq!(pages_spanned(0, PAGE, PAGE), 1);
-        assert_eq!(pages_spanned(PAGE * 7, PAGE * 3, PAGE), 3);
-        // Offset by one byte: the same length now reaches one page further.
-        assert_eq!(pages_spanned(1, PAGE, PAGE), 2);
-        assert_eq!(pages_spanned(PAGE * 7 + 1, PAGE * 3, PAGE), 4);
-        // A span wholly inside one page stays at one, wherever it starts.
-        assert_eq!(pages_spanned(PAGE - 1, 1, PAGE), 1);
-        // …and one byte longer crosses.
-        assert_eq!(pages_spanned(PAGE - 1, 2, PAGE), 2);
-        // The arm64 pathway's 16 KiB pages take the same rule.
-        assert_eq!(pages_spanned(16384 * 3 + 5, 16384, 16384), 2);
-    }
 
     /// The collapse this migration ended: nineteen distinct checks — the walk's
     /// fifteen plus four of its own — all answered `MemError::Unmapped`, and

@@ -2258,10 +2258,10 @@ fn band_runs(runs: usize) -> &'static str {
 /// Coalesce GPA-contiguous stretches of `window` into packed host-VA runs
 /// covering `span` bytes from `head_off` into the first page.
 ///
-/// The single implementation of the walk every guest-pages rail needs: pick the
-/// longest stretch whose GPAs ascend by exactly one page, import it once, and
-/// take from it until `span` is met. `map_pages` hands back a direct RAMBlock
-/// alias, so the import is a lookup and `unmap` is a no-op.
+/// The stretch arithmetic is `reims_vgpu_paging::runs::coalesce_window`; what
+/// this adds is the host side — one `map_pages` per stretch. `map_pages` hands
+/// back a direct RAMBlock alias, so the import is a lookup and `unmap` is a
+/// no-op.
 ///
 /// `None` if any stretch fails to import, or if the window runs out before
 /// `span` — a partial gather would hand the GPU a short buffer, which is a
@@ -2274,26 +2274,16 @@ fn coalesce_pages_to_runs<M: HostOps>(
     span: u64,
 ) -> Option<Vec<crate::backend::vulkan::engine::GuestRun>> {
     use crate::backend::vulkan::engine;
-    let mut runs: Vec<engine::GuestRun> = Vec::new();
-    let mut consumed = 0u64;
-    let mut i = 0usize;
-    while i < window.len() && consumed < span {
-        let mut j = i + 1;
-        while j < window.len() && window[j] == window[i] + ((j - i) as u64) * page {
-            j += 1;
-        }
-        let base = host.map_pages(&window[i..j], page as usize)? as u64;
-        let start_in_run = if i == 0 { head_off } else { 0 };
-        let avail = ((j - i) as u64) * page - start_in_run;
-        let len = avail.min(span - consumed);
+    let stretches = reims_vgpu_paging::runs::coalesce_window(window, page, head_off, span)?;
+    let mut runs: Vec<engine::GuestRun> = Vec::with_capacity(stretches.len());
+    for s in stretches {
+        let base = host.map_pages(&window[s.pages], page as usize)? as u64;
         runs.push(engine::GuestRun {
-            host_ptr: (base + start_in_run) as usize,
-            len,
+            host_ptr: (base + s.start_offset) as usize,
+            len: s.len,
         });
-        consumed += len;
-        i = j;
     }
-    (consumed == span).then_some(runs)
+    Some(runs)
 }
 
 /// The byte extent of a `w × h` image at `bpr` bytes per row and `bpp` bytes per
