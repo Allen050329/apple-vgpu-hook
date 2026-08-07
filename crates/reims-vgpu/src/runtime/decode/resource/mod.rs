@@ -2455,6 +2455,12 @@ pub fn decode_render_pipeline_descriptor(
 /// the relation and a refusal would fail them wholesale. The fixtures have to
 /// state a payload length first. A reader who measures only the boot will
 /// conclude the promotion is free, and it is not.
+///
+/// Both pipeline subtypes reach this, and **only** those two: the other type-7
+/// subtypes — sampler, depth-stencil, ICB — are fixed-layout wire structs rather
+/// than property-list containers, so their fourth header word is a declared
+/// field of the struct and not a payload length. The relation would be false
+/// there, and asking it would be reading one format's rule into another.
 fn note_type7_payload_len(kind: &'static str, payload: u32, declared: usize) {
     let padded = (payload as usize).next_multiple_of(4);
     if TYPE7_FIRST_TLVS.checked_add(padded) == Some(declared) {
@@ -3534,6 +3540,11 @@ pub fn decode_compute_pipeline_descriptor(
     if declared != bytes.len() || declared < TYPE7_MIN_LEN {
         return Err(DecodeStatus::ErrShort("res_compute_pipeline_declared_len"));
     }
+    // The same four-word header its render sibling carries, so the same relation
+    // between its two lengths holds. Checked rather than stored: this descriptor
+    // has no consumer for the value, and the walks below bound themselves on the
+    // declared length.
+    note_type7_payload_len("compute", ld32(&bytes[12..]), declared);
     let (fields, consumed) = decode_compact_tlv_record(bytes, TYPE7_FIRST_TLVS)?;
     note_pipeline_tlv_fields("compute", &COMPUTE_PIPELINE_TAGS_CONSUMED, &fields);
     let first_tlv_end = TYPE7_FIRST_TLVS + consumed;

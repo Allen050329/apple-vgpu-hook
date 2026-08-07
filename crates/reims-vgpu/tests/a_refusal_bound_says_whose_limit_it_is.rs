@@ -164,6 +164,36 @@ struct Row {
 /// this test rather than silently re-pointing a verdict at a different site.
 /// That is the intended cost: re-reading a bound when its neighbourhood changes
 /// is the whole point of writing the verdict down.
+///
+/// # What that cost has actually bought, measured
+///
+/// One session moved these rows **seven times**, and not one of the seven was a
+/// re-read. Every one was a doc comment added above an unrelated function in
+/// `decode/resource/mod.rs`, and every one was discharged the same way: diff the
+/// lines around the new number against `git show HEAD:<file>` at the old one,
+/// confirm the site is identical, bump the number. The verdict was never in
+/// question because nothing near the bound had changed.
+///
+/// So the re-read this key is meant to force does not happen; what happens is a
+/// mechanical re-point, and the hazard is that the *next* one is done without
+/// even the diff. `a_dedup_latch_guards_only_its_own_line` reached the opposite
+/// conclusion for the same reason and says so at its own `ROWS` — it keys by
+/// `(file, count)`, on the argument that a line number moves whenever anything
+/// above it does and re-pointing a row teaches nobody anything. Two sibling
+/// scans, one question, two answers, and neither cited the other until now.
+///
+/// A key that would keep the per-site verdict and survive the churn:
+/// `(file, enclosing fn, bound name, nth in that fn)`. Measured against this
+/// table's 29 rows, `(file, fn, bound)` alone collides twice — both in
+/// `backend/metal/render.rs`, at `make_vertex_descriptor` and `render_core_mrt`
+/// — so the occurrence index is required rather than decorative. It fails
+/// exactly when a site is added to or removed from a function, which is the
+/// event this table exists to catch, and stays put when a doc comment above it
+/// does not.
+///
+/// Left as `file:line` because changing it is a scan change plus 29 rewritten
+/// rows and no guest-visible effect. Recorded here so the next session deciding
+/// it has the measurement rather than the argument.
 const ROWS: &[Row] = &[
     Row {
         at: "reims-vgpu/src/backend/metal/compute.rs:512",
@@ -363,7 +393,7 @@ const ROWS: &[Row] = &[
               same basis `wire::ops::bind_limit::SAMPLER` carries.",
     },
     Row {
-        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:3024",
+        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:3030",
         bound: "MAX_COLOR_ATTACHMENTS",
         verdict: Verdict::WireField,
         why: "The declared colour-attachment count against the width of the slot \
@@ -371,7 +401,7 @@ const ROWS: &[Row] = &[
               itself stops at.",
     },
     Row {
-        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:2788",
+        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:2794",
         bound: "MAX_COLOR_ATTACHMENTS",
         verdict: Verdict::WireField,
         why: "The same eight, one entry down: the guard admits a declared slot \
@@ -648,7 +678,9 @@ fn the_scan_can_see_the_sites_it_is_about() {
         ("reims-vgpu/src/contract/gva_resolve.rs", "MAX_DEPTH"),
     ] {
         assert!(
-            found.iter().any(|(at, b)| at.starts_with(file) && b == bound),
+            found
+                .iter()
+                .any(|(at, b)| at.starts_with(file) && b == bound),
             "the scan no longer finds {bound} in {file}; its silence proves nothing until it does"
         );
     }
