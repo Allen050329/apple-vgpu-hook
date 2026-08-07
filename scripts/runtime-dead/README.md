@@ -336,3 +336,37 @@ one-function delta on a file that has nothing to do with importing is as likely
 to be workload variance as a rail. The deltas worth trusting are the large ones
 and the ones whose file is about the import decision. A third run would separate
 them and has not been done.
+
+## What is cold in both runs, and why `never-ran.txt` is the wrong file to count
+
+With an import-on and an import-off report on disk, the intersection is
+answerable for the first time: **1387 mangled names are cold in both.** Ranking
+their files is the closest thing this instrument has to a candidate list, and
+the top of it is a good illustration of why it is not one.
+
+| file | cold in both | why |
+|---|---|---|
+| `runtime/blit_exec/mod.rs` | 89 | 28 of 117 functions ran — a window drag issues few blits (reason 3) |
+| `runtime/mapper/mod.rs` | 67 | **arm64-only**, and the file says so at its own resolve rail: entered from `capture_at_producer`, so only an arm64 boot can move it. `AGENTS.md` names this rail as its standing example of a one-pathway rail. 42 of 79 functions still ran here, so it is half live even on x86 |
+| `runtime/compute_exec/mod.rs` | 46 | 62 of 108 ran; the cold half is opcodes this workload does not issue |
+| `observe/decline.rs` | 40 | the file has **three** functions and missed **two** |
+
+That last row is the warning. `never-ran.txt` is one line per *monomorphization*,
+and the generics note above says to check a name against `by-file.txt` before
+concluding a function is cold. Here is the size of the effect:
+
+```
+by-file.txt     3175 functions   1234 missed
+never-ran.txt   1413 lines                     — 1.15x, +179
+```
+
+In aggregate that is a 15 % overstatement and the headline number is roughly
+honest. **Per file it is not**, and the error does not distribute evenly:
+`observe/decline.rs` supplies 40 lines against 2 missed functions, a factor of
+20 in one file, because a `Decline` impl is generic and every instantiation
+counts separately. So rank files by `by-file.txt`'s missed-function column, and
+treat a `never-ran.txt` line as a pointer to look rather than as a fact about a
+function.
+
+The same caution retires the 26-versus-70 figure in the `--import-off` section
+above, and it is the reason that section diffs at file granularity.
