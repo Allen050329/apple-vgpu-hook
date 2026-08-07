@@ -1342,9 +1342,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         // is tuned from data it destroyed the tail of. A
                         // resident read here had gone at least
                         // `IDLE_TARGET_AGE_MS + since_ms` between uses.
-                        crate::runtime::drain::note_store_route(
-                            reclaimed_resample_band(since_ms),
-                        );
+                        crate::runtime::drain::note_store_route(reclaimed_resample_band(since_ms));
                         if crate::observe::first_sight("sampled_resident_reclaimed", u64::from(mid))
                         {
                             crate::observe::fail(format!(
@@ -2326,6 +2324,23 @@ pub(super) fn task_gva_guest_run_window<M: HostMemory + HostOps>(
 /// refusal is named on the always-on sink by
 /// [`crate::runtime::guest_ram_map`], so a fall back to the copy is never
 /// silent.
+///
+/// # Why the refusal is counted as well as reported
+///
+/// `guest_ram_map` deduplicates its refusals per boot — one line however many
+/// times a reason is reached — which is right for the log and useless for
+/// sizing this rail. A driven boot put `zc_buffer_gathered` at 342 492 against
+/// `zc_buffer_imported` at **zero**: every draw-time buffer bind on a host whose
+/// `vk_caps` said `host_pointer_import=supported` fell back to the CPU gather,
+/// and the one deduplicated line could not say whether that was one cause or
+/// four, nor whether the windows missing a single bind range were missing it by
+/// two stretches or by five hundred.
+///
+/// Those are different fixes. Two stretches is a gather the GPU could do in two
+/// copy regions; five hundred is not obviously worth taking off the CPU. So the
+/// class is counted here, and the stretch count banded, on the census rather
+/// than the fail channel — nothing here is a new loss of guest work, it is the
+/// existing loss made countable.
 fn guest_page_window<M: HostOps>(
     host: &mut M,
     gpas: Vec<u64>,
@@ -2333,7 +2348,33 @@ fn guest_page_window<M: HostOps>(
     head_offset: u64,
     span: u64,
 ) -> Option<crate::runtime::guest_ram::GuestRef> {
-    crate::runtime::guest_ram_map::reference_for_pages(host, &gpas, page, head_offset, span).ok()
+    use crate::runtime::guest_ram_map::MapRefusal;
+    match crate::runtime::guest_ram_map::reference_for_pages(host, &gpas, page, head_offset, span) {
+        Ok(reference) => Some(reference),
+        Err(refusal) => {
+            crate::runtime::drain::note_store_route(match refusal {
+                MapRefusal::NoBackendImport => "zc_buf_no_import",
+                MapRefusal::HostRefused(_) => "zc_buf_host_refused",
+                MapRefusal::NoUsableRegion { .. } => "zc_buf_no_region",
+                MapRefusal::GpaNotInAnyImport { .. } => "zc_buf_gpa_unbacked",
+                MapRefusal::OutsideImport(_) => "zc_buf_outside_import",
+                // Banded, not exact: the decision this feeds is how many copy
+                // regions a GPU gather would cost, and that is a question about
+                // the order of magnitude. An exact count would also need an
+                // unbounded set of static strings, which `note_store_route`
+                // does not take.
+                MapRefusal::Scattered { runs, .. } => match runs {
+                    0..=1 => "zc_buf_scattered_1",
+                    2 => "zc_buf_scattered_2",
+                    3..=4 => "zc_buf_scattered_3_4",
+                    5..=8 => "zc_buf_scattered_5_8",
+                    9..=32 => "zc_buf_scattered_9_32",
+                    _ => "zc_buf_scattered_gt32",
+                },
+            });
+            None
+        }
+    }
 }
 
 /// Coalesce GPA-contiguous stretches of `window` into packed host-VA runs
@@ -5142,8 +5183,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // Resident target carries the chain; no CPU seed bytes.
                 }
                 MTL_LOAD_ACTION_CLEAR => {
-                    target_rgba8 =
-                        Some(std::sync::Arc::new(solid_rgba8(w, h, &c0.clear_color)));
+                    target_rgba8 = Some(std::sync::Arc::new(solid_rgba8(w, h, &c0.clear_color)));
                 }
                 MTL_LOAD_ACTION_LOAD => {
                     // Which door this pass took, so a pass that ends with no
@@ -5288,12 +5328,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // same draw either way.
         resources.occlusion_query = match req.visibility {
             None => None,
-            Some(v) => translate::raster::visibility_result_mode(v.mode)
-                .map_err(|e| {
-                    DrawError::Unsupported(
-                        crate::backend::vulkan::engine::reason::DrawReason::VisibilityResultMode(e),
-                    )
-                })?,
+            Some(v) => translate::raster::visibility_result_mode(v.mode).map_err(|e| {
+                DrawError::Unsupported(
+                    crate::backend::vulkan::engine::reason::DrawReason::VisibilityResultMode(e),
+                )
+            })?,
         };
         resources.scissors = req
             .scissors
