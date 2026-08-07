@@ -751,10 +751,13 @@ fn every_metal_icb_inheritance_check_is_unique_namespaced_and_log_safe() {
             pipeline_ref: 27,
             detail: "pipeline failed".into(),
         },
+        MetalIcbInheritanceDecline::AllocationFailed {
+            what: "inherited_texture",
+        },
     ];
 
     let mut slugs = all.iter().map(Decline::slug).collect::<Vec<_>>();
-    assert_eq!(slugs.len(), 25, "the fixture must cover every check");
+    assert_eq!(slugs.len(), 26, "the fixture must cover every check");
     for decline in &all {
         assert!(decline.slug().starts_with("metal_icb_inherit_"));
         for (key, value) in decline.fields() {

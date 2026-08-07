@@ -114,6 +114,16 @@ pub(super) enum MetalIcbInheritanceDecline {
         pipeline_ref: u32,
         detail: String,
     },
+    /// Metal answered nil for an object this pass had to create, so the
+    /// inheritance cannot be applied.
+    ///
+    /// `what` names which one. A nil from a texture or a buffer is the device
+    /// out of memory; the whole encoder is declined rather than inherited
+    /// partially, because a pass missing one of its inherited binds draws with
+    /// whatever the encoder held before.
+    AllocationFailed {
+        what: &'static str,
+    },
 }
 
 impl crate::observe::Decline for MetalIcbInheritanceDecline {
@@ -141,6 +151,7 @@ impl crate::observe::Decline for MetalIcbInheritanceDecline {
                 "metal_icb_inherit_vertex_attribute_unencodable"
             }
             Self::RenderPipelineCreate { .. } => "metal_icb_inherit_render_pipeline_create",
+            Self::AllocationFailed { .. } => "metal_icb_inherit_allocation_failed",
         }
     }
 
@@ -189,6 +200,7 @@ impl crate::observe::Decline for MetalIcbInheritanceDecline {
                 ("detail", token(detail)),
             ],
             Self::PipelineRefZero => Vec::new(),
+            Self::AllocationFailed { what } => vec![("what", (*what).to_string())],
             Self::VertexAttributeUnencodable {
                 pipeline_ref,
                 location,
@@ -361,12 +373,18 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
     // Shared buffer staging (copy into Metal so guest Vec can drop). A
     // successful `load_buffer_bytes` is nonempty by construction: its
     // `host_alloc_len(avail).filter(|n| n > 0)` rejects the zero-span case.
-    let stage_mtl_buf = |bytes: &[u8]| -> metal::Buffer {
-        device.new_buffer_with_data(
-            bytes.as_ptr() as *const _,
-            bytes.len() as u64,
-            MTLResourceOptions::StorageModeShared,
-        )
+    let stage_mtl_buf = |bytes: &[u8]| -> Result<metal::Buffer, MetalIcbInheritanceDecline> {
+        unsafe {
+            crate::backend::metal::raw_metal::new_buffer_with_data(
+                device,
+                bytes.as_ptr() as *const _,
+                bytes.len() as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .ok_or(MetalIcbInheritanceDecline::AllocationFailed {
+            what: "staged_buffer",
+        })
     };
 
     // Buffers: applied when inheritBuffers or when the request carries binds
@@ -388,7 +406,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
                     offset: b.offset,
                 });
             };
-            let mtl = stage_mtl_buf(&bytes);
+            let mtl = stage_mtl_buf(&bytes)?;
             enc.set_vertex_buffer(b.index as u64, Some(mtl.as_ref()), 0);
             keep.buffers.push(mtl);
         }
@@ -404,7 +422,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
                     offset: b.offset,
                 });
             };
-            let mtl = stage_mtl_buf(&bytes);
+            let mtl = stage_mtl_buf(&bytes)?;
             enc.set_fragment_buffer(b.index as u64, Some(mtl.as_ref()), 0);
             keep.buffers.push(mtl);
         }
@@ -430,7 +448,11 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
         td.set_height(h as u64);
         td.set_storage_mode(MTLStorageMode::Shared);
         td.set_usage(MTLTextureUsage::ShaderRead);
-        let tex = device.new_texture(&td);
+        let tex = crate::backend::metal::raw_metal::new_texture(device, &td).ok_or(
+            MetalIcbInheritanceDecline::AllocationFailed {
+                what: "inherited_texture",
+            },
+        )?;
         let region = MTLRegion {
             origin: MTLOrigin { x: 0, y: 0, z: 0 },
             size: MTLSize {
@@ -461,7 +483,11 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
         td.set_height(h as u64);
         td.set_storage_mode(MTLStorageMode::Shared);
         td.set_usage(MTLTextureUsage::ShaderRead);
-        let tex = device.new_texture(&td);
+        let tex = crate::backend::metal::raw_metal::new_texture(device, &td).ok_or(
+            MetalIcbInheritanceDecline::AllocationFailed {
+                what: "inherited_texture",
+            },
+        )?;
         let region = MTLRegion {
             origin: MTLOrigin { x: 0, y: 0, z: 0 },
             size: MTLSize {
@@ -813,7 +839,9 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
         td.set_height(height as u64);
         td.set_storage_mode(MTLStorageMode::Shared);
         td.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-        let tex = device.new_texture(&td);
+        let Some(tex) = crate::backend::metal::raw_metal::new_texture(device, &td) else {
+            return EncodeStatus::MetalFailed("icb_color_texture_alloc_failed");
+        };
         let region = MTLRegion {
             origin: MTLOrigin { x: 0, y: 0, z: 0 },
             size: MTLSize {
@@ -834,8 +862,13 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
         att.set_store_action(MTLStoreAction::Store);
     }
 
-    let cb = queue.new_command_buffer().to_owned();
-    let enc = cb.new_render_command_encoder(pass);
+    let Some(cb) = crate::backend::metal::raw_metal::new_command_buffer(&queue) else {
+        return EncodeStatus::MetalFailed("icb_command_buffer_unavailable");
+    };
+    let cb = cb.to_owned();
+    let Some(enc) = crate::backend::metal::raw_metal::new_render_command_encoder(&cb, pass) else {
+        return EncodeStatus::MetalFailed("icb_render_encoder_unavailable");
+    };
     // Parent-encoder inheritance: stream viewport/scissor/buffers/textures/samplers
     // and (when ICB create flags say so) pipeline. Textures/samplers are never
     // recordable into IndirectRenderCommand — they always come from the encoder.

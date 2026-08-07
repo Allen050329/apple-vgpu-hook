@@ -2049,8 +2049,15 @@ pub fn render_core_mrt(
     }
 
     let queue = thread_queue(device);
-    let command_buffer = queue.new_command_buffer().to_owned();
-    let encoder = command_buffer.new_render_command_encoder(pass);
+    let Some(command_buffer) = crate::backend::metal::raw_metal::new_command_buffer(&queue) else {
+        return Status::execute("metal_render_command_buffer_unavailable");
+    };
+    let command_buffer = command_buffer.to_owned();
+    let Some(encoder) =
+        crate::backend::metal::raw_metal::new_render_command_encoder(&command_buffer, pass)
+    else {
+        return Status::execute("metal_render_encoder_unavailable");
+    };
     encoder.set_render_pipeline_state(&pso);
     if let Some(mode) = visibility_mode {
         encoder.set_visibility_result_mode(mode, 0);

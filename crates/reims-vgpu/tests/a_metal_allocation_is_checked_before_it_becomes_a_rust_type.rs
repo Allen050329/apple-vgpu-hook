@@ -57,6 +57,28 @@ const NIL_RETURNING: &[&str] = &[
     ".new_sampler(",
     ".new_depth_stencil_state(",
     ".new_command_queue(",
+    // The encoder and command-buffer vendors. These are worse than the
+    // allocators above rather than better: metal-0.33 types them as `&XxxRef`,
+    // so a nil becomes a **null reference** — always undefined behaviour, and
+    // dereferenced by the very next method call. `commandBuffer` answers nil
+    // when the queue will not issue another, which is a pressure refusal, and
+    // `renderCommandEncoderWithDescriptor:` answers nil for a pass descriptor
+    // Metal rejects.
+    ".new_command_buffer(",
+    ".new_render_command_encoder(",
+    ".new_blit_command_encoder(",
+    ".new_compute_command_encoder(",
+    ".compute_command_encoder_with_dispatch_type(",
+];
+
+/// Files outside `src/backend/metal/` that also reach metal-0.33 directly.
+///
+/// The encoder vendors are called from `runtime/` too — the Metal ICB rail and
+/// the compute session own their own command buffers — so scanning only the
+/// backend would report a clean tree while two of the ten sites sat elsewhere.
+const EXTRA_SCANNED: &[&str] = &[
+    "src/runtime/draw/metal_icb.rs",
+    "src/runtime/compute_session.rs",
 ];
 
 /// A call left unconverted, and why.
@@ -134,7 +156,17 @@ fn strip_comments(text: &str) -> String {
 #[test]
 fn every_nil_returning_metal_allocation_is_checked_as_a_pointer() {
     let dir = metal_dir();
-    let sources = rust_sources(&dir);
+    let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sources = rust_sources(&dir);
+    for extra in EXTRA_SCANNED {
+        let p = crate_root.join(extra);
+        assert!(
+            p.is_file(),
+            "EXTRA_SCANNED names {extra}, which is not a file — it moved, and \
+             this scan would silently stop reading it"
+        );
+        sources.push(p);
+    }
 
     // Self-check: a scan that read nothing would report a clean tree. `raw_metal`
     // defines the checked replacements, so its own file must be present and the
@@ -154,7 +186,8 @@ fn every_nil_returning_metal_allocation_is_checked_as_a_pointer() {
     for path in &sources {
         let rel = path
             .strip_prefix(&dir)
-            .expect("every scanned file is under the metal backend")
+            .or_else(|_| path.strip_prefix(crate_root))
+            .expect("a scanned file is under the metal backend or the crate root")
             .to_string_lossy()
             .to_string();
         // `raw_metal` is the one place allowed to reach metal-0.33's allocators,

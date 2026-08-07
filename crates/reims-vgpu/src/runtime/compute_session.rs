@@ -98,10 +98,24 @@ impl ComputeSession {
             } else {
                 MTLDispatchType::Serial
             };
-            let command_buffer = queue.new_command_buffer().to_owned();
-            let encoder = command_buffer
-                .compute_command_encoder_with_dispatch_type(metal_dt)
-                .to_owned();
+            let Some(command_buffer) = crate::backend::metal::raw_metal::new_command_buffer(&queue)
+            else {
+                return Err(ComputeStatus::MetalFailed(
+                    "compute_session_command_buffer_unavailable",
+                ));
+            };
+            let command_buffer = command_buffer.to_owned();
+            let Some(encoder) =
+                crate::backend::metal::raw_metal::new_compute_command_encoder_with_dispatch_type(
+                    &command_buffer,
+                    metal_dt,
+                )
+            else {
+                return Err(ComputeStatus::MetalFailed(
+                    "compute_session_encoder_unavailable",
+                ));
+            };
+            let encoder = encoder.to_owned();
             Ok(Self {
                 device: device.to_owned(),
                 command_buffer,
@@ -153,11 +167,17 @@ impl ComputeSession {
                     0,
                     end as usize,
                 )?;
-                let mtl = this.device.new_buffer_with_data(
-                    bytes.as_ptr() as *const _,
-                    bytes.len() as u64,
-                    MTLResourceOptions::StorageModeShared,
-                );
+                let mtl = unsafe {
+                    crate::backend::metal::raw_metal::new_buffer_with_data(
+                        &this.device,
+                        bytes.as_ptr() as *const _,
+                        bytes.len() as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                }
+                .ok_or(ComputeStatus::MetalFailed(
+                    "compute_session_control_buffer_alloc_failed",
+                ))?;
                 this.retained.push(mtl.clone());
                 Ok((mtl, offset))
             };
@@ -349,11 +369,18 @@ impl ComputeSession {
                         Ok(b) => b,
                         Err(e) => return e,
                     };
-                    let mtl = self.device.new_buffer_with_data(
-                        raw.as_ptr() as *const _,
-                        raw.len() as u64,
-                        MTLResourceOptions::StorageModeShared,
-                    );
+                    let Some(mtl) = (unsafe {
+                        crate::backend::metal::raw_metal::new_buffer_with_data(
+                            &self.device,
+                            raw.as_ptr() as *const _,
+                            raw.len() as u64,
+                            MTLResourceOptions::StorageModeShared,
+                        )
+                    }) else {
+                        return ComputeStatus::MetalFailed(
+                            "compute_session_icb_buffer_alloc_failed",
+                        );
+                    };
                     self.retained.push(mtl.clone());
                     // Indirect range size unknown until GPU reads it — apply inheritance
                     // with parent-encoder binds only (no ICB slot patch of AB buffer).
@@ -758,7 +785,10 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                     usage |= MTLTextureUsage::ShaderWrite;
                 }
                 td.set_usage(usage);
-                let tex = session.device.new_texture(&td);
+                let tex = crate::backend::metal::raw_metal::new_texture(&session.device, &td)
+                    .ok_or(ComputeStatus::MetalFailed(
+                        "compute_session_inherit_texture_alloc_failed",
+                    ))?;
                 let region = MTLRegion {
                     origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
                     size: metal::MTLSize {
@@ -839,9 +869,14 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                     "compute_icb_inherit_ab_zero_len",
                 ));
             }
-            let ab = session
-                .device
-                .new_buffer(ab_len, metal::MTLResourceOptions::StorageModeShared);
+            let ab = crate::backend::metal::raw_metal::new_buffer(
+                &session.device,
+                ab_len,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+            .ok_or(ComputeStatus::MetalFailed(
+                "compute_session_argument_buffer_alloc_failed",
+            ))?;
             arg_enc.set_argument_buffer(&ab, 0);
             for (tex, abm) in mtl_texs.iter().zip(ab_layout.textures.iter()) {
                 arg_enc.set_texture(abm.argument_index, tex.as_ref());

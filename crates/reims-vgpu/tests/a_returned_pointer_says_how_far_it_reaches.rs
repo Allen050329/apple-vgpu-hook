@@ -86,7 +86,7 @@ const ROWS: &[Row] = &[
               any of them is returned.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/raw_metal.rs:631",
+        at: "reims-vgpu/src/backend/metal/raw_metal.rs:688",
         verdict: Verdict::NotASpan,
         why: "An Objective-C `*mut Object` beside a pipeline state — a retained \
               object handle, not a byte range, so there is no extent to carry.",

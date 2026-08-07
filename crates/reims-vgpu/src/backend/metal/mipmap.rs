@@ -104,8 +104,11 @@ pub fn generate_mipmaps_filtered(
     };
     texture.replace_region(region0, 0, level0.as_ptr() as *const _, plan.bytes_per_row);
 
-    let command_buffer = queue.new_command_buffer().to_owned();
-    let blit = command_buffer.new_blit_command_encoder();
+    let command_buffer = crate::backend::metal::raw_metal::new_command_buffer(&queue)
+        .ok_or(MetalMipmapError::CommandBufferFailed)?
+        .to_owned();
+    let blit = crate::backend::metal::raw_metal::new_blit_command_encoder(&command_buffer)
+        .ok_or(MetalMipmapError::CommandBufferFailed)?;
     blit.generate_mipmaps(&texture);
     blit.end_encoding();
     command_buffer.commit();

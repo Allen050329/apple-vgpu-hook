@@ -929,8 +929,18 @@ pub fn compute_core(
     };
 
     let queue = thread_queue(device);
-    let command_buffer = queue.new_command_buffer().to_owned();
-    let encoder = command_buffer.compute_command_encoder_with_dispatch_type(metal_dispatch_type);
+    let Some(command_buffer) = crate::backend::metal::raw_metal::new_command_buffer(&queue) else {
+        return Status::execute("metal_compute_command_buffer_unavailable");
+    };
+    let command_buffer = command_buffer.to_owned();
+    let Some(encoder) =
+        crate::backend::metal::raw_metal::new_compute_command_encoder_with_dispatch_type(
+            &command_buffer,
+            metal_dispatch_type,
+        )
+    else {
+        return Status::execute("metal_compute_encoder_unavailable");
+    };
 
     let retain = match compute_encode_on_encoder(
         device,

@@ -25,13 +25,14 @@
 //! has no memory left, which every caller turns into a typed refusal. That is
 //! what a GPU does with an allocation it cannot serve.
 
-use foreign_types::ForeignType;
+use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
-    Buffer, BufferRef, ComputeCommandEncoderRef, ComputePipelineState, DeviceRef, FunctionRef,
-    IndirectCommandBufferRef, IndirectComputeCommandRef, IndirectRenderCommandRef, MTLIndexType,
-    MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSize, MTLTextureType,
-    NSInteger, NSRange, NSUInteger, RenderPipelineDescriptorRef, Texture, TextureDescriptorRef,
-    TextureRef,
+    BlitCommandEncoderRef, Buffer, BufferRef, CommandBufferRef, CommandQueueRef,
+    ComputeCommandEncoderRef, ComputePipelineState, DeviceRef, FunctionRef,
+    IndirectCommandBufferRef, IndirectComputeCommandRef, IndirectRenderCommandRef, MTLDispatchType,
+    MTLIndexType, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSize,
+    MTLTextureType, NSInteger, NSRange, NSUInteger, RenderCommandEncoderRef,
+    RenderPassDescriptorRef, RenderPipelineDescriptorRef, Texture, TextureDescriptorRef, TextureRef,
 };
 use objc::runtime::{Object, BOOL, NO, YES};
 use objc::{msg_send, sel, sel_impl};
@@ -393,6 +394,62 @@ pub unsafe fn new_buffer_no_copy(
             deallocator: std::ptr::null::<Object>()
         ];
         (!ptr.is_null()).then(|| Buffer::from_ptr(ptr as *mut _))
+    }
+}
+
+/// `[MTLCommandQueue commandBuffer]`, with the nil it can answer.
+///
+/// **Borrowed, exactly as metal-0.33 returns it.** The object is autoreleased,
+/// so ownership is taken by the caller's `.to_owned()` (which retains); handing
+/// back an owned `CommandBuffer` from `from_ptr` here would take ownership
+/// without retaining and over-release at drop.
+///
+/// A nil is the queue declining to issue another command buffer — a resource
+/// limit, and one of the few Metal refusals that is genuinely about pressure
+/// rather than about the request.
+pub fn new_command_buffer(queue: &CommandQueueRef) -> Option<&CommandBufferRef> {
+    unsafe {
+        let ptr: *mut Object = msg_send![queue, commandBuffer];
+        (!ptr.is_null()).then(|| CommandBufferRef::from_ptr(ptr as *mut _))
+    }
+}
+
+/// `[MTLCommandBuffer renderCommandEncoderWithDescriptor:]`, with the nil an
+/// invalid pass descriptor answers.
+///
+/// Borrowed for the same reason as [`new_command_buffer`]. The lifetime ties the
+/// encoder to the command buffer that vended it, which is what metal-0.33's
+/// signature does and what Metal's ownership actually is.
+pub fn new_render_command_encoder<'a>(
+    command_buffer: &'a CommandBufferRef,
+    descriptor: &RenderPassDescriptorRef,
+) -> Option<&'a RenderCommandEncoderRef> {
+    unsafe {
+        let ptr: *mut Object =
+            msg_send![command_buffer, renderCommandEncoderWithDescriptor: descriptor];
+        (!ptr.is_null()).then(|| RenderCommandEncoderRef::from_ptr(ptr as *mut _))
+    }
+}
+
+/// `[MTLCommandBuffer blitCommandEncoder]`, with its nil.
+pub fn new_blit_command_encoder(
+    command_buffer: &CommandBufferRef,
+) -> Option<&BlitCommandEncoderRef> {
+    unsafe {
+        let ptr: *mut Object = msg_send![command_buffer, blitCommandEncoder];
+        (!ptr.is_null()).then(|| BlitCommandEncoderRef::from_ptr(ptr as *mut _))
+    }
+}
+
+/// `[MTLCommandBuffer computeCommandEncoderWithDispatchType:]`, with its nil.
+pub fn new_compute_command_encoder_with_dispatch_type(
+    command_buffer: &CommandBufferRef,
+    dispatch_type: MTLDispatchType,
+) -> Option<&ComputeCommandEncoderRef> {
+    unsafe {
+        let ptr: *mut Object =
+            msg_send![command_buffer, computeCommandEncoderWithDispatchType: dispatch_type];
+        (!ptr.is_null()).then(|| ComputeCommandEncoderRef::from_ptr(ptr as *mut _))
     }
 }
 
