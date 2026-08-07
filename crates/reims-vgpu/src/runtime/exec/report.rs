@@ -442,6 +442,28 @@ pub(super) fn note_pass_array_length_unsupported(task_id: u32, length: u64) -> S
     drop
 }
 
+/// A pass declaring a default raster sample count this device cannot rasterize
+/// at. See [`StreamDrawDrop::PassRasterSampleCountUnsupported`].
+///
+/// The census route keeps the name it had while this was a bare count, on the
+/// same reading [`note_pass_array_length_unsupported`] states: a boot series
+/// spanning the change stays comparable, and what moved is the verdict rather
+/// than the population.
+///
+/// Deduped on the requested count, because that is what varies between two
+/// guests asking for this.
+pub(super) fn note_pass_raster_sample_count_unsupported(
+    task_id: u32,
+    count: u64,
+) -> StreamDrawDrop {
+    crate::runtime::drain::note_store_route("render_pass_raster_sample_count_dropped");
+    let drop = StreamDrawDrop::PassRasterSampleCountUnsupported { count };
+    crate::observe::Emit::decline("stream_pass", &drop)
+        .field("task", task_id)
+        .fail_once(drop.latch());
+    drop
+}
+
 /// A colour attachment naming a mip, a slice, a depth plane or a multisample
 /// resolve target this device renders past.
 /// See [`StreamDrawDrop::ColorSubresourceUnsupported`].

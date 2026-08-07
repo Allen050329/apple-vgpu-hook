@@ -26,8 +26,8 @@ use crate::runtime::decode::fifo::{
     CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN, CHILD_EXEC_INDIRECT_TASK_ID,
 };
 use crate::runtime::decode::render::{
-    self, decode_color_attachment, decode_depth_attachment, decode_stencil_attachment,
-    attachment_subresource_is_bindable, ColorAttachment, DepthAttachment, Kind as RenderKind, ScissorRect,
+    self, attachment_subresource_is_bindable, decode_color_attachment, decode_depth_attachment,
+    decode_stencil_attachment, ColorAttachment, DepthAttachment, Kind as RenderKind, ScissorRect,
     Stage, StencilAttachment, PASS_MAX_COLOR_ATTACHMENTS,
 };
 use crate::runtime::decode::stream::{
@@ -338,6 +338,27 @@ enum StreamDrawDrop {
     /// downstream can tell, because a pass that touched only layer 0 is exactly
     /// what a guest that asked for one layer also produces.
     PassArrayLengthUnsupported { length: u64 },
+    /// A pass declaring a default raster sample count this device cannot
+    /// rasterize at.
+    ///
+    /// `defaultRasterSampleCount` is how many fragments the rasterizer produces
+    /// per pixel for a pass whose coverage does not come from an attachment. No
+    /// render rail here rasterizes above one sample, so a pass asking for four
+    /// gets one — and the difference is not a quality setting: coverage decides
+    /// which fragments run, so a shader that blends by coverage, an occlusion
+    /// query that counts samples, and any edge the guest expected to be
+    /// resolved all come back with a different answer than the one it asked
+    /// for.
+    ///
+    /// Refused rather than counted for the reason
+    /// [`Self::PassArrayLengthUnsupported`] gives: a pass rendered at one sample
+    /// is exactly what a guest asking for one sample also produces, so nothing
+    /// downstream can tell the substitution happened.
+    ///
+    /// The device advertises `DEVICE_INFO_KEY_MAX_SAMPLE_COUNT` above 1, so a
+    /// guest is entitled to ask. This is the refusal that says what that
+    /// advertisement costs when it does.
+    PassRasterSampleCountUnsupported { count: u64 },
 }
 
 impl crate::observe::Decline for StreamDrawDrop {
@@ -347,6 +368,9 @@ impl crate::observe::Decline for StreamDrawDrop {
             Self::DepthStencilUnsupported { .. } => "stream_depth_stencil_unsupported",
             Self::ColorSubresourceUnsupported { .. } => "stream_color_subresource_unsupported",
             Self::PassArrayLengthUnsupported { .. } => "stream_pass_array_length_unsupported",
+            Self::PassRasterSampleCountUnsupported { .. } => {
+                "stream_pass_raster_sample_count_unsupported"
+            }
         }
     }
 
@@ -381,6 +405,9 @@ impl crate::observe::Decline for StreamDrawDrop {
             ],
             Self::PassArrayLengthUnsupported { length } => {
                 vec![("length", length.to_string())]
+            }
+            Self::PassRasterSampleCountUnsupported { count } => {
+                vec![("count", count.to_string())]
             }
         }
     }
@@ -442,6 +469,11 @@ impl StreamDrawDrop {
             // for 2 are different readings, and how many a pass declares is the
             // whole of what this arm has to say.
             Self::PassArrayLengthUnsupported { length } => length,
+            // The requested count, on the same reading as the layer count
+            // above: a guest asking for 2 samples and one asking for 8 are
+            // different readings, and the count is the whole of what this arm
+            // reports.
+            Self::PassRasterSampleCountUnsupported { count } => count,
         }
     }
 }
@@ -1745,8 +1777,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     task_id,
                     cmd.pass_render_target_array_length,
                 );
-                acc.unrepresentable
-                    .get_or_insert(StreamRefusal::Pass(drop));
+                acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
             }
             if cmd.pass_render_target_width != 0 || cmd.pass_render_target_height != 0 {
                 note_pass_target_extent();
@@ -1769,8 +1800,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         acc.depth_attach = Some(depth);
                     } else {
                         let drop = note_depth_stencil_unsupported(task_id, "depth", &depth.into());
-                        acc.unrepresentable
-                            .get_or_insert(StreamRefusal::Pass(drop));
+                        acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
                     }
                 }
                 let stencil = decode_stencil_attachment(payload);
@@ -1780,8 +1810,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     } else {
                         let drop =
                             note_depth_stencil_unsupported(task_id, "stencil", &stencil.into());
-                        acc.unrepresentable
-                            .get_or_insert(StreamRefusal::Pass(drop));
+                        acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
                     }
                 }
                 for i in 0..PASS_MAX_COLOR_ATTACHMENTS {
@@ -1820,8 +1849,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     // guest goes on to read.
                     if !attachment_subresource_is_bindable(att.into()) {
                         let drop = note_color_subresource_unsupported(task_id, slot, &att);
-                        acc.unrepresentable
-                            .get_or_insert(StreamRefusal::Pass(drop));
+                        acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
                     }
                     if !acc
                         .color_slots
@@ -2126,18 +2154,14 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 }
                 // Neither of these carries an index: there is one depth and one
                 // stencil attachment, so the record names only the action.
-                wire_render::OPCODE_SET_DEPTH_STORE_ACTION => {
-                    match acc.depth_attach.as_mut() {
-                        Some(d) => d.store_action = action,
-                        None => note_store_action_no_attachment("depth", action),
-                    }
-                }
-                wire_render::OPCODE_SET_STENCIL_STORE_ACTION => {
-                    match acc.stencil_attach.as_mut() {
-                        Some(s) => s.store_action = action,
-                        None => note_store_action_no_attachment("stencil", action),
-                    }
-                }
+                wire_render::OPCODE_SET_DEPTH_STORE_ACTION => match acc.depth_attach.as_mut() {
+                    Some(d) => d.store_action = action,
+                    None => note_store_action_no_attachment("depth", action),
+                },
+                wire_render::OPCODE_SET_STENCIL_STORE_ACTION => match acc.stencil_attach.as_mut() {
+                    Some(s) => s.store_action = action,
+                    None => note_store_action_no_attachment("stencil", action),
+                },
                 // Not a catch-all standing in for the stencil arm: the decoder
                 // maps exactly three opcodes to this kind, so a fourth reaching
                 // here means the decoder grew an arm this one did not, and the
@@ -2289,19 +2313,43 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // positions change *where fragments land*; the raster sample count
             // changes how many there are; the three tile ones are tile-shader
             // pass geometry this device has no executor for at all.
-            crate::runtime::drain::note_store_route(match cmd.opcode {
-                wire_pass::OPCODE_RASTERIZATION_RATE_MAP => "render_pass_rate_map_dropped",
-                wire_pass::OPCODE_SAMPLE_POSITIONS => "render_pass_sample_positions_dropped",
-                wire_pass::OPCODE_DEFAULT_RASTER_SAMPLE_COUNT => {
-                    "render_pass_raster_sample_count_dropped"
+            //
+            // The sample count is the one of the six that is refused rather
+            // than counted, and it takes its own arm below for that reason. The
+            // other five still count: three are tile-shader pass geometry with
+            // no executor to refuse *for*, and the rate map and the sample
+            // positions move fragments within a pixel rather than changing
+            // which pixels a draw covers — a loss that has never been read
+            // against a boot, so refusing on it would trade a measured
+            // degradation for an unmeasured refusal.
+            if cmd.opcode == wire_pass::OPCODE_DEFAULT_RASTER_SAMPLE_COUNT {
+                // `MTLRenderPassDescriptor.defaultRasterSampleCount` defaults to
+                // 1, which is what this device already does, so only a request
+                // above it is a loss. A zero is not a Metal sample count at all;
+                // it reaches the refusal rather than the silent arm, because a
+                // record this device cannot honour is not made honourable by
+                // naming an impossible value.
+                if cmd.mode != 1 {
+                    let drop = note_pass_raster_sample_count_unsupported(task_id, cmd.mode);
+                    acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
                 }
-                wire_pass::OPCODE_IMAGEBLOCK_SAMPLE_LENGTH => "render_pass_imageblock_dropped",
-                wire_pass::OPCODE_THREADGROUP_MEMORY_LENGTH => {
-                    "render_pass_threadgroup_memory_dropped"
-                }
-                _ => "render_pass_tile_size_dropped",
-            });
-            note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
+            } else {
+                crate::runtime::drain::note_store_route(match cmd.opcode {
+                    wire_pass::OPCODE_RASTERIZATION_RATE_MAP => "render_pass_rate_map_dropped",
+                    wire_pass::OPCODE_SAMPLE_POSITIONS => "render_pass_sample_positions_dropped",
+                    wire_pass::OPCODE_IMAGEBLOCK_SAMPLE_LENGTH => "render_pass_imageblock_dropped",
+                    wire_pass::OPCODE_THREADGROUP_MEMORY_LENGTH => {
+                        "render_pass_threadgroup_memory_dropped"
+                    }
+                    _ => "render_pass_tile_size_dropped",
+                });
+                // Only the five that are still dropped. The sample count has an
+                // executor arm now — it is honoured at 1 and refused above it —
+                // so reporting it as `accepted_without_executor` beside its own
+                // typed decline would name the same record twice and disagree
+                // with itself about whether anything read it.
+                note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
+            }
         }
         RenderKind::TileDimensionsQuery => {
             // Not a dropped command — a *wrong answer*. The guest handed over a
@@ -2455,13 +2503,19 @@ impl BindClass {
         use reims_vgpu_wire::ops::bind_limit;
         match (self, reach) {
             (BindClass::Buffer, r) if r <= bind_limit::SAMPLER => "render_bind_reach_buffer_le16",
-            (BindClass::Buffer, r) if r <= MAX_BUFFER_BIND_SLOTS => "render_bind_reach_buffer_le_table",
+            (BindClass::Buffer, r) if r <= MAX_BUFFER_BIND_SLOTS => {
+                "render_bind_reach_buffer_le_table"
+            }
             (BindClass::Buffer, _) => "render_bind_reach_buffer_over_table",
             (BindClass::Texture, r) if r <= bind_limit::SAMPLER => "render_bind_reach_texture_le16",
-            (BindClass::Texture, r) if r <= MAX_TEXTURE_BIND_SLOTS => "render_bind_reach_texture_le_table",
+            (BindClass::Texture, r) if r <= MAX_TEXTURE_BIND_SLOTS => {
+                "render_bind_reach_texture_le_table"
+            }
             (BindClass::Texture, _) => "render_bind_reach_texture_over_table",
             (BindClass::Sampler, r) if r <= bind_limit::SAMPLER => "render_bind_reach_sampler_le16",
-            (BindClass::Sampler, r) if r <= MAX_SAMPLER_BIND_SLOTS => "render_bind_reach_sampler_le_table",
+            (BindClass::Sampler, r) if r <= MAX_SAMPLER_BIND_SLOTS => {
+                "render_bind_reach_sampler_le_table"
+            }
             (BindClass::Sampler, _) => "render_bind_reach_sampler_over_table",
         }
     }
@@ -2549,9 +2603,7 @@ fn note_draw_refused(refusal: StreamRefusal, pipeline_ref: u32, site: &'static s
     let emit = match refusal {
         StreamRefusal::Bind(over) => crate::observe::Emit::decline("render_draw", &over),
         StreamRefusal::Pass(drop) => crate::observe::Emit::decline("render_draw", &drop),
-        StreamRefusal::BufferOffset(over) => {
-            crate::observe::Emit::decline("render_draw", &over)
-        }
+        StreamRefusal::BufferOffset(over) => crate::observe::Emit::decline("render_draw", &over),
     };
     emit.field("site", site)
         .field("pipeline_ref", pipeline_ref)
@@ -2965,13 +3017,13 @@ fn finish_stream<M: HostMemory + HostOps>(
             // actions and its clears. Every later one composites onto what the
             // pass already holds.
             let loading_slots;
-            let (slots, clears): (&[(u32, ColorAttachment)], &[ColorAttachment]) =
-                if icb_index == 0 {
-                    (&acc.color_slots, &acc.clears)
-                } else {
-                    loading_slots = color_slots_loading(&acc.color_slots);
-                    (&loading_slots, &[])
-                };
+            let (slots, clears): (&[(u32, ColorAttachment)], &[ColorAttachment]) = if icb_index == 0
+            {
+                (&acc.color_slots, &acc.clears)
+            } else {
+                loading_slots = color_slots_loading(&acc.color_slots);
+                (&loading_slots, &[])
+            };
             let req = draw::mrt_draw_request(state, host, task_id, pipeline, slots, clears, args);
             // ICB execute inherits stream bind state at end of stream, and both
             // branches below inherit the same six tables — the last draw's
@@ -3860,10 +3912,11 @@ mod report;
 use report::{
     is_indexed_draw_opcode, note_clear_dropped, note_color_subresource_unsupported,
     note_compute_refusal, note_depth_stencil_unsupported, note_draw_encode_fail,
-    note_empty_scissor, note_indexed_draw_without_buffer, note_store_action_no_attachment,
-    note_indirect_draw_refused, note_pass_array_length_unsupported, note_pass_extent_for_slot,
-    note_pass_target_extent, note_stream_draw_drops,
-    note_unimplemented_render_opcode, note_unnamed_icb_execute,
+    note_empty_scissor, note_indexed_draw_without_buffer, note_indirect_draw_refused,
+    note_pass_array_length_unsupported, note_pass_extent_for_slot,
+    note_pass_raster_sample_count_unsupported, note_pass_target_extent,
+    note_store_action_no_attachment, note_stream_draw_drops, note_unimplemented_render_opcode,
+    note_unnamed_icb_execute,
 };
 // The unimplemented-opcode latch is test-only on both sides, so its import has
 // to carry the same gate the items do.

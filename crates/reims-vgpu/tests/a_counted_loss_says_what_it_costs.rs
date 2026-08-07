@@ -222,10 +222,15 @@ const ROWS: &[(&str, Counted, &str)] = &[
     ),
     (
         "render_pass_raster_sample_count_dropped",
-        Counted::StateNotApplied,
+        Counted::BesideATypedDecline,
         "the default raster sample count: how many fragments the rasterizer \
-         produces per pixel. This device rasterizes at one sample, so a guest \
-         asking for more gets an unmultisampled pass",
+         produces per pixel. This device rasterizes at one sample, so a pass \
+         asking for more is now refused rather than rendered unmultisampled. \
+         Raised by `note_pass_raster_sample_count_unsupported`, which returns \
+         the `StreamDrawDrop::PassRasterSampleCountUnsupported` its caller \
+         records as `StreamAccum::unrepresentable`; the route keeps its old \
+         name so a boot series spanning the change stays comparable, and it \
+         now fires only past the API default of 1",
     ),
     (
         "render_pass_sample_positions_dropped",
@@ -471,7 +476,7 @@ fn no_counted_loss_is_unread() {
 /// subresource or the wrong layer with a counter going up.
 #[test]
 fn the_counted_loss_census_only_shrinks() {
-    const COUNTED_LOSS_CEILING: usize = 18;
+    const COUNTED_LOSS_CEILING: usize = 17;
     let losses = ROWS
         .iter()
         .filter(|(_, c, _)| matches!(c, Counted::StateNotApplied | Counted::WorkNotExecuted))

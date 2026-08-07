@@ -731,13 +731,15 @@ const ROWS: &[Row] = &[
         file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
         ty: "StreamDrawDrop",
         loss: Loss::Refused,
-        why: "the three arms that used to continue no longer do: a dropped \
-              depth/stencil attachment, an unbindable colour subresource and a \
+        why: "four arms that used to continue no longer do — a dropped \
+              depth/stencil attachment, an unbindable colour subresource, a \
               pass declaring more render-target array layers than this device \
-              draws all set `StreamAccum::unrepresentable`, and `bind_snapshot` \
-              refuses the stream's draws rather than running the pass without \
-              depth, into the base level, or into layer 0. The `Unbound` arm \
-              keeps the draw \
+              draws, and a pass declaring a default raster sample count it \
+              cannot rasterize at. Every one of them sets \
+              `StreamAccum::unrepresentable`, and `bind_snapshot` refuses the \
+              stream's draws rather than running the pass without depth, into \
+              the base level, into layer 0, or at one sample per pixel. The \
+              `Unbound` arm keeps the draw \
               out of `acc.draws` entirely, and its ambiguity is now closed \
               structurally rather than by a rate: \
               `a_pipeline_reaches_the_latch_by_one_wire_form` pins that exactly \
@@ -955,8 +957,14 @@ fn every_decline_says_whether_the_guest_lost_work() {
     // population every row of which is present, and reads exactly like a tidy
     // tree.
     for (file, ty) in [
-        ("crates/reims-vgpu/src/runtime/gather_witness.rs", "GatherWitnessFault"),
-        ("crates/reims-vgpu/src/runtime/mapping_write/mod.rs", "SurfaceWriteRefusal"),
+        (
+            "crates/reims-vgpu/src/runtime/gather_witness.rs",
+            "GatherWitnessFault",
+        ),
+        (
+            "crates/reims-vgpu/src/runtime/mapping_write/mod.rs",
+            "SurfaceWriteRefusal",
+        ),
     ] {
         assert!(
             found.iter().any(|i| i.file == file && i.ty == ty),

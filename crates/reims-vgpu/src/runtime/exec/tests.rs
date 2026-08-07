@@ -938,6 +938,86 @@ fn a_pass_declaring_more_array_layers_than_this_device_draws_refuses_the_draws()
     );
 }
 
+/// A pass declaring a default raster sample count this device cannot rasterize
+/// at refuses the stream's draws.
+///
+/// `defaultRasterSampleCount` says how many fragments the rasterizer produces
+/// per pixel. Every render rail here produces one, so a pass asking for four
+/// used to render at one and raise a counter — and a pass rendered at one
+/// sample is exactly what a guest asking for one sample also produces, so
+/// nothing downstream could tell. Coverage decides which fragments run, so what
+/// the guest got back was a different picture and, for an occlusion query, a
+/// different number.
+///
+/// The device advertises `DEVICE_INFO_KEY_MAX_SAMPLE_COUNT` above 1, so a guest
+/// is entitled to ask; this is the refusal that says what that costs.
+#[test]
+fn a_pass_declaring_a_raster_sample_count_this_device_cannot_rasterize_refuses_the_draws() {
+    use crate::contract::endian::st32;
+
+    let record = |count: u32| {
+        let total = wire_pass::DEFAULT_RASTER_SAMPLE_COUNT_TOTAL_LEN as usize;
+        let mut cmd = vec![0u8; total];
+        st32(&mut cmd[0..], wire_pass::OPCODE_DEFAULT_RASTER_SAMPLE_COUNT);
+        st32(&mut cmd[4..], total as u32);
+        st32(&mut cmd[OP_HEADER_LEN..], count);
+        cmd
+    };
+    let run = |cmd: &[u8]| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        handle_render_record(
+            &mut state,
+            &host,
+            1,
+            wire_pass::OPCODE_DEFAULT_RASTER_SAMPLE_COUNT,
+            cmd,
+            &mut out,
+            &mut acc,
+        );
+        acc
+    };
+
+    // One sample is the API default and is what this device rasterizes at, so
+    // the record is honoured and nothing is refused.
+    assert!(
+        run(&record(1)).bind_snapshot().is_ok(),
+        "one sample per pixel is what this device rasterizes at; nothing is \
+         refused"
+    );
+
+    // Zero is not a Metal sample count. It refuses with the rest rather than
+    // being read as "the guest asked for nothing", because a record this device
+    // cannot honour is not made honourable by naming an impossible value.
+    for count in [0u32, 2, 4, 8] {
+        assert!(
+            matches!(
+                run(&record(count)).bind_snapshot(),
+                Err(StreamRefusal::Pass(
+                    StreamDrawDrop::PassRasterSampleCountUnsupported { .. }
+                ))
+            ),
+            "count={count}: a pass this device would rasterize at one sample \
+             must refuse its draws rather than hand the guest a picture \
+             assembled from different coverage"
+        );
+    }
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.contains("stream_pass_raster_sample_count_unsupported"),
+        "a pass declaring a sample count this device does not rasterize at \
+         said nothing"
+    );
+    assert!(
+        log.contains("count=8"),
+        "the line must carry the requested count: 2 samples and 8 are different \
+         readings, and it is the whole of what this arm reports"
+    );
+}
+
 /// A colour attachment naming a mip, a slice or a depth plane refuses the
 /// stream's draws.
 ///
@@ -1501,7 +1581,7 @@ fn draws_sharing_a_bind_table_share_its_allocation() {
             index: 0,
             buffer_ref: 9,
             offset: 0,
-                attribute_stride: None,
+            attribute_stride: None,
         }]),
         ..Default::default()
     };
@@ -1542,7 +1622,7 @@ fn a_bind_after_a_draw_does_not_rewrite_that_draws_snapshot() {
             index: 0,
             buffer_ref: 9,
             offset: 0,
-                attribute_stride: None,
+            attribute_stride: None,
         }]),
         ..Default::default()
     };
@@ -1948,7 +2028,7 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
             index: 0,
             buffer_ref: 1,
             offset: 0,
-                attribute_stride: None,
+            attribute_stride: None,
         }]),
         fragment_buffers: Arc::default(),
         vertex_textures: Arc::default(),
@@ -2055,7 +2135,7 @@ fn nometal_draw_falls_back_to_type4_clear() {
             index: 0,
             buffer_ref: 1,
             offset: 0,
-                attribute_stride: None,
+            attribute_stride: None,
         }]),
         fragment_buffers: Arc::default(),
         vertex_textures: Arc::default(),
@@ -3267,7 +3347,11 @@ fn an_indirect_draw_takes_its_counts_from_the_guest_buffer() {
         st16(&mut command[p + 12..], 4); // MTLPrimitiveTypeTriangleStrip
         handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
 
-        assert_eq!(acc.draws.len(), 1, "the draw the guest asked for is recorded");
+        assert_eq!(
+            acc.draws.len(),
+            1,
+            "the draw the guest asked for is recorded"
+        );
         assert_eq!(
             acc.draws[0].draw,
             crate::contract::draw::DrawArgs {
@@ -3349,7 +3433,10 @@ fn an_indirect_draw_takes_its_counts_from_the_guest_buffer() {
             acc.draws.is_empty(),
             "a draw whose counts could not be read must not be recorded with invented ones"
         );
-        assert!(!acc.saw_draw, "and must not claim the stream has draws in it");
+        assert!(
+            !acc.saw_draw,
+            "and must not claim the stream has draws in it"
+        );
     }
 }
 
@@ -3414,7 +3501,10 @@ fn every_icb_execute_in_a_stream_is_kept_in_order() {
     assert_eq!(acc.execute_icb[0].args_buffer_ref, 5151);
     assert_eq!(acc.execute_icb[0].args_buffer_offset, 0x1111);
     assert_eq!(acc.execute_icb[1].args_buffer_ref, 5152);
-    assert!(acc.execute_icb[2].is_range, "0x15 is the literal-range form");
+    assert!(
+        acc.execute_icb[2].is_range,
+        "0x15 is the literal-range form"
+    );
     assert_eq!(acc.execute_icb[2].range_location, 0x1100);
     assert_eq!(acc.execute_icb[2].range_length, 0x2200);
 }
@@ -3456,7 +3546,10 @@ fn a_later_icb_execute_opens_its_pass_with_load() {
     let loading = color_slots_loading(&slots);
     assert_eq!(loading.len(), slots.len(), "no attachment is dropped");
     for ((slot, att), (orig_slot, orig)) in loading.iter().zip(slots.iter()) {
-        assert_eq!(slot, orig_slot, "the slot index is the pass's, not an index");
+        assert_eq!(
+            slot, orig_slot,
+            "the slot index is the pass's, not an index"
+        );
         assert_eq!(att.load_action, MTL_LOAD_ACTION_LOAD);
         // Everything else is the stream's own. The clear colour in particular
         // is carried rather than blanked: it is unread on this path, and a
@@ -4264,7 +4357,10 @@ fn a_fill_mode_and_a_depth_clip_mode_reach_the_stream_state() {
     for mode in [0u64, 1] {
         let acc = drive(wire_render::OPCODE_SET_TRIANGLE_FILL_MODE, mode);
         assert_eq!(acc.fill_mode, Some(mode as u32), "fill mode {mode}");
-        assert_eq!(acc.depth_clip_mode, None, "fill mode {mode} set the sibling");
+        assert_eq!(
+            acc.depth_clip_mode, None,
+            "fill mode {mode} set the sibling"
+        );
         let acc = drive(wire_render::OPCODE_SET_DEPTH_CLIP_MODE, mode);
         assert_eq!(acc.depth_clip_mode, Some(mode as u32), "depth clip {mode}");
         assert_eq!(acc.fill_mode, None, "depth clip {mode} set the sibling");
@@ -4569,7 +4665,10 @@ fn an_armed_visibility_query_and_its_buffer_both_reach_the_accumulator() {
     let mut arm = |acc: &mut StreamAccum, offset: u64, mode: u64| {
         let total = wire_render::SET_VISIBILITY_RESULT_MODE_TOTAL_LEN as usize;
         let mut command = vec![0u8; total];
-        st32(&mut command[0..], wire_render::OPCODE_SET_VISIBILITY_RESULT_MODE);
+        st32(
+            &mut command[0..],
+            wire_render::OPCODE_SET_VISIBILITY_RESULT_MODE,
+        );
         st32(&mut command[4..], total as u32);
         // Offset first, mode second — the wire's own order, which is the
         // reverse of the selector's.
@@ -4679,7 +4778,10 @@ fn a_visibility_count_lands_at_the_guest_offset_the_pass_named() {
     gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &bdesc);
     let entry_off = list_object_entry_offset(BUF_REF, 32).unwrap();
     let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
-    st32(&mut le[0..], u32::from(OBJECT_TYPE_BUFFER) | ((bdesc.len() as u32) << 8));
+    st32(
+        &mut le[0..],
+        u32::from(OBJECT_TYPE_BUFFER) | ((bdesc.len() as u32) << 8),
+    );
     le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], entry_off, &le);
 
@@ -4700,8 +4802,14 @@ fn a_visibility_count_lands_at_the_guest_offset_the_pass_named() {
         64,
         "the count for offset 0 lands at the buffer's base, little-endian"
     );
-    gva_mem::read_task_gva(&host, &state.tasks[1], buf_gva + 16, &mut got, PAGE_SHIFT_ARM64E)
-        .expect("read the second offset back");
+    gva_mem::read_task_gva(
+        &host,
+        &state.tasks[1],
+        buf_gva + 16,
+        &mut got,
+        PAGE_SHIFT_ARM64E,
+    )
+    .expect("read the second offset back");
     assert_eq!(
         u64::from_le_bytes(got),
         4095,
