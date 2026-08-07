@@ -353,6 +353,20 @@ pub fn walk<M: GuestMemory>(
     })
 }
 
+/// Deepest-level entries fetched per guest read by [`walk_run`].
+///
+/// The buffer is a stack array, so this is the only thing bounding it: 64
+/// entries is 256 bytes, and it turns the one-read-per-page the level-reuse
+/// leaves behind into one read per 64 pages. Raising it costs stack in every
+/// frame that walks a run and buys a shrinking fraction of the reads that are
+/// left; lowering it gives the per-page cost back.
+///
+/// It is not a limit on anything the guest can express — a run longer than a
+/// batch simply takes several, and a run shorter than one reads only the words
+/// its node has left. Nothing observable changes with this number, which is
+/// why the equivalence test against [`walk`] is what holds it.
+const LEAF_BATCH: usize = 64;
+
 /// Walk a run of consecutive pages, re-reading only the levels whose entry
 /// index changed.
 ///
@@ -378,6 +392,10 @@ pub fn walk<M: GuestMemory>(
 /// device is reading, and neither form of walk can be atomic against that.
 /// A caller needing a coherent snapshot needs one from the hypervisor, not from
 /// a re-read here.
+///
+/// The deepest level is read [`LEAF_BATCH`] entries at a time, which widens
+/// that same assumption from the levels above a page to the `LEAF_BATCH` pages
+/// either side of it. It does not introduce it.
 pub fn walk_run<M: GuestMemory>(
     mem: &M,
     geometry: Geometry,
@@ -419,6 +437,25 @@ pub fn walk_run<M: GuestMemory>(
     let mut seen_next = [0u32; MAX_DEPTH as usize];
     let mut held = 0usize;
 
+    // The deepest level's entry index advances by one per page, so consecutive
+    // pages read consecutive words of one node. Those are fetched a batch at a
+    // time: the upper levels are already elided by `held`, which leaves one
+    // guest read per page, and a batch turns 64 of them into one.
+    //
+    // `leaf_node` is the node the buffer holds words from — never zero for a
+    // live batch, because PFN zero is not a page the format can name, so a zero
+    // here means empty. A batch never crosses a node: it is clamped to the
+    // words left in this one, which is also what keeps `leaf_first + leaf_len`
+    // inside the node's own page.
+    let mut leaf_buf = [0u8; LEAF_BATCH * PTE_SIZE as usize];
+    let mut leaf_node = 0u32;
+    let mut leaf_first = 0u32;
+    let mut leaf_len = 0usize;
+    // A node whose batch read failed. One unreadable byte fails a whole span,
+    // so a batch cannot say *which* word was bad; without this the walk would
+    // retry the failing batch for every page of the node before falling back.
+    let mut leaf_unbatchable = 0u32;
+
     let first_page = first_gva >> geometry.page_shift;
     for i in 0..pages {
         let page_index = first_page + i;
@@ -443,7 +480,42 @@ pub fn walk_run<M: GuestMemory>(
                 entry_index,
                 raw_pte,
             };
-            let Some(pte) = mem.u32_at(entry_addr) else {
+            let read = if level + 1 == depth {
+                // Refill when this word is not one the buffer already holds.
+                if leaf_node != current_pfn
+                    || entry_index < leaf_first
+                    || (entry_index - leaf_first) as usize >= leaf_len
+                {
+                    leaf_len = 0;
+                    if leaf_unbatchable != current_pfn {
+                        let left = geometry.entries_per_table() - entry_index as u64;
+                        let want = (left as usize).min(LEAF_BATCH);
+                        if mem.read_at(entry_addr, &mut leaf_buf[..want * PTE_SIZE as usize]) {
+                            leaf_node = current_pfn;
+                            leaf_first = entry_index;
+                            leaf_len = want;
+                        } else {
+                            leaf_unbatchable = current_pfn;
+                        }
+                    }
+                }
+                if leaf_len == 0 {
+                    // Batching is off for this node, so read the one word and
+                    // let its own failure be attributed to its own page.
+                    mem.u32_at(entry_addr)
+                } else {
+                    let off = (entry_index - leaf_first) as usize * PTE_SIZE as usize;
+                    Some(u32::from_le_bytes([
+                        leaf_buf[off],
+                        leaf_buf[off + 1],
+                        leaf_buf[off + 2],
+                        leaf_buf[off + 3],
+                    ]))
+                }
+            } else {
+                mem.u32_at(entry_addr)
+            };
+            let Some(pte) = read else {
                 failure = Some(at(WalkError::TableRead, 0));
                 break;
             };
@@ -731,6 +803,111 @@ mod tests {
                 assert_eq!(seen, pages, "every page of the run is visited, in order");
             }
         }
+    }
+
+    /// A run fetches its deepest level a batch at a time, so the guest-read
+    /// count falls far below one per page.
+    ///
+    /// The proxy for the batching itself. `a_run_walk_agrees_with_the_single_walk_on_every_page`
+    /// already pins the answers across batch and node boundaries — it walks
+    /// 1027 pages on the x86 geometry — so what is unproven without counting is
+    /// whether the batch is *taken*. A refill bug that re-read per page would
+    /// answer identically and cost what the batch exists to save.
+    #[test]
+    fn a_long_run_reads_its_deepest_level_in_batches() {
+        struct Counting<'a> {
+            inner: SliceMemory<'a>,
+            reads: core::cell::Cell<usize>,
+        }
+        impl GuestMemory for Counting<'_> {
+            fn read_at(&self, addr: u64, out: &mut [u8]) -> bool {
+                self.reads.set(self.reads.get() + 1);
+                self.inner.read_at(addr, out)
+            }
+        }
+
+        const PAGES: u64 = 4 * LEAF_BATCH as u64;
+        let geometry = X86_64;
+        let mut buf = [0u8; IMAGE];
+        let mut b = Builder::new(geometry, &mut buf);
+        // One node, every entry of the run mapped to a distinct frame, so a
+        // batch that mixed neighbouring words up would be caught below.
+        let root = b.map(1, 0, 0x100);
+        for i in 1..PAGES {
+            b.map_into(root, 1, i, 0x100 + i as u32);
+        }
+        let mem = Counting {
+            inner: SliceMemory::new(b.bytes()),
+            reads: core::cell::Cell::new(0),
+        };
+
+        let mut seen = 0u64;
+        walk_run(&mem, geometry, root, 1, 0, PAGES, &mut |i, got| {
+            assert_eq!(
+                got.map(|w| w.leaf_pfn),
+                Ok(0x100 + i as u32),
+                "page {i} took the wrong word of its batch"
+            );
+            seen += 1;
+            true
+        });
+        assert_eq!(seen, PAGES);
+        assert_eq!(
+            mem.reads.get() as u64,
+            PAGES.div_ceil(LEAF_BATCH as u64),
+            "one read per batch, not one per page"
+        );
+    }
+
+    /// A node whose batch read is refused falls back to one read per word, and
+    /// still answers what the single walk answers.
+    ///
+    /// One unreadable byte fails a whole span, so a batch cannot report *which*
+    /// word was bad. Falling back is what keeps a failure attributed to the page
+    /// that owns it — and on a host that refuses the wide read for its own
+    /// reasons, what keeps the run answering at all.
+    #[test]
+    fn a_node_that_refuses_a_wide_read_falls_back_to_one_word_at_a_time() {
+        struct NarrowOnly<'a> {
+            inner: SliceMemory<'a>,
+            reads: core::cell::Cell<usize>,
+        }
+        impl GuestMemory for NarrowOnly<'_> {
+            fn read_at(&self, addr: u64, out: &mut [u8]) -> bool {
+                self.reads.set(self.reads.get() + 1);
+                out.len() <= PTE_SIZE as usize && self.inner.read_at(addr, out)
+            }
+        }
+
+        const PAGES: u64 = 8;
+        let geometry = X86_64;
+        let mut buf = [0u8; IMAGE];
+        let mut b = Builder::new(geometry, &mut buf);
+        let root = b.map(2, 0, 0x11);
+        for i in 1..PAGES {
+            // Page 3 is left unmapped, so the fallback carries a refusal as
+            // well as the frames either side of it.
+            if i != 3 {
+                b.map_into(root, 2, i, 0x11 + i as u32);
+            }
+        }
+        let mem = NarrowOnly {
+            inner: SliceMemory::new(b.bytes()),
+            reads: core::cell::Cell::new(0),
+        };
+
+        let mut seen = 0u64;
+        walk_run(&mem, geometry, root, 2, 0, PAGES, &mut |i, got| {
+            let want = walk(&mem, geometry, root, 2, i << geometry.page_shift);
+            assert_eq!(got, want, "page {i}");
+            seen += 1;
+            true
+        });
+        assert_eq!(seen, PAGES);
+        assert!(
+            mem.reads.get() >= PAGES as usize,
+            "the fallback reads at least once per page"
+        );
     }
 
     /// The visitor stops the run by answering `false`, and no page past it is
