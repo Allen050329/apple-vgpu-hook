@@ -2210,7 +2210,59 @@ const MESH_PIPELINE_TAGS_CONSUMED: [u8; 4] = [
 /// fields must not hide one behind a tag its other caller reads.
 const COMPUTE_PIPELINE_TAGS_CONSUMED: [u8; 1] = [PIPELINE_TAG_KERNEL_FUNC];
 
-/// A pipeline-descriptor field this decoder does not read.
+/// `MTLRenderPipelineDescriptor.label`, a four-byte reference into the record's
+/// string area.
+///
+/// Numerically the same tag as [`PIPELINE_TAG_KERNEL_FUNC`], and that is not a
+/// collision: the tag is a property index within *this* descriptor's property
+/// list, so tag 0 on a render descriptor and tag 0 on a compute one name
+/// different properties. Declared separately for that reason — sharing the
+/// constant would say the two are one property.
+const RENDER_PIPELINE_TAG_LABEL: u8 = 0x00;
+/// `MTLComputePipelineDescriptor.threadGroupSizeIsMultipleOfThreadExecutionWidth`,
+/// a `BOOL` widened to four bytes.
+const COMPUTE_PIPELINE_TAG_THREADGROUP_MULTIPLE: u8 = 0x01;
+/// `MTLComputePipelineDescriptor.label`. Same property as
+/// [`RENDER_PIPELINE_TAG_LABEL`] at a different index, for the reason that
+/// constant's doc gives.
+const COMPUTE_PIPELINE_TAG_LABEL: u8 = 0x02;
+
+/// Tags this decoder deliberately does not read, and which cost the guest
+/// nothing.
+///
+/// The distinction from `*_TAGS_CONSUMED` is the whole of what makes refusing an
+/// unknown tag safe. A consumed tag is one the decoder reads; a *benign* one is
+/// one it has read the meaning of, decided not to apply, and written down why.
+/// Everything in neither list is a property of `MTLRenderPipelineDescriptor`
+/// nobody here has identified, and applying Metal's default in its place is the
+/// silent modification [`PipelineFieldDropped`] exists to stop.
+///
+/// A tag may only join this list with the argument for it beside it:
+///
+/// * [`RENDER_PIPELINE_TAG_LABEL`] and [`COMPUTE_PIPELINE_TAG_LABEL`] are a
+///   debug name. Nothing this device renders depends on one, and nothing about
+///   the frame changes if it is dropped.
+/// * [`COMPUTE_PIPELINE_TAG_THREADGROUP_MULTIPLE`] is a hint to Metal's own
+///   shader compiler about how it may size a threadgroup. This device compiles
+///   the shader itself and takes the threadgroup size from the dispatch record,
+///   so there is nothing to apply — and the property's own default is the
+///   conservative arm, so not applying it cannot be the unsafe direction.
+///
+/// **`rasterizationEnabled`, `alphaToCoverageEnabled` and `rasterSampleCount`
+/// are deliberately not here.** They are the three the old doc named as silently
+/// defaulted, they are the reason this refusal exists, and none of them has ever
+/// appeared in this block on a driven boot — see [`PipelineFieldDropped`] for
+/// the shapes. If one arrives it must refuse rather than be waved through.
+const RENDER_PIPELINE_TAGS_BENIGN: [u8; 1] = [RENDER_PIPELINE_TAG_LABEL];
+/// The compute half of [`RENDER_PIPELINE_TAGS_BENIGN`]; same rule, and listed
+/// apart for the same reason `COMPUTE_PIPELINE_TAGS_CONSUMED` is.
+const COMPUTE_PIPELINE_TAGS_BENIGN: [u8; 2] = [
+    COMPUTE_PIPELINE_TAG_THREADGROUP_MULTIPLE,
+    COMPUTE_PIPELINE_TAG_LABEL,
+];
+
+/// A pipeline-descriptor field this decoder does not read **and has not
+/// identified**. The pipeline is refused.
 ///
 /// The colour-attachment walk beside this one has had both halves of this
 /// instrument — a shape line and a per-tag decline — for as long as it has
@@ -2218,6 +2270,17 @@ const COMPUTE_PIPELINE_TAGS_CONSUMED: [u8; 1] = [PIPELINE_TAG_KERNEL_FUNC];
 /// the guest set on the descriptor and this device never read was not merely
 /// unimplemented, it was unmeasured: nothing said how many arrive, which ones,
 /// or how often.
+///
+/// It is now a refusal on that same sibling's licence, and the licence is what
+/// took the work: the sibling refuses because `type7_color_attach_shape`
+/// measured its zero first. This block's `unconsumed` count is *not* zero and
+/// never will be — two labels arrive on every boot — so the zero that had to be
+/// measured was a different one. Splitting the unread tags into
+/// [`RENDER_PIPELINE_TAGS_BENIGN`] (identified, argued, deliberately dropped)
+/// and everything else made the second count exist, and *that* one reads zero
+/// across the twelve shapes below. The shape line now carries both: `*` for
+/// unread, `!` for unread and unidentified, and `unconsumed=` beside
+/// `unknown=`.
 ///
 /// # The reading, x86/Vulkan, one driven boot (Safari window drag)
 ///
@@ -2229,13 +2292,20 @@ const COMPUTE_PIPELINE_TAGS_CONSUMED: [u8; 1] = [PIPELINE_TAG_KERNEL_FUNC];
 /// settled it against the expectation that motivated writing it.
 ///
 /// ```text
-/// kind=render      tags=[08:4,01:4,02:4]           unconsumed=0
-/// kind=render      tags=[03:4,08:4,01:4,02:4]      unconsumed=1  (0x03)
-/// kind=render      tags=[00:4,03:4,08:4,01:4,02:4] unconsumed=2  (0x00, 0x03)
-/// kind=render      tags=[00:4,08:4,01:4,02:4]      unconsumed=1  (0x00)
-/// kind=compute     tags=[02:4,01:4,00:4]           unconsumed=2  (0x01, 0x02)
-/// kind=compute     tags=[00:4]                     unconsumed=0
+/// kind=render      tags=[08:4,01:4,02:4]            unconsumed=0  unknown=0
+/// kind=render      tags=[03:4,08:4,01:4,02:4]       unconsumed=0  unknown=0
+/// kind=render      tags=[00:4*,03:4,08:4,01:4,02:4] unconsumed=1  unknown=0
+/// kind=render      tags=[00:4*,08:4,01:4,02:4]      unconsumed=1  unknown=0
+/// kind=compute     tags=[02:4*,01:4*,00:4]          unconsumed=2  unknown=0
+/// kind=compute     tags=[00:4]                      unconsumed=0  unknown=0
 /// ```
+///
+/// Taken after `0x03` became a read tag and after the benign split, so the two
+/// columns are what a reader should compare: **`unconsumed` is never zero and
+/// `unknown` always is.** The same boot raised this decline zero times where it
+/// raised it three times before the split — not because anything stopped being
+/// dropped, but because what is dropped now has an argument behind it and the
+/// fail channel is for the losses.
 ///
 /// # What the four were
 ///
@@ -2251,14 +2321,17 @@ const COMPUTE_PIPELINE_TAGS_CONSUMED: [u8; 1] = [PIPELINE_TAG_KERNEL_FUNC];
 ///   the descriptor stated its position.
 /// * **render `0x00` = `label`** and **compute `0x02` = `label`**, each a
 ///   four-byte reference into the record's string area. A debug name; nothing
-///   this device renders depends on it. Left unread, and the shape line is what
-///   keeps that decision visible.
+///   this device renders depends on it.
 /// * **compute `0x01` =
 ///   `threadGroupSizeIsMultipleOfThreadExecutionWidth`**, a `BOOL` widened to
 ///   four bytes. A hint to Metal's own compiler about how it may size a
 ///   threadgroup; this device compiles the shader itself and takes the
 ///   threadgroup size from the dispatch record, so there is nothing here to
 ///   apply.
+///
+/// The last three are now named in [`RENDER_PIPELINE_TAGS_BENIGN`] and its
+/// compute sibling, which is what turned "unread" into two different answers
+/// and let the refusal below exist.
 ///
 /// An earlier draft of this doc guessed that the compute pair might include
 /// `maxTotalThreadsPerThreadgroup` and warned that dropping it could let this
@@ -2267,19 +2340,29 @@ const COMPUTE_PIPELINE_TAGS_CONSUMED: [u8; 1] = [PIPELINE_TAG_KERNEL_FUNC];
 /// above. The guess is recorded here rather than deleted because the shape line
 /// is what disproved it, which is the argument for having one.
 ///
-/// # Reported, not refused
+/// # Refused, and what it costs to be wrong in each direction
 ///
-/// The sibling refuses an unconsumed colour-attachment tag, and this one does
-/// not, on that sibling's own stated licence: its zero was *measured* first —
-/// `type7_color_attach_shape` runs 4–13 times a boot with `unconsumed=0` — and
-/// only a measured zero makes refusing safe. This block's reading is **not**
-/// zero: two labels still arrive and are dropped on purpose. Refusing a pipeline
-/// for carrying a debug name would decline pipelines a live guest sends on every
-/// boot, to no end.
+/// The alternative — the behaviour this replaced — is that an unidentified
+/// property gets Metal's default: `rasterizationEnabled` becomes yes,
+/// `alphaToCoverageEnabled` becomes no, `rasterSampleCount` becomes one. The
+/// guest asked for something, the device built a pipeline that does something
+/// else, and the frame is wrong with nothing downstream able to name it. That is
+/// the class this file exists to stop, and refusing is what a GPU does with a
+/// request it cannot represent.
+///
+/// The cost of refusing is a lost pipeline, and it is bounded by the zero above:
+/// no tag outside the consumed and benign lists has appeared on any driven boot
+/// of this rig. A firing is therefore a guest doing something this workload does
+/// not, and the answer is to identify the tag — into the consumed list if it is
+/// load-bearing, into the benign list with an argument if it is not. Widening
+/// the benign list to silence a refusal without that argument is the one move
+/// this instrument is built to prevent.
 ///
 /// Deduped per distinct `(tag, len)` rather than per value: what a reader needs
 /// first is which properties arrive, and a per-value latch on a field like a
 /// sample count would emit once per distinct count for no extra information.
+/// The refusal itself is outside that latch — the line names a tag once, the
+/// pipeline is refused every time.
 struct PipelineFieldDropped {
     kind: &'static str,
     tag: u8,
@@ -2315,13 +2398,25 @@ impl crate::observe::Decline for PipelineFieldDropped {
 ///
 /// Pipeline descriptors are decoded once per distinct pipeline and cached, so
 /// neither line is on a per-draw path.
-fn note_pipeline_tlv_fields(kind: &'static str, consumed_tags: &[u8], fields: &[CompactTlv]) {
-    report_tlv_shape(
+fn note_pipeline_tlv_fields(
+    kind: &'static str,
+    consumed_tags: &[u8],
+    benign_tags: &[u8],
+    fields: &[CompactTlv],
+) -> Result<(), DecodeStatus> {
+    let unknown = report_tlv_shape(
         kind,
         fields.len(),
         fields.iter().map(|f| (f.tag, f.length)),
         consumed_tags,
+        benign_tags,
     );
+    // Outside the emit above, so the refusal does not inherit `fail_once`'s
+    // latch: the line names a tag once, the pipeline is refused every time.
+    if unknown > 0 {
+        return Err(DecodeStatus::ErrUnsupported("res_pipeline_field_unread"));
+    }
+    Ok(())
 }
 
 /// [`note_pipeline_tlv_fields`] for an entry that is walked **in place** rather
@@ -2338,6 +2433,12 @@ fn note_pipeline_tlv_fields(kind: &'static str, consumed_tags: &[u8], fields: &[
 /// these bytes (`res_vertex_layout_entry_oob` and its siblings), and a second
 /// opinion from an instrument would be a second answer to a question already
 /// answered by a refusal.
+///
+/// **Reports and does not refuse**, unlike its pipeline sibling, and the count
+/// it discards is the difference. Every tag these entries carry is consumed —
+/// six shapes across a driven boot, all `unconsumed=0` — so it has no benign
+/// list to declare and nothing to refuse *yet*; promoting it needs its own
+/// commit and its own reading, not a share of the pipeline block's.
 fn note_entry_tlv_fields(kind: &'static str, bytes: &[u8], entry: usize, consumed_tags: &[u8]) {
     let Some(&field_count) = bytes.get(entry) else {
         return;
@@ -2355,7 +2456,8 @@ fn note_entry_tlv_fields(kind: &'static str, bytes: &[u8], entry: usize, consume
         seen.push((tag, len));
         p += 2 + len as usize;
     }
-    report_tlv_shape(kind, field_count as usize, seen.into_iter(), consumed_tags);
+    // No benign list: see this function's doc for why it refuses nothing.
+    let _unknown = report_tlv_shape(kind, field_count as usize, seen.into_iter(), consumed_tags, &[]);
 }
 
 /// The half [`note_pipeline_tlv_fields`] and [`note_entry_tlv_fields`] share:
@@ -2370,18 +2472,32 @@ fn report_tlv_shape(
     field_count: usize,
     fields: impl Iterator<Item = (u8, u8)>,
     consumed_tags: &[u8],
-) {
+    benign_tags: &[u8],
+) -> usize {
     let kind_key = kind
         .bytes()
         .fold(0u64, |acc, b| acc.rotate_left(7) ^ u64::from(b));
     let mut shape = String::new();
     let mut shape_key = kind_key;
     let mut dropped: Vec<(u8, u8)> = Vec::new();
+    let mut unknown: Vec<(u8, u8)> = Vec::new();
     for (tag, len) in fields {
         let consumed = consumed_tags.contains(&tag);
         let sep = if shape.is_empty() { "" } else { "," };
+        // `*` keeps its old meaning — this decoder does not read the tag — so
+        // shapes recorded in earlier readings still say what they said. `!` is
+        // the new half: unread *and* unidentified, which is the arm that
+        // refuses.
         let star = if consumed { "" } else { "*" };
-        let _ = std::fmt::Write::write_fmt(&mut shape, format_args!("{sep}{tag:02x}:{len}{star}"));
+        let bang = if consumed || benign_tags.contains(&tag) {
+            ""
+        } else {
+            "!"
+        };
+        let _ = std::fmt::Write::write_fmt(
+            &mut shape,
+            format_args!("{sep}{tag:02x}:{len}{star}{bang}"),
+        );
         // Order-sensitive, so a reordered block reads as a different shape. The
         // tag and the length are what a reader of this block depends on; the
         // value is not, and mixing it in would make every distinct sample count
@@ -2389,18 +2505,28 @@ fn report_tlv_shape(
         shape_key = shape_key.rotate_left(9) ^ (u64::from(tag) << 8) ^ u64::from(len);
         if !consumed {
             dropped.push((tag, len));
+            if !benign_tags.contains(&tag) {
+                unknown.push((tag, len));
+            }
         }
     }
     if crate::observe::first_sight("type7_pipeline_shape", shape_key) {
         crate::observe::off(format!(
-            "type7_pipeline_shape kind={kind} nfields={field_count} tags=[{shape}] unconsumed={}",
-            dropped.len()
+            "type7_pipeline_shape kind={kind} nfields={field_count} tags=[{shape}] \
+             unconsumed={} unknown={}",
+            dropped.len(),
+            unknown.len()
         ));
     }
-    for (tag, len) in dropped {
+    // Only the unidentified ones reach the fail channel. A benign drop is
+    // expected control flow with a written argument behind it, and `AGENTS.md`
+    // asks that expected control flow stay quiet; the shape line above is where
+    // it stays visible.
+    for &(tag, len) in &unknown {
         crate::observe::Emit::decline("type7_pipeline", &PipelineFieldDropped { kind, tag, len })
             .fail_once(kind_key.rotate_left(16) ^ (u64::from(tag) << 8) ^ u64::from(len));
     }
+    unknown.len()
 }
 
 pub fn decode_render_pipeline_descriptor(
@@ -2430,7 +2556,12 @@ pub fn decode_render_pipeline_descriptor(
     // Mesh SPI shape: tag 0x14 section offset (host serializeMeshRenderPipelineDescriptor).
     // Classic type-7 uses tag 0x08. Roles for 0x01/0x02/0x03 differ by shape.
     if let Some(off) = compact_tlv_u32(&fields, PIPELINE_TAG_MESH_SECTION_OFFSET) {
-        note_pipeline_tlv_fields("render_mesh", &MESH_PIPELINE_TAGS_CONSUMED, &fields);
+        note_pipeline_tlv_fields(
+            "render_mesh",
+            &MESH_PIPELINE_TAGS_CONSUMED,
+            &RENDER_PIPELINE_TAGS_BENIGN,
+            &fields,
+        )?;
         out.object_func_ref = tag01;
         out.mesh_func_ref = tag02;
         out.fragment_func_ref = tag03;
@@ -2438,7 +2569,12 @@ pub fn decode_render_pipeline_descriptor(
         out.color_attachment_offset = off;
         out.has_color_attachment_offset = true;
     } else {
-        note_pipeline_tlv_fields("render", &CLASSIC_PIPELINE_TAGS_CONSUMED, &fields);
+        note_pipeline_tlv_fields(
+            "render",
+            &CLASSIC_PIPELINE_TAGS_CONSUMED,
+            &RENDER_PIPELINE_TAGS_BENIGN,
+            &fields,
+        )?;
         out.vertex_func_ref = tag01;
         out.fragment_func_ref = tag02;
         out.object_func_ref = 0;
@@ -3696,7 +3832,12 @@ pub fn decode_compute_pipeline_descriptor(
     // declared length.
     note_type7_payload_len("compute", ld32(&bytes[12..]), declared);
     let (fields, consumed) = decode_compact_tlv_record(bytes, TYPE7_FIRST_TLVS)?;
-    note_pipeline_tlv_fields("compute", &COMPUTE_PIPELINE_TAGS_CONSUMED, &fields);
+    note_pipeline_tlv_fields(
+        "compute",
+        &COMPUTE_PIPELINE_TAGS_CONSUMED,
+        &COMPUTE_PIPELINE_TAGS_BENIGN,
+        &fields,
+    )?;
     let first_tlv_end = TYPE7_FIRST_TLVS + consumed;
     let stage_input = parse_compute_stage_input_block(bytes, first_tlv_end)?;
     Ok(ComputePipelineDescriptor {

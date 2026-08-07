@@ -1468,19 +1468,18 @@ fn compact_render_pipeline_funcs() {
     assert_eq!(p.object_id, 9);
 }
 
-/// A property the guest set on a pipeline descriptor and this decoder does not
-/// read says so, and the shape line beside it is what makes a boot with *no*
-/// drops readable as a measurement rather than as silence.
+/// A property the guest set on a pipeline descriptor that this decoder neither
+/// reads nor has identified **refuses the pipeline**, and the shape line beside
+/// it is what makes a boot with no such tag readable as a measurement rather
+/// than as silence.
 ///
 /// The colour-attachment walk has had both halves of this instrument for as
 /// long as it has refused an unknown tag. The pipeline's own block had neither,
-/// which is what left `rasterSampleCount` — the only route this device has to a
-/// guest's requested sample count — not merely unread but uncounted.
-///
-/// Reported and not refused, on the colour walk's own licence: it refuses
-/// because its zero was measured first, and nothing has measured this block.
+/// which is what let a property become `rasterizationEnabled = yes` or
+/// `alphaToCoverageEnabled = no` without anything saying the guest had asked
+/// otherwise.
 #[test]
-fn an_unread_pipeline_descriptor_field_says_so_without_refusing_the_pipeline() {
+fn an_unidentified_pipeline_descriptor_field_refuses_the_pipeline() {
     use crate::contract::endian::st32;
     // Tags no other test in this process uses, so `first_sight` cannot have
     // latched either shape or either drop already.
@@ -1504,9 +1503,11 @@ fn an_unread_pipeline_descriptor_field_says_so_without_refusing_the_pipeline() {
     st32(&mut b[31..], 1);
 
     let cap = crate::observe::FailCapture::start();
-    let p = decode_render_pipeline_descriptor(&b)
-        .expect("an unread property is reported, not refused: the pipeline still builds");
-    assert_eq!(p.vertex_func_ref, 2, "the tags it does read are unaffected");
+    assert_eq!(
+        decode_render_pipeline_descriptor(&b).unwrap_err(),
+        DecodeStatus::ErrUnsupported("res_pipeline_field_unread"),
+        "a property this decoder cannot name is refused, not defaulted"
+    );
     let lines = cap.lines();
 
     let shape: Vec<&String> = lines
@@ -1520,9 +1521,11 @@ fn an_unread_pipeline_descriptor_field_says_so_without_refusing_the_pipeline() {
     );
     assert!(
         shape[0].contains("kind=render")
-            && shape[0].contains("tags=[01:4,6d:4*,6e:4*]")
-            && shape[0].contains("unconsumed=2"),
-        "the shape line names every tag and stars the unread ones: {}",
+            && shape[0].contains("tags=[01:4,6d:4*!,6e:4*!]")
+            && shape[0].contains("unconsumed=2")
+            && shape[0].contains("unknown=2"),
+        "the shape line stars every unread tag and bangs the unidentified \
+         ones, and the two counts are separate: {}",
         shape[0]
     );
 
@@ -1543,15 +1546,82 @@ fn an_unread_pipeline_descriptor_field_says_so_without_refusing_the_pipeline() {
         drops[0]
     );
 
-    // Both lines are latched. `resume`, not `start`: the claim above is what is
-    // under test, and `start` would clear the latch and see them a second time.
+    // The lines are latched; the refusal is not. `resume`, not `start`: the
+    // claim above is what is under test, and `start` would clear the latch and
+    // see them a second time.
     let cap2 = crate::observe::FailCapture::resume();
-    decode_render_pipeline_descriptor(&b).expect("still decodes");
+    assert_eq!(
+        decode_render_pipeline_descriptor(&b).unwrap_err(),
+        DecodeStatus::ErrUnsupported("res_pipeline_field_unread"),
+        "the line names a tag once; the pipeline is refused every time"
+    );
     assert!(
         cap2.lines().is_empty(),
         "a pipeline decoded once per distinct pipeline must not re-report its \
          shape: {:?}",
         cap2.lines()
+    );
+}
+
+/// The counterweight to the refusal above, and the reason it is safe: a tag
+/// this decoder has *identified* and deliberately does not apply still builds
+/// the pipeline, and stays off the fail channel entirely.
+///
+/// Without this the refusal would decline every pipeline a live guest sends —
+/// `label` arrives on most of them — which is why the benign list exists and
+/// why widening it without an argument is the move that would quietly undo the
+/// refusal.
+#[test]
+fn an_identified_but_unapplied_pipeline_field_still_builds_the_pipeline() {
+    use crate::contract::endian::st32;
+
+    let mut b = vec![0u8; 16 + 1 + 6 + 6 + 6];
+    let blen = b.len() as u32;
+    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[4..], blen);
+    st32(&mut b[8..], 9);
+    b[16] = 3;
+    b[17] = PIPELINE_TAG_VERTEX_FUNC;
+    b[18] = 4;
+    st32(&mut b[19..], 7);
+    b[23] = PIPELINE_TAG_FRAGMENT_FUNC;
+    b[24] = 4;
+    st32(&mut b[25..], 8);
+    // `label` — unread by decision, argued at RENDER_PIPELINE_TAGS_BENIGN.
+    b[29] = RENDER_PIPELINE_TAG_LABEL;
+    b[30] = 4;
+    st32(&mut b[31..], 0x1234);
+
+    let cap = crate::observe::FailCapture::start();
+    let p = decode_render_pipeline_descriptor(&b)
+        .expect("an identified property this device does not apply is not a refusal");
+    assert_eq!(p.vertex_func_ref, 7);
+    assert_eq!(p.fragment_func_ref, 8);
+
+    let lines = cap.lines();
+    let dropped: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("reason=pipeline_descriptor_field_dropped"))
+        .collect();
+    assert!(
+        dropped.is_empty(),
+        "expected control flow stays quiet: a benign drop has an argument \
+         behind it and does not belong on the fail channel: {dropped:?}"
+    );
+
+    // It is still visible, on the channel that is for visibility rather than
+    // for alarm — starred as unread, and not counted as unknown.
+    let shape: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("type7_pipeline_shape"))
+        .collect();
+    assert_eq!(shape.len(), 1, "{lines:?}");
+    assert!(
+        shape[0].contains("tags=[01:4,02:4,00:4*]")
+            && shape[0].contains("unconsumed=1")
+            && shape[0].contains("unknown=0"),
+        "a benign tag is starred but not banged, and the two counts differ: {}",
+        shape[0]
     );
 }
 

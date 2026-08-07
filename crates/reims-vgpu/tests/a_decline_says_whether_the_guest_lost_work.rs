@@ -99,20 +99,27 @@ struct Row {
 ///
 /// Not a budget. A ratchet: see [`the_executed_modified_census_only_shrinks`].
 ///
-/// It has been raised exactly once, for `PipelineFieldDropped`, and that entry
-/// is the worked example of the one thing that legitimately raises it: a defect
-/// that was already happening and had **no decline type at all**, so the census
-/// could not see it. Naming it moved the number up while the device did not get
-/// worse. A ratchet that forbade this would be paying for its own blind spots —
-/// the cheapest way to keep this number low is to leave a loss unnamed, which is
-/// the opposite of what it is for. Raising it for a *new* modification is the
-/// thing it forbids.
-/// It has been lowered once, for `VertexFormatWidenDecline`, and that is the
-/// shape a lowering is supposed to have: the modification was not reclassified,
-/// it was made impossible. The substitution now runs only where the shader's
-/// own declared read width proves it unobservable, and the two cases where it
-/// would have been observable refuse by name.
-const EXECUTED_MODIFIED_CEILING: usize = 8;
+/// It has been **raised** exactly once, for `PipelineFieldDropped`, and that
+/// entry is the worked example of the one thing that legitimately raises it: a
+/// defect that was already happening and had **no decline type at all**, so the
+/// census could not see it. Naming it moved the number up while the device did
+/// not get worse. A ratchet that forbade this would be paying for its own blind
+/// spots — the cheapest way to keep this number low is to leave a loss unnamed,
+/// which is the opposite of what it is for. Raising it for a *new* modification
+/// is the thing it forbids.
+///
+/// It has been **lowered** twice, and both have the shape a lowering is supposed
+/// to have: the modification was not reclassified, it was made impossible.
+///
+/// * `VertexFormatWidenDecline` — the substitution now runs only where the
+///   shader's own declared read width proves it unobservable, and the two cases
+///   where it would have been observable refuse by name.
+/// * `PipelineFieldDropped` — the same entry that raised it, which is the
+///   sequence this ratchet is built to reward. Naming the loss made it
+///   measurable; measuring it identified every tag that was arriving; and with
+///   the identified ones argued and set aside, what remained could be refused.
+///   Raise-then-retire is the intended path, not an embarrassment.
+const EXECUTED_MODIFIED_CEILING: usize = 7;
 
 /// Every `impl Decline`/`impl Refusal` in the crate, and what its worst arm
 /// costs the guest.
@@ -559,22 +566,22 @@ const ROWS: &[Row] = &[
     Row {
         file: "crates/reims-vgpu/src/runtime/decode/resource/mod.rs",
         ty: "PipelineFieldDropped",
-        loss: Loss::ExecutedModified,
-        why: "a tag in a type-7 pipeline's *own* compact-TLV block that neither \
-              pipeline decoder reads. The pipeline is built from the tags they \
-              do read, so every other property the guest set on the descriptor \
-              gets Metal's default: `rasterizationEnabled` becomes yes, \
-              `alphaToCoverageEnabled` becomes no, `rasterSampleCount` becomes \
-              one. This raised the ceiling by one, and the defect it counts is \
-              not new — the block simply had no instrument, so the loss was \
-              real and uncounted rather than absent. Reported and not refused \
-              on `ColorAttachDropped`'s own licence: that sibling refuses \
-              because `type7_color_attach_shape` measured its zero first, and \
-              nothing has yet measured this block. Retired by refusing once \
-              `type7_pipeline_shape` reads `unconsumed=0` on a driven boot, or \
-              by reading the tags it names — which is also the only route this \
-              device has to a guest's requested sample count, the attachment \
-              record carrying a resolve ref and no count",
+        loss: Loss::Refused,
+        why: "a tag in a type-7 pipeline's *own* compact-TLV block that this \
+              decoder neither reads nor has identified; the pipeline is refused \
+              (`res_pipeline_field_unread`). This is the row that raised the \
+              ceiling and then lowered it, and the two moves were different \
+              things. It raised it because the block had no instrument at all, \
+              so a real loss became visible without the device getting worse. \
+              It lowers it because the loss was then removed: the unread tags \
+              were identified and split into a benign list — two labels and a \
+              threadgroup-sizing hint, each argued at \
+              `RENDER_PIPELINE_TAGS_BENIGN` — which made a second count exist \
+              (`unknown=`) and let that one be measured at zero across twelve \
+              shapes on a driven boot. Everything outside both lists now \
+              refuses instead of taking Metal's default, which is what \
+              `rasterizationEnabled`, `alphaToCoverageEnabled` and \
+              `rasterSampleCount` would have done silently"
     },
     Row {
         file: "crates/reims-vgpu/src/runtime/decode/resource/mod.rs",
