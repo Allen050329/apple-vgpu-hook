@@ -1884,6 +1884,7 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
             index: MAX_BUFFER_BIND_SLOTS - 1,
             buffer_ref: 7,
             offset: 0,
+                attribute_stride: None,
         }],
         fragment_textures: vec![TextureBind {
             index: MAX_TEXTURE_BIND_SLOTS - 1,
@@ -1907,6 +1908,7 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
                     index: MAX_BUFFER_BIND_SLOTS,
                     buffer_ref: 7,
                     offset: 0,
+                attribute_stride: None,
                 }],
                 ..Default::default()
             },
@@ -1963,6 +1965,7 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
             index: MAX_BUFFER_BIND_SLOTS + 4,
             buffer_ref: 0,
             offset: 0,
+                attribute_stride: None,
         }],
         fragment_textures: vec![TextureBind {
             index: MAX_TEXTURE_BIND_SLOTS + 4,

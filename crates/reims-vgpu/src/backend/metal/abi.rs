@@ -138,8 +138,19 @@ pub const REIMS_VGPU_TEXTURE_SWIZZLE_GREEN: u8 = 3;
 pub const REIMS_VGPU_TEXTURE_SWIZZLE_BLUE: u8 = 4;
 pub const REIMS_VGPU_TEXTURE_SWIZZLE_ALPHA: u8 = 5;
 
+/// Metal's own viewport-array width, not this device's choice.
+///
+/// The Metal Shading Language specification declares `[[viewport_array_index]]`
+/// as taking values `0` through `15`, so a render encoder rasterizes into at
+/// most sixteen viewports and `setViewports:count:` with more is out of
+/// contract. `setScissorRects:count:` is one rect per viewport and takes the
+/// same width, which is why the two constants are equal rather than one being
+/// derived from the other by coincidence.
+///
+/// The refusal at the comparison is what keeps a larger count from reaching
+/// Metal, where it is a process-aborting exception rather than a status.
 pub const REIMS_VGPU_BACKEND_MAX_VIEWPORTS: usize = 16;
-pub const REIMS_VGPU_BACKEND_MAX_SCISSORS: usize = 16;
+pub const REIMS_VGPU_BACKEND_MAX_SCISSORS: usize = REIMS_VGPU_BACKEND_MAX_VIEWPORTS;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

@@ -1380,6 +1380,7 @@ fn draws_sharing_a_bind_table_share_its_allocation() {
             index: 0,
             buffer_ref: 9,
             offset: 0,
+                attribute_stride: None,
         }]),
         ..Default::default()
     };
@@ -1420,6 +1421,7 @@ fn a_bind_after_a_draw_does_not_rewrite_that_draws_snapshot() {
             index: 0,
             buffer_ref: 9,
             offset: 0,
+                attribute_stride: None,
         }]),
         ..Default::default()
     };
@@ -1433,7 +1435,11 @@ fn a_bind_after_a_draw_does_not_rewrite_that_draws_snapshot() {
     handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
 
     apply_binds(
-        &[(77u32, 0u64)],
+        &[crate::runtime::decode::render::DecodedBufferBind {
+            buffer_ref: 77,
+            offset: 0,
+            attribute_stride: None,
+        }],
         0,
         BindTarget {
             stage: Stage::Vertex,
@@ -1445,11 +1451,12 @@ fn a_bind_after_a_draw_does_not_rewrite_that_draws_snapshot() {
             refused: &mut acc.unrepresentable,
         },
         |b| b.index,
-        |index, (buffer_ref, offset)| {
+        |index, b: crate::runtime::decode::render::DecodedBufferBind| {
             Some(BufferBind {
                 index,
-                buffer_ref,
-                offset,
+                buffer_ref: b.buffer_ref,
+                offset: b.offset,
+                attribute_stride: b.attribute_stride,
             })
         },
     );
@@ -1819,6 +1826,7 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
             index: 0,
             buffer_ref: 1,
             offset: 0,
+                attribute_stride: None,
         }]),
         fragment_buffers: Arc::default(),
         vertex_textures: Arc::default(),
@@ -1924,6 +1932,7 @@ fn nometal_draw_falls_back_to_type4_clear() {
             index: 0,
             buffer_ref: 1,
             offset: 0,
+                attribute_stride: None,
         }]),
         fragment_buffers: Arc::default(),
         vertex_textures: Arc::default(),
@@ -3489,19 +3498,17 @@ fn each_blit_spi_record_reaches_a_counter_that_names_which_one_it_is() {
     }
 }
 
-/// A strided vertex bind reaches the bind table *and* its own counter.
+/// A strided vertex bind reaches the bind table carrying its stride.
 ///
-/// Both halves matter and they are different claims. The bind must land,
-/// because this record used to be refused before decode and the buffer
-/// never bound at all; the counter must fire, because the per-entry
-/// attribute stride still is not applied and the count is what says whether
-/// applying it is worth building.
+/// Three claims, and they failed in three different eras. The record used to
+/// be refused before decode, so the buffer never bound at all. Then the bind
+/// landed and the stride was stepped over and counted. Now the stride travels
+/// on the bind, so the assertion is that the *third* field of the twenty-byte
+/// entry is the guest's number and not padding.
 #[test]
-fn a_strided_vertex_bind_lands_in_the_table_and_still_reports_the_stride() {
+fn a_strided_vertex_bind_lands_in_the_table_carrying_its_stride() {
     use crate::contract::endian::st64;
-    use crate::runtime::drain::store_route_count;
 
-    const ROUTE: &str = "render_vertex_attribute_stride_dropped";
     let total = reims_vgpu_wire::OP_HEADER_LEN
         + render::BIND_ENTRIES
         + render::BUFFER_STRIDE_BIND_ENTRY_SIZE;
@@ -3528,7 +3535,6 @@ fn a_strided_vertex_bind_lands_in_the_table_and_still_reports_the_stride() {
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
-    let before = store_route_count(ROUTE);
     handle_render_record(
         &mut state,
         &host,
@@ -3539,24 +3545,25 @@ fn a_strided_vertex_bind_lands_in_the_table_and_still_reports_the_stride() {
         &mut acc,
     );
     assert_eq!(
-        store_route_count(ROUTE),
-        before + 1,
-        "the dropped stride was not counted"
-    );
-    assert_eq!(
         acc.vertex_buffers.len(),
         1,
         "the buffer did not bind; this record used to be refused whole"
     );
     let b = &acc.vertex_buffers[0];
     assert_eq!((b.index, b.buffer_ref, b.offset), (4, 5151, 0x2345));
+    assert_eq!(
+        b.attribute_stride,
+        Some(0x3456),
+        "the stride is the entry's third field, not padding stepped over"
+    );
     assert!(
         acc.fragment_buffers.is_empty(),
         "a vertex bind reached the fragment table"
     );
 
-    // The plain bind must not report a stride it never carried, or the
-    // counter reads as traffic on every ordinary vertex bind.
+    // The plain bind carries no stride table, and `None` is not `Some(0)`: a
+    // zero stride is a legal Metal request that fetches every vertex from one
+    // address, so the two cannot share a spelling.
     let plain_total =
         reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + render::BUFFER_BIND_ENTRY_SIZE;
     let mut plain = vec![0u8; plain_total];
@@ -3570,7 +3577,6 @@ fn a_strided_vertex_bind_lands_in_the_table_and_still_reports_the_stride() {
         &mut plain[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES..],
         5151,
     );
-    let before = store_route_count(ROUTE);
     handle_render_record(
         &mut state,
         &host,
@@ -3580,9 +3586,16 @@ fn a_strided_vertex_bind_lands_in_the_table_and_still_reports_the_stride() {
         &mut out,
         &mut acc,
     );
+    // By index, not by position: the strided bind above took slot 4 and is
+    // still in the table, so `[0]` is whichever landed first rather than the
+    // one this record wrote.
+    let plain_bind = acc
+        .vertex_buffers
+        .iter()
+        .find(|b| b.index == 0)
+        .expect("the plain bind landed at slot 0");
     assert_eq!(
-        store_route_count(ROUTE),
-        before,
+        plain_bind.attribute_stride, None,
         "a plain vertex bind reported a stride it does not carry"
     );
 }

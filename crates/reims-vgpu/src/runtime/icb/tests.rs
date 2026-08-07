@@ -3439,6 +3439,7 @@ fn inherit_buffers_encoder_fragment_color() {
             index: 0,
             buffer_ref: 13,
             offset: 0,
+                attribute_stride: None,
         }],
         viewports: vec![[0.0, 0.0, 4.0, 4.0, 0.0, 1.0]],
         ..draw_request(mapping_id)

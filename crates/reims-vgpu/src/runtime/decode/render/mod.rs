@@ -487,6 +487,28 @@ impl ScissorRect {
     }
 }
 
+/// One entry of a multi-slot buffer bind record.
+///
+/// A struct rather than the `(u32, u64)` tuple this used to be, because the
+/// stride is a third value travelling with the same two and `scripts/scattered-struct`
+/// exists for exactly that. The pair had already outgrown the tuple: the
+/// twenty-byte `setVertexBuffers:offsets:attributeStrides:withRange:` entry
+/// carries all three, and the decoder was reading the first two and stepping
+/// over the third.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DecodedBufferBind {
+    pub buffer_ref: u32,
+    pub offset: u64,
+    /// The vertex fetch stride this bind declares, overriding whatever the
+    /// pipeline's `MTLVertexBufferLayoutDescriptor` said for the same index.
+    ///
+    /// `None` is "this record carried no stride table", which is the plain
+    /// `setVertexBuffers:offsets:withRange:` and every non-vertex stage. It is
+    /// not the same as `Some(0)`: a zero stride is a legal Metal request that
+    /// fetches every vertex from the same address.
+    pub attribute_stride: Option<u64>,
+}
+
 /// Lift one wire rect. Shared by the singular and plural scissor opcodes, which
 /// carry the identical element and differ only in how many of it follow.
 fn scissor_from_wire(r: &wire::ScissorRect) -> ScissorRect {
@@ -611,8 +633,8 @@ pub struct Command {
     pub count: u32,
     pub buffer_ref: u32,
     pub buffer_offset: u64,
-    /// Multi-entry buffer binds: (object_ref, offset) for slots first..first+count.
-    pub buffer_binds: Vec<(u32, u64)>,
+    /// Multi-entry buffer binds for slots `first..first+count`.
+    pub buffer_binds: Vec<DecodedBufferBind>,
     pub texture_ref: u32,
     /// Multi-entry texture/sampler refs for slots first..first+count.
     pub ref_binds: Vec<u32>,
@@ -684,6 +706,11 @@ pub struct Command {
     /// see [`wire::OPCODE_SET_VERTEX_BUFFER_STRIDE`]. The buffer still binds — what is
     /// missing is the stride the guest wanted the vertex fetch to use.
     pub has_attribute_stride: bool,
+    /// The stride of a single-slot [`Kind::SetBufferOffset`] record that
+    /// carried one (`setVertexBufferOffset:attributeStride:atIndex:`). The
+    /// multi-slot forms carry theirs per entry in
+    /// [`DecodedBufferBind::attribute_stride`], because the record does.
+    pub attribute_stride: Option<u64>,
     pub raw_payload_len: usize,
     /// Color attachment[0] when kind is RenderPass (boot clear path).
     pub color0: ColorAttachment,
@@ -902,17 +929,21 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             }
             out.buffer_binds.clear();
             for e in entries {
-                out.buffer_binds.push((e.buffer_ref.get(), e.offset.get()));
+                out.buffer_binds.push(DecodedBufferBind {
+                    buffer_ref: e.buffer_ref.get(),
+                    offset: e.offset.get(),
+                    attribute_stride: None,
+                });
             }
-            if let Some(&(r, o)) = out.buffer_binds.first() {
-                out.buffer_ref = r;
-                out.buffer_offset = o;
+            if let Some(b) = out.buffer_binds.first() {
+                out.buffer_ref = b.buffer_ref;
+                out.buffer_offset = b.offset;
             }
             Ok(out)
         }
         wire::OPCODE_SET_VERTEX_BUFFER_STRIDE => {
-            // Attribute-stride form: twenty-byte entries. Stride is not lifted
-            // (nothing applies it), but the bind itself must decode.
+            // Attribute-stride form: twenty-byte entries, all three fields of
+            // each lifted.
             let (head, entries) =
                 wire::buffer_stride_binds(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetBuffer;
@@ -929,11 +960,15 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             }
             out.buffer_binds.clear();
             for e in entries {
-                out.buffer_binds.push((e.buffer_ref.get(), e.offset.get()));
+                out.buffer_binds.push(DecodedBufferBind {
+                    buffer_ref: e.buffer_ref.get(),
+                    offset: e.offset.get(),
+                    attribute_stride: Some(e.attribute_stride.get()),
+                });
             }
-            if let Some(&(r, o)) = out.buffer_binds.first() {
-                out.buffer_ref = r;
-                out.buffer_offset = o;
+            if let Some(b) = out.buffer_binds.first() {
+                out.buffer_ref = b.buffer_ref;
+                out.buffer_offset = b.offset;
             }
             Ok(out)
         }
@@ -1254,6 +1289,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.has_attribute_stride = true;
             out.first = b.index.get();
             out.buffer_offset = b.offset.get();
+            out.attribute_stride = Some(b.attribute_stride.get());
             Ok(out)
         }
         wire::OPCODE_SET_VIEWPORT => {

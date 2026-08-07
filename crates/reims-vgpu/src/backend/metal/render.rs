@@ -842,6 +842,34 @@ fn bind_storage_buffers(
         };
         if fragment_stage {
             encoder.set_fragment_buffer(buffer.binding as u64, Some(&mtl_buffer), 0);
+        } else if buffer.has_attribute_stride != 0 {
+            // `setVertexBuffer:offset:attributeStride:atIndex:` is only legal
+            // where the pipeline's `MTLVertexBufferLayoutDescriptor.stride` for
+            // this index is `MTLBufferLayoutStrideDynamic`, exactly as the
+            // compute rail's `metal_compute_attribute_stride_without_dynamic_layout`
+            // states for `MTLBufferLayoutDescriptor`. This rail's vertex
+            // descriptor is built from the type-7 attribute block and never
+            // declares a dynamic layout, so the selector would raise an
+            // NSException — a process abort, not an error return.
+            //
+            // Refused by name rather than bound with the pipeline's own stride.
+            // A guest that sent this negotiated `supportsDynamicAttributeStride`
+            // and built a pipeline whose layout stride is the sentinel, so
+            // fetching at that stride is not "close enough": it is wrong
+            // geometry the guest is never told about. Closing this means the
+            // render pipeline declaring the dynamic layout, at which point the
+            // bind becomes `raw_metal`'s render sibling of the compute setter.
+            set_err(
+                err,
+                format!(
+                    "vertex buffer {} carries an attributeStride and this rail's \
+                     vertex descriptor declares no dynamic layout",
+                    buffer.binding
+                ),
+            );
+            return Status::args("metal_render_attribute_stride_without_dynamic_layout")
+                .field("binding", buffer.binding)
+                .field("stride", buffer.attribute_stride);
         } else {
             encoder.set_vertex_buffer(buffer.binding as u64, Some(&mtl_buffer), 0);
         }

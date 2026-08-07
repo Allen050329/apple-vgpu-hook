@@ -4407,7 +4407,27 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let attrs_span =
             crate::runtime::bind_phase::Span::open(crate::runtime::bind_phase::Part::Attrs);
         for a in &pd.vertex_attributes {
-            if a.format == 0 || a.stride == 0 {
+            // `setVertexBuffer:offset:attributeStride:atIndex:` overrides what
+            // the pipeline's `MTLVertexBufferLayoutDescriptor` declared for this
+            // buffer index, so it is resolved before the stride is read — a
+            // pipeline built for a dynamic stride declares one this device
+            // cannot use, and the guard below would drop the attribute for it.
+            //
+            // On this backend the stride reaches the pipeline through
+            // `AttrKey::stride`, which is already part of the key: Vulkan's
+            // per-binding stride is `VkVertexInputBindingDescription::stride`
+            // and is not dynamic below `vkCmdBindVertexBuffers2`, core in 1.3
+            // against this device's 1.2 floor. So two draws sharing shaders and
+            // differing only in a guest-supplied stride already get their own
+            // pipelines, with no change to the key.
+            let stride = req
+                .vertex_buffers
+                .iter()
+                .find(|b| b.index == a.buffer_index)
+                .and_then(|b| b.attribute_stride)
+                .and_then(|s| u32::try_from(s).ok())
+                .unwrap_or(a.stride);
+            if a.format == 0 || stride == 0 {
                 continue;
             }
             let format = prepare_vertex_attribute_format(a).map_err(DrawError::DrawPreparation)?;
@@ -4426,7 +4446,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         location: a.location,
                         buffer_index: a.buffer_index,
                         raw_format: a.format,
-                        stride: a.stride,
+                        stride,
                     },
                 ));
             }
@@ -4438,7 +4458,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 binding: a.location,
                 format,
                 offset: a.offset,
-                stride: a.stride,
+                stride,
                 step_function: step,
                 step_rate,
                 content,

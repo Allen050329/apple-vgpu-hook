@@ -548,6 +548,18 @@ pub struct BufferBind {
     pub index: u32,
     pub buffer_ref: u32,
     pub offset: u64,
+    /// The vertex fetch stride this bind declares, from
+    /// `setVertexBuffer:offset:attributeStride:atIndex:` and its plural and
+    /// offset-only siblings. `None` means the record carried no stride table,
+    /// so whatever the pipeline's vertex layout declared for this index stands.
+    ///
+    /// Same shape as [`SamplerBind::lod_clamp`] — a value the bind record
+    /// carries that overrides pipeline state — and it arrived the same way,
+    /// which is that the opcodes carrying it were being decoded and their extra
+    /// field stepped over. The compute rail has carried this field the whole
+    /// time, on `ReimsVgpuBuffer::attribute_stride`, through
+    /// `raw_metal::set_buffer_with_attribute_stride`.
+    pub attribute_stride: Option<u64>,
 }
 
 /// One slot of a render encoder's vertex or fragment texture table. The stage
@@ -1718,6 +1730,20 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         ab.binding = binding;
         ab.data = data.as_ptr() as *mut u8;
         ab.len = data.len();
+        // The bind's own stride, where the record carried one. The ABI has
+        // always had these two fields — the compute rail fills them and
+        // `raw_metal::set_buffer_with_attribute_stride` reads them — and the
+        // render path wrote zeros into them because nothing above it carried a
+        // stride to write.
+        if let Some(stride) = req
+            .vertex_buffers
+            .iter()
+            .find(|b| b.index == binding)
+            .and_then(|b| b.attribute_stride)
+        {
+            ab.attribute_stride = stride;
+            ab.has_attribute_stride = 1;
+        }
         vtx_bufs.push(ab);
     }
     let mut frag_bufs: Vec<ReimsVgpuBuffer> = Vec::with_capacity(frag_storage.len());

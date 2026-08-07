@@ -965,8 +965,20 @@ fn a_vertex_bind_with_an_attribute_stride_binds_the_buffer_rather_than_being_ref
     assert_eq!(c.first, 9);
     assert_eq!(
         c.buffer_binds,
-        vec![(5151, 0x3333), (5252, 0x4444)],
-        "the entry stride is 20, not the plain bind's 12"
+        vec![
+            DecodedBufferBind {
+                buffer_ref: 5151,
+                offset: 0x3333,
+                attribute_stride: Some(0x5555),
+            },
+            DecodedBufferBind {
+                buffer_ref: 5252,
+                offset: 0x4444,
+                attribute_stride: Some(0x6666),
+            }
+        ],
+        "the entry stride is 20, not the plain bind's 12, and the third field of \
+         each entry is the stride rather than padding stepped over"
     );
 
     // The plain bind must not be told it carries one, or every ordinary

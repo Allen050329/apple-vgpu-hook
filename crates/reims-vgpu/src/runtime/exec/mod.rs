@@ -1431,24 +1431,6 @@ fn handle_render_record<M: HostMemory + HostOps>(
             acc.pipeline_ref = cmd.pipeline_ref;
         }
         RenderKind::SetBuffer => {
-            if cmd.has_attribute_stride {
-                // Same shape as the sampler LOD bind below, and it was the same
-                // bug: `0xa5` sits above the old accepted window, so a guest
-                // that negotiated `supportsDynamicAttributeStride` had every
-                // strided vertex bind refused and the buffer never bound. The
-                // bind is applied now; the per-entry stride is not, because
-                // `BufferBind` carries none and the vertex fetch layout is
-                // pipeline state neither backend is asked to re-declare.
-                //
-                // The sampler sibling has since been carried the rest of the
-                // way — `SamplerBind::lod_clamp` — and that is the shape this
-                // one would take: a field on the bind, applied over whatever
-                // the pipeline declared. It is the harder half, because a
-                // stride is baked into the graphics pipeline on both backends
-                // where a clamp is per-descriptor, so closing it means the
-                // stride joining the pipeline key.
-                crate::runtime::drain::note_store_route("render_vertex_attribute_stride_dropped");
-            }
             // Slots first..first+n from the archive layout's entry array.
             // `render::decode` refuses `count == 0` with `ErrBadLength`, and
             // sets `cmd.buffer_ref` from `buffer_binds.first()`, so a decoded
@@ -1467,20 +1449,18 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     refused: &mut acc.unrepresentable,
                 },
                 |b| b.index,
-                |index, (buffer_ref, offset)| {
-                    (buffer_ref != 0).then_some(BufferBind {
+                |index, b| {
+                    (b.buffer_ref != 0).then_some(BufferBind {
                         index,
-                        buffer_ref,
-                        offset,
+                        buffer_ref: b.buffer_ref,
+                        offset: b.offset,
+                        attribute_stride: b.attribute_stride,
                     })
                 },
             );
             out.buffer_unbinds = out.buffer_unbinds.saturating_add(cleared);
         }
         RenderKind::SetBufferOffset => {
-            if cmd.has_attribute_stride {
-                crate::runtime::drain::note_store_route("render_vertex_attribute_stride_dropped");
-            }
             // Archive apply_buffer_offset: update offset on an already-bound slot.
             if cmd.first >= BindClass::Buffer.table() {
                 // The slot is outside the table, so the bind that would have
@@ -1517,7 +1497,16 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 Stage::Unknown => return,
             };
             match list.iter_mut().find(|b| b.index == cmd.first) {
-                Some(b) => b.offset = cmd.buffer_offset,
+                Some(b) => {
+                    b.offset = cmd.buffer_offset;
+                    // Only when this record carried one.
+                    // `setVertexBufferOffset:atIndex:` and its strided sibling
+                    // are different opcodes, and the plain one must not clear a
+                    // stride an earlier bind established.
+                    if let Some(stride) = cmd.attribute_stride {
+                        b.attribute_stride = Some(stride);
+                    }
+                }
                 // A healthy zero, and a sharp one. Metal requires a buffer
                 // already bound at the index before
                 // `setVertexBufferOffset:atIndex:`, and a render encoder's bind

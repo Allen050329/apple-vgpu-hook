@@ -40,9 +40,11 @@
 //! field that `wire_geometry` dropped before the walk. It is gone.
 //! `REIMS_VGPU_METAL_MAX_SAMPLERS` was the one argument-table size with no
 //! reachable derivation, and now pins to the serializer capture that measured
-//! it. And the two viewport bounds turned out to guard a list this device builds
+//! it. And the two viewport bounds turned out to guard a list this device built
 //! with at most one entry — see [`Verdict::NeverReached`], which is where the
-//! interesting half of this population is.
+//! interesting half of this population is. Those two have since moved to
+//! [`Verdict::ContractLimit`]: the list carries the guest's own count now, so
+//! the comparison is live and the number had to be shown to be Metal's.
 //!
 //! # What this reads, and what it therefore cannot see
 //!
@@ -134,10 +136,13 @@ enum Verdict {
     /// this device rather than by the guest and is narrower by construction.
     ///
     /// **The reason must name what makes it unreachable**, because that is
-    /// usually where the guest work actually goes. Both viewport bounds are
-    /// here, and what makes them unreachable is that the device models a single
-    /// viewport and counts the rest of a plural record as a loss — a bound that
-    /// cannot fire in front of a truncation that already did.
+    /// usually where the guest work actually goes. Both viewport bounds used to
+    /// be here, and what made them unreachable was that the device modelled a
+    /// single viewport and counted the rest of a plural record as a loss — a
+    /// bound that could not fire in front of a truncation that already had.
+    /// They are `ContractLimit` now that the count is the guest's, which is the
+    /// shape this verdict is for: it names where the work went, so that closing
+    /// that gap moves the row rather than leaving a stale reassurance.
     NeverReached,
     /// A limit this device picked. **Must not appear.** A guest request refused
     /// for a number nobody outside this repository knows about is guest work
@@ -207,7 +212,7 @@ const ROWS: &[Row] = &[
               inside PER_INSTANCE.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/render.rs:1624",
+        at: "reims-vgpu/src/backend/metal/render.rs:1652",
         bound: "REIMS_VGPU_METAL_MAX_COLOR_RTS",
         verdict: Verdict::WireField,
         why: "Metal's eight colour attachments, held equal by a const assertion to \
@@ -215,7 +220,7 @@ const ROWS: &[Row] = &[
               Apple's serialized render-pass record.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/render.rs:1634",
+        at: "reims-vgpu/src/backend/metal/render.rs:1662",
         bound: "REIMS_VGPU_METAL_MAX_COLOR_RTS",
         verdict: Verdict::WireField,
         why: "The same eight, tested against a slot number rather than a count: a \
@@ -223,27 +228,25 @@ const ROWS: &[Row] = &[
               to have carried.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/render.rs:1719",
+        at: "reims-vgpu/src/backend/metal/render.rs:1747",
         bound: "REIMS_VGPU_BACKEND_MAX_VIEWPORTS",
-        verdict: Verdict::NeverReached,
-        why: "The list is built in draw::mod from DrawEncodeRequest::viewport, an \
-              Option, so it holds nought or one. The extra viewports were dropped at \
-              decode and counted as render_extra_viewports_dropped. Raising the \
-              carriage to an array would render the same pixels: selecting a \
-              viewport past 0 needs a shader writing the view index, which arrives \
-              as setVertexAmplificationCount: and is itself dropped \
-              (render_vertex_amplification_dropped). The gap is multi-view \
-              rendering, not this bound.",
+        verdict: Verdict::ContractLimit,
+        why: "Metal's own array width: MSL declares [[viewport_array_index]] as 0 \
+              through 15, so sixteen is every viewport a render encoder can \
+              rasterize into and setViewports:count: with more is out of contract. \
+              This row read NeverReached while DrawEncodeRequest::viewport was an \
+              Option and the list could hold nought or one; it carries the guest's \
+              own count now, so the comparison is live and the number has to be \
+              Metal's rather than a ceiling this device picked.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/render.rs:1725",
+        at: "reims-vgpu/src/backend/metal/render.rs:1753",
         bound: "REIMS_VGPU_BACKEND_MAX_SCISSORS",
-        verdict: Verdict::NeverReached,
-        why: "The scissor twin of the viewport row above, unreachable for the same \
-              reason and blocked behind the same feature: Metal's setScissorRects: \
-              is one rect per viewport, so rects past the first are dropped and \
-              counted as render_extra_scissors_dropped for want of multi-view, not \
-              for want of room.",
+        verdict: Verdict::ContractLimit,
+        why: "The scissor twin of the viewport row above and the same limit for the \
+              same reason: setScissorRects:count: is one rect per viewport, so its \
+              width is the viewport array's. Declared as that constant rather than \
+              as a second 16, so the two cannot drift.",
     },
     Row {
         at: "reims-vgpu/src/backend/metal/stage_input.rs:125",

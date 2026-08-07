@@ -94,15 +94,6 @@ enum Counted {
 /// Keyed by the slug, which is the one name that cannot move when a line does.
 const ROWS: &[(&str, Counted, &str)] = &[
     (
-        "render_vertex_attribute_stride_dropped",
-        Counted::StateNotApplied,
-        "SetBuffer and SetBufferOffset apply the bind and drop the per-entry \
-         attribute stride, so the vertex fetch uses the pipeline's declared \
-         layout. Fires only under `has_attribute_stride`. Before this arm \
-         existed the whole record was refused and the buffer never bound at \
-         all, so the count is the distance still left rather than a regression",
-    ),
-    (
         "render_store_action_override_dropped",
         Counted::StateNotApplied,
         "a SetStoreAction record overrides what the pass descriptor said for an \
@@ -426,7 +417,7 @@ fn every_counted_loss_says_what_it_costs() {
     // directory carries: a scan that matched no counter argument would report
     // an empty population as fully adjudicated.
     assert!(
-        found.len() >= 28,
+        found.len() >= 27,
         "the scan found only {} counter-only loss slugs, so it is not parsing \
          `note_store_route` arguments and its verdict means nothing: {found:?}",
         found.len()
@@ -482,7 +473,7 @@ fn no_counted_loss_is_unread() {
 /// population without changing anything the guest sees.
 #[test]
 fn the_counted_loss_census_only_shrinks() {
-    const COUNTED_LOSS_CEILING: usize = 23;
+    const COUNTED_LOSS_CEILING: usize = 22;
     let losses = ROWS
         .iter()
         .filter(|(_, c, _)| matches!(c, Counted::StateNotApplied | Counted::WorkNotExecuted))
