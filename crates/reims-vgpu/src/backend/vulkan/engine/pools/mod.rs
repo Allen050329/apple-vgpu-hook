@@ -413,6 +413,41 @@ pub(crate) struct ResourcePools {
     /// because the answer the stamp needs is "is there any", and a quiesce
     /// retires the whole ring regardless.
     guest_reads_in_flight: bool,
+    /// Whether any command buffer submitted since the last quiesce **writes**
+    /// guest RAM when it executes.
+    ///
+    /// The mirror of `guest_reads_in_flight`, and it exists for the same
+    /// sentence read the other way round. `copy_target_to_guest_pages` used to
+    /// wait its own fence before returning, which made the writeback rail one
+    /// blocking GPU round trip per landed window: 369 fences a second at
+    /// 1 360 us each, of which the device's own timestamps priced only 636 us as
+    /// the copy executing. The remaining 724 us was submit-to-start plus
+    /// signal-to-wake, paid once per window, and it was 267 ms of every second.
+    ///
+    /// Deferring the wait does not weaken the ordering the stamp needs, because
+    /// that ordering was never "each copy has landed by the time its own
+    /// function returns" — it is "every copy has landed before the guest is told
+    /// anything". Recording the debt here and settling it at the same choke
+    /// points [`ResourcePools::quiesce_guest_reads`] is settled at collapses N
+    /// waits into one and lets the copies pipeline against each other on the
+    /// GPU instead of stopping the queue between them.
+    guest_writes_in_flight: bool,
+    /// Residents held pinned because a submitted-but-unsettled writeback copy
+    /// reads them.
+    ///
+    /// A window's flush used to unpin its resident as soon as the copy returned,
+    /// which was safe only because the copy had already executed by then. With
+    /// the wait deferred, unpinning at that point would let the
+    /// allocation-failure reclaim or the idle drain take an image the GPU has
+    /// not read yet. The pin is transferred here instead and released by
+    /// [`ResourcePools::quiesce_guest_writes`], which waits the whole ring — so
+    /// the interval it covers is exactly the interval the copy can still be
+    /// running in.
+    ///
+    /// Cannot strand a pin: nothing is pushed here without also setting
+    /// `guest_writes_in_flight`, and every setting of that flag is answered by a
+    /// quiesce at the next completion stamp.
+    unpin_on_settle: Vec<TargetIdentity>,
     initialized: bool,
 }
 

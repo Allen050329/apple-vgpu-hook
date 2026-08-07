@@ -510,9 +510,27 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 ///   wasted is knowable only in hindsight, and a mapping whose pages are read
 ///   while stale has already served wrong pixels.
 ///
-/// The async-readback split (release the device lock across the fence wait) is
-/// the step that does not require any of them, and the fence is now most of what
-/// a flush is.
+/// The step that required none of them has been taken, and it was not the one
+/// named here. This paragraph used to propose releasing the device lock across
+/// the fence wait; `engine_lock` prices that at nothing — the drain worker held
+/// the engine 563 ms of a second and the window thread was blocked once, for
+/// 45 us. Nothing else wanted the lock, so releasing it buys nothing. The worker
+/// itself was the bottleneck.
+///
+/// What paid was deleting the wait's *repetition*. Each landed window blocked on
+/// its own fence, and the device's own timestamps say what that cost: 369 fences
+/// a second at 1 360 us each, of which `gpu_us` accounts for 636 us. The
+/// remaining 724 us per window is submit-to-start plus signal-to-wake — 267 ms
+/// of every second spent not copying anything. `copy_target_to_guest_pages` now
+/// returns once the copy is on the queue and the obligation is settled at the
+/// completion stamp instead (`engine::quiesce_guest_writes`), so a pass submits
+/// every window back to back and blocks once at the end. Each window's own CPU
+/// work — vouch, resolve, the identity ladder — then runs while the previous
+/// window's copy executes, which is where the rest of the round trip goes.
+///
+/// The copy itself is untouched and is now the floor: ~235 ms/s of GPU time
+/// moving whole surfaces across the bus, which only the third route above
+/// reduces.
 ///
 /// # What witnessing the undeclared read would take
 ///

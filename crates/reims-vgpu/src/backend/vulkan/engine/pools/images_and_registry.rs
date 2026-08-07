@@ -1428,6 +1428,16 @@ impl ResourcePools {
     /// stays protected until every holder unpins. Returns false when the identity is absent or (for pinning) its
     /// content is not ready — callers must fall back to the synchronous
     /// Store. Unpin saturates at zero (a spurious unpin never underflows).
+    ///
+    /// # An unpin at zero is reported, not absorbed
+    ///
+    /// The saturation keeps the count sane; it does not make the call correct.
+    /// Two holders and one unpin too many is a resident left reclaimable while
+    /// somebody still reads it, and the deferred writeback rail made that
+    /// reachable from a single line: it hands its pin to
+    /// `note_guest_write_recorded` and a caller that also unpins would release
+    /// one holder's pin on another's behalf. Silent saturation is what would let
+    /// that land as a rare wrong frame instead of a log line.
     pub(crate) fn pin_resident_target(&mut self, identity: &TargetIdentity, pinned: bool) -> bool {
         let Some(slot) = self.registry.get_mut(identity) else {
             return false;
@@ -1435,15 +1445,22 @@ impl ResourcePools {
         if pinned && !slot.content_ready {
             return false;
         }
+        if !pinned && slot.pin_count == 0 {
+            crate::observe::fail(format!(
+                "resident_unpin_unbalanced identity={identity:?} \
+                 (an unpin with no pin outstanding — some other holder's pin has \
+                 already been released on its behalf, or this one was never taken)"
+            ));
+            return true;
+        }
         // Counted pins, so only the 0 <-> 1 crossings change whether this slot is
         // in the non-pinned totals. A second pin, or an unpin that leaves one
-        // holder, moves nothing — and a saturating unpin at zero must not add a
-        // slot that was already counted.
+        // holder, moves nothing.
         let before_non_pinned = slot.pin_count == 0;
         if pinned {
             slot.pin_count += 1;
         } else {
-            slot.pin_count = slot.pin_count.saturating_sub(1);
+            slot.pin_count -= 1;
         }
         let after_non_pinned = slot.pin_count == 0;
         if before_non_pinned != after_non_pinned {
@@ -2074,8 +2091,14 @@ impl ResourcePools {
 }
 
 #[cfg(test)]
-mod pin_count_tests {
+pub(super) mod pin_count_tests {
     use super::*;
+
+    /// A registry slot a pin will be granted on, for tests in sibling modules
+    /// that need a resident to hold rather than a resident to inspect.
+    pub(in crate::backend::vulkan::engine::pools) fn ready_slot() -> ResidentTargetSlot {
+        dummy_slot(true)
+    }
 
     fn dummy_slot(content_ready: bool) -> ResidentTargetSlot {
         ResidentTargetSlot {

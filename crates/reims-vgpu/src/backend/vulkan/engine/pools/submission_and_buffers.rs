@@ -130,6 +130,8 @@ impl ResourcePools {
             slabs: buffer_slab::BufferSlabs::new(),
             host_ram_imports: host_ram::HostRamImports::default(),
             guest_reads_in_flight: false,
+            guest_writes_in_flight: false,
+            unpin_on_settle: Vec::new(),
             initialized: false,
         }
     }
@@ -1232,6 +1234,65 @@ impl ResourcePools {
     /// `false`.
     pub(crate) fn take_guest_read_debt(&mut self) -> bool {
         std::mem::take(&mut self.guest_reads_in_flight)
+    }
+
+    /// Record that a submitted command buffer **writes** guest RAM when it
+    /// executes, and take over `identity`'s pin until it has.
+    ///
+    /// Both halves are one call because they are one fact: this copy has not
+    /// happened yet. Whoever asked for it may not read those guest bytes and the
+    /// registry may not reclaim that image until the fence says otherwise, and a
+    /// site that recorded the debt without taking the pin would satisfy the first
+    /// while breaking the second.
+    ///
+    /// Called only once the copy is known submitted, so a rail that failed to
+    /// record one still owns its pin and unpins it the way it always did.
+    pub(crate) fn note_guest_write_recorded(&mut self, identity: &TargetIdentity) {
+        self.guest_writes_in_flight = true;
+        self.unpin_on_settle.push(identity.clone());
+    }
+
+    /// Clear the guest-write debt and answer whether there was one. The mirror
+    /// of [`Self::take_guest_read_debt`], and split from its wait for the same
+    /// reason.
+    pub(crate) fn take_guest_write_debt(&mut self) -> bool {
+        std::mem::take(&mut self.guest_writes_in_flight)
+    }
+
+    /// Wait until every guest-page writeback this device has recorded has
+    /// landed.
+    ///
+    /// The obligation this settles is the one `flush_all_windows_before_fence`
+    /// used to settle inline, one blocking fence per window. It is the same
+    /// wait; what changed is that it happens once for all of them and after
+    /// they were all submitted, so the queue runs them back to back instead of
+    /// stopping between each.
+    ///
+    /// Every caller is a point where the copy becoming visible stops being
+    /// this device's own business: the completion stamp, and the flush-on-access
+    /// choke points where a host reader or writer is about to touch the same
+    /// guest bytes. A new one of either is a new caller.
+    pub(crate) unsafe fn quiesce_guest_writes(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+    ) -> Result<(), DrawError> {
+        // Taken before the wait, for the reason `quiesce_guest_reads` states:
+        // a failed wait still leaves the slot pending and the next claimant
+        // re-waits, so the ordering holds without carrying the debt forward.
+        if !self.take_guest_write_debt() {
+            return Ok(());
+        }
+        let waited = unsafe { self.retire_all(ctx, counters) };
+        // Released whether or not the wait succeeded. A failed wait leaves the
+        // slot pending and the next claimant re-waits, so the copy is still
+        // ordered ahead of anything that reuses the image — and holding these
+        // pins for the rest of the boot is how a whole framebuffer per failure
+        // becomes unreclaimable.
+        for identity in std::mem::take(&mut self.unpin_on_settle) {
+            self.pin_resident_target(&identity, false);
+        }
+        waited
     }
 
     /// Wait until nothing this device has recorded will read guest RAM again.
@@ -3672,6 +3733,94 @@ mod recycle_tests {
         pools.note_guest_read_recorded();
         assert!(pools.take_guest_read_debt());
         assert!(!pools.take_guest_read_debt());
+    }
+
+    /// The write ledger's own half, and the reason it is a ledger rather than a
+    /// blocking call: several windows landed in one fence pass settle together.
+    /// A rail that took the debt per window would be the per-window fence this
+    /// change removed, wearing a different name.
+    #[test]
+    fn a_stamp_waits_for_guest_writes_only_when_one_was_recorded() {
+        let mut pools = ResourcePools::new();
+        let identity = TargetIdentity::Surface {
+            id: 1,
+            width: 16,
+            height: 16,
+            generation: 0,
+        };
+        assert!(
+            !pools.take_guest_write_debt(),
+            "a device that has submitted no writeback owes no wait"
+        );
+
+        pools.note_guest_write_recorded(&identity);
+        assert!(pools.take_guest_write_debt());
+        assert!(
+            !pools.take_guest_write_debt(),
+            "one settle covers the copies recorded before it, not every stamp after"
+        );
+
+        pools.note_guest_write_recorded(&identity);
+        pools.note_guest_write_recorded(&identity);
+        assert!(pools.take_guest_write_debt());
+        assert!(!pools.take_guest_write_debt());
+    }
+
+    /// A submitted-but-unsettled copy reads its resident's image, so the pin
+    /// that licenses that read may not be dropped at the call which issued the
+    /// copy — which is where the rail used to drop it, safely, because the copy
+    /// had already executed by then.
+    ///
+    /// Device-free: `quiesce_guest_writes` needs a `DeviceContext` for the wait,
+    /// so this drives the two halves it composes — that the ledger holds the pin
+    /// across the submit, and that taking the debt is what releases it.
+    #[test]
+    fn a_submitted_writeback_holds_its_residents_pin_until_the_settle() {
+        let mut pools = ResourcePools::new();
+        let identity = TargetIdentity::Surface {
+            id: 7,
+            width: 16,
+            height: 16,
+            generation: 3,
+        };
+        pools
+            .registry
+            .insert(
+                identity.clone(),
+                crate::backend::vulkan::engine::pools::images_and_registry::pin_count_tests::ready_slot(),
+            );
+        assert!(pools.pin_resident_target(&identity, true), "the flush's pin");
+        assert_eq!(pools.registry[&identity].pin_count, 1);
+
+        // The copy is issued: the flush hands its pin over rather than dropping
+        // it, so the image stays out of the reclaim's reach.
+        pools.note_guest_write_recorded(&identity);
+        assert_eq!(
+            pools.registry[&identity].pin_count, 1,
+            "issuing the copy must not unpin — the GPU has not read the image yet"
+        );
+
+        // Two more windows on the same resident inside one pass each hand over
+        // their own pin, and each is released once.
+        assert!(pools.pin_resident_target(&identity, true));
+        pools.note_guest_write_recorded(&identity);
+        assert_eq!(pools.registry[&identity].pin_count, 2);
+
+        // What the settle does after the wait. Split out from `retire_all` so
+        // this is testable without a device; the release is unconditional there
+        // for the same reason the debt is taken before the wait.
+        assert!(pools.take_guest_write_debt());
+        for held in std::mem::take(&mut pools.unpin_on_settle) {
+            pools.pin_resident_target(&held, false);
+        }
+        assert_eq!(
+            pools.registry[&identity].pin_count, 0,
+            "every handed-over pin is released exactly once"
+        );
+        assert!(
+            pools.unpin_on_settle.is_empty(),
+            "a settled pin must not be released a second time at the next stamp"
+        );
     }
 
     /// A dispose site has already unlinked the handle, so only the entries

@@ -10,6 +10,26 @@ use super::land::{flush_gva_one, flush_linear_one, flush_one};
 use crate::model::DeviceState;
 use crate::runtime::host::{HostMemory, HostOps};
 
+/// Land any writeback this device has already submitted but not yet waited for.
+///
+/// The render rail issues its guest-page copy on the GPU and returns without
+/// blocking, so a window that was flushed a moment ago may still be executing.
+/// Every entry point below is a host reader or writer about to touch guest
+/// mapping bytes, which is precisely where that stops being safe: the reader
+/// would see the pre-flush frame, and a CPU writer would be overwritten by a
+/// copy that lands after it.
+///
+/// **Unconditional, and before any window bookkeeping.** The outstanding copy
+/// belongs to a window that has already been landed and disarmed, so gating this
+/// on "is anything armed" would skip it in exactly the case it exists for. It
+/// costs one relaxed load when there is no debt, which is the common case — a
+/// driven boot's flushes are all fence-pass flushes and reach none of these
+/// entry points at all.
+fn settle_guest_writes() {
+    #[cfg(feature = "backend-vulkan")]
+    crate::backend::vulkan::engine::quiesce_guest_writes();
+}
+
 /// Flush every deferred window intersecting `[lo, hi)` on `mapping_id` into
 /// guest pages. Returns `false` when any window could not be flushed (the
 /// failure is fail-logged; the guest window keeps its stale-but-coherent
@@ -25,6 +45,7 @@ pub fn flush_intersecting<M: HostMemory + HostOps>(
     lo: u64,
     hi: u64,
 ) -> bool {
+    settle_guest_writes();
     if state.compute_deferred_flush.is_empty() {
         return true;
     }
@@ -141,6 +162,7 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
     gva: u64,
     span: u64,
 ) {
+    settle_guest_writes();
     if span == 0
         || (state.deferred_alias_pages.is_empty()
             && state.linear_deferred_flush.is_empty()
@@ -290,6 +312,7 @@ pub fn flush_mapping_for_guest_read<M: HostMemory + HostOps>(
     host: &mut M,
     mapping_id: u32,
 ) -> (bool, u32) {
+    settle_guest_writes();
     crate::runtime::drain::note_store_route("guest_read_declared");
     // Does the declaration name a surface the eager rail actually writes back?
     // `guest_read_dry` cannot say — the fence always empties the windows first,
@@ -368,6 +391,7 @@ pub fn flush_gva_exact<M: HostMemory + HostOps>(
     guest_write: bool,
     trigger: &str,
 ) -> bool {
+    settle_guest_writes();
     let Some(entry) = state.take_gva_deferred_window(gva) else {
         return true;
     };

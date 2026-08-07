@@ -1129,6 +1129,12 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     // corruption continued. See `storage_flush::flush_all_windows_before_fence`,
     // which the root completion stamp in `drain_main_fifo` shares.
     crate::runtime::storage_flush::flush_all_windows_before_fence(state, host);
+    // The flush above submits its copies without waiting for them, so "owed" is
+    // not yet "landed" until this returns. One settle for every window the pass
+    // issued, taken after all of them are on the queue, rather than one blocking
+    // fence per window taken between them.
+    #[cfg(feature = "backend-vulkan")]
+    crate::backend::vulkan::engine::quiesce_guest_writes();
     // And the other half of that sentence: everything this device is still
     // *reading* out of guest RAM has to be done reading. A draw that binds guest
     // pages through the imported RAMBlock reads them when its command buffer
@@ -1818,6 +1824,12 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                         // every deferred rail owes guest RAM its bytes here, not
                         // only at `write_stamp`'s child slots.
                         crate::runtime::storage_flush::flush_all_windows_before_fence(state, host);
+                        // And landed, not merely issued — the flush above
+                        // submits without waiting. This is the second site that
+                        // moves a completion word, so it settles the writebacks
+                        // for the same reason `write_stamp` does.
+                        #[cfg(feature = "backend-vulkan")]
+                        crate::backend::vulkan::engine::quiesce_guest_writes();
                         let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;
                         if gpa_map::write_u32(
                             host,

@@ -231,6 +231,17 @@ pub enum ReadbackPhase {
     Submit,
     /// Block on the readback fence: pure GPU round-trip latency, and the part
     /// no smaller copy can reduce.
+    ///
+    /// **Its count is no longer one per copy.** The GPU-direct writeback rail
+    /// submits without waiting and settles every copy at once
+    /// (`engine::quiesce_guest_writes`), so on that rail `fence` counts settles
+    /// while `submit` counts windows, and `fence_us / fence` is the mean cost of
+    /// a *pass* rather than of a frame. Dividing it by `submit` is reading the
+    /// shape this rail had when each window blocked on its own fence: 369 of
+    /// them a second at 1 360 us, against 636 us of `gpu_us` — the difference
+    /// being submit-to-start plus signal-to-wake, paid once per window and
+    /// 267 ms of every second. The copying rail below still reports one `Fence`
+    /// per readback, so a window in which both ran mixes the two counts.
     Fence,
     /// Make the staging buffer readable. On the leased arm that is the
     /// invalidate alone, because the mapping already exists for the slot's

@@ -562,6 +562,71 @@ pub fn flush_batched_draws() {
 /// host that cannot import guest RAM never pays for it. See
 /// [`pools::ResourcePools::quiesce_guest_reads`] for why the wait retires the
 /// whole ring rather than the fences carrying the reads.
+/// Whether any guest-page writeback is submitted and not yet settled, readable
+/// without the engine lock.
+///
+/// [`quiesce_guest_writes`] is called from every host read or write of guest
+/// mapping bytes, which is a far hotter set of sites than the completion stamp
+/// its read-side twin serves. Taking the engine lock at each of them to discover
+/// there was nothing to settle would be the cost this change is removing, so the
+/// common answer is one relaxed-acquire load and no lock at all.
+///
+/// Set under the engine lock with `Release` after the copy is parked and before
+/// it is submitted; cleared under the same lock once the ring has retired. A
+/// thread that reads `false` therefore observed a point at which no writeback
+/// was outstanding.
+static GUEST_WRITE_DEBT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Wait until every guest-page writeback this device has recorded has landed in
+/// guest RAM.
+///
+/// The write-side twin of [`quiesce_guest_reads`], and the settle point for the
+/// fence `copy_target_to_guest_pages` no longer takes itself. Call it wherever a
+/// reader that is not this device's own command stream is about to observe those
+/// bytes: the completion stamp, and the flush-on-access choke points in
+/// `runtime::storage_flush::access` and
+/// `runtime::mapping_write::flush_windows_under_bgra8_write`.
+pub fn quiesce_guest_writes() {
+    use std::sync::atomic::Ordering;
+    if !GUEST_WRITE_DEBT.load(Ordering::Acquire) {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let Some(ctx) = owner.ctx.as_ref() else {
+        // No device, so nothing can be in flight and nothing can settle it.
+        GUEST_WRITE_DEBT.store(false, Ordering::Release);
+        return;
+    };
+    if let Err(e) = unsafe { pools.quiesce_guest_writes(ctx, counters) } {
+        // The wait failed, so this device cannot say the frame reached the
+        // guest's pages. Nothing here can hold the caller back — a stamp that
+        // never moves hangs the guest — so report it and let the lost device
+        // surface on the next draw.
+        crate::observe::Emit::decline("vk_guest_write_quiesce", &e).fail_once(0);
+    }
+    // Cleared whether the wait succeeded or failed, for the reason
+    // `ResourcePools::quiesce_guest_writes` takes its own debt before waiting:
+    // the slot stays pending either way and the next claimant re-waits, so the
+    // ordering survives without every later settle re-running a failing wait.
+    GUEST_WRITE_DEBT.store(false, Ordering::Release);
+    // Reported as `ReadbackPhase::Fence` because it *is* that phase — the same
+    // block on the same fences, moved. Its count is now settles rather than
+    // windows, which is the whole of what this change did to the rail, so
+    // `fence` no longer tracks `submit` and a reading that assumes it does is
+    // reading the old shape.
+    crate::runtime::drain::note_readback_phase(
+        crate::runtime::drain::ReadbackPhase::Fence,
+        started.elapsed().as_micros() as u64,
+    );
+}
+
 pub fn quiesce_guest_reads() {
     let mut guard = lock_engine();
     let EngineState {
@@ -1805,9 +1870,25 @@ impl GuestPageTarget {
 /// Binding guest pages as a draw's *source* would have the GPU read them when
 /// the command buffer executes, and this device acks a command before its work
 /// runs — so the guest may repaint the pages first. Nothing here has that shape.
-/// The fence is waited before returning, and the caller runs inside
-/// `flush_all_windows_before_fence`, which is ordered before the completion
-/// stamp: the pages hold the frame before the guest is told anything.
+/// The caller runs inside `flush_all_windows_before_fence`, which is ordered
+/// before the completion stamp, and [`quiesce_guest_writes`] sits between the
+/// two: the pages hold the frame before the guest is told anything.
+///
+/// # This call does not wait, and takes the pin
+///
+/// It returns once the copy is submitted. Two obligations follow from that and
+/// neither is the caller's to discharge by hand:
+///
+/// * The bytes are not in guest RAM yet. Anything about to *read* them —
+///   including the guest, via the stamp — must call [`quiesce_guest_writes`]
+///   first.
+/// * On `Ok`, `identity`'s registry pin is now held by the entry carrying the
+///   copy and released when its fence retires. **The caller must not unpin it**;
+///   unpinning here is what would let the reclaim take an image the GPU has not
+///   finished reading. An `Err` is a routing answer taken before anything was
+///   recorded, so the pin is untouched and the caller still owns it — which is
+///   what lets the copying arms below the decline unpin exactly as they always
+///   did.
 ///
 /// # Errors
 ///
@@ -1896,6 +1977,13 @@ pub fn copy_target_to_guest_pages(
         pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         counters.note_target_read(u64::from(dst.width) * u64::from(dst.height) * 4);
     }
+    // Past the last fallible step, so this runs exactly when the copy is on the
+    // queue — which is what makes "an `Err` leaves the pin with the caller" true
+    // without a second outcome for the caller to branch on.
+    pools.note_guest_write_recorded(identity);
+    // Published after the ledger entry and while the engine lock is still held,
+    // so no thread can observe the flag clear while a copy is outstanding.
+    GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
     Ok(())
 }
 
@@ -2066,7 +2154,11 @@ unsafe fn plan_guest_copies(
     Ok(grouped)
 }
 
-/// Record, submit and wait one image→buffer copy of a resident's level 0.
+/// Record and submit one image→buffer copy of a resident's level 0, without
+/// waiting for it.
+///
+/// An `Ok` means the copy is on the queue; the caller owns everything that
+/// follows from it not having executed yet.
 ///
 /// # Safety
 ///
@@ -2079,7 +2171,10 @@ unsafe fn copy_image_level0_to_buffer(
     snap: &ResidentReadSnapshot,
     plan: &GuestCopyPlan,
 ) -> Result<(), DrawError> {
+    use crate::runtime::drain::{note_readback_phase, ReadbackPhase};
     let submit_started = std::time::Instant::now();
+    // Before anything is recorded, and in particular before the reset below.
+    unsafe { publish_previous_writeback_timestamps(ctx) };
     // Appended to a recording batch where there is one, for the reason
     // `copy_image_level0_to_host_delivered` gives: `begin_entry` would submit
     // that batch only to submit this copy behind it, and the copy has to be
@@ -2229,6 +2324,16 @@ unsafe fn copy_image_level0_to_buffer(
         &[],
         &[],
     );
+    // The wait this rail no longer takes here.
+    //
+    // What the stamp needs is that every copy has landed before the guest is
+    // told anything, and that is not the same statement as "this copy has landed
+    // before this call returns" — which is what the wait that used to sit here
+    // asserted, once per window. The obligation is recorded instead and settled
+    // by `quiesce_guest_writes` at the two places where it stops being this
+    // device's own business: the completion stamp, and a host reader or writer
+    // arriving at the same guest bytes.
+    //
     if appended.is_some() {
         // Ends and submits the batch with the fence `batch_open_recording`
         // returned, and seals the batch's cleanup — one submission carrying the
@@ -2246,50 +2351,63 @@ unsafe fn copy_image_level0_to_buffer(
         let cleanup = pools.seal_entry(Vec::new(), Vec::new());
         pools.finish_entry_async(cleanup);
     }
-    use crate::runtime::drain::{note_readback_phase, ReadbackPhase};
     note_readback_phase(
         ReadbackPhase::Submit,
         submit_started.elapsed().as_micros() as u64,
     );
-    // The wait this rail cannot skip. The caller runs before the completion
-    // stamp, and the guest reads these pages with no device operation at all, so
-    // "the copy is queued" is not a state the stamp may be written in.
-    let fence_started = std::time::Instant::now();
-    pools.wait_entry_fence(ctx, counters, fence)?;
-    note_readback_phase(
-        ReadbackPhase::Fence,
-        fence_started.elapsed().as_micros() as u64,
-    );
-    // Read against the fence that just signalled, so both queries are available
-    // and this cannot block. What is left of `fence_us` after `gpu_us` is the
-    // round trip: submit-to-signal on a queue this thread is the only user of.
-    if let Some(probe) = ctx.timestamps.as_ref() {
-        let mut ticks = [0u64; context::TimestampProbe::SLOTS as usize];
-        match ctx.device.get_query_pool_results(
-            probe.pool,
-            0,
-            &mut ticks,
-            ash::vk::QueryResultFlags::TYPE_64,
-        ) {
-            // In f64, not integer ticks-times-period: `timestampPeriod` is a
-            // float and drivers do report values below 1 ns, which an integer
-            // multiply would truncate to zero and report as "the GPU did nothing".
-            Ok(()) => {
-                let us = |from: usize, to: usize| {
-                    (ticks[to].saturating_sub(ticks[from]) as f64
-                        * probe.ns_per_tick.max(0.0) as f64
-                        / 1_000.0) as u64
-                };
-                crate::runtime::drain::note_readback_gpu_us(us(0, 1), us(1, 2));
-            }
-            Err(e) => crate::observe::Emit::decline(
-                "vk_timestamp_read",
-                &VkCall::new(VkOp::ContextGetQueryPoolResults, e),
-            )
-            .fail_once(0),
-        }
-    }
     Ok(())
+}
+
+/// Publish the timestamps of the previous guest-page writeback, if it has
+/// finished.
+///
+/// Taken here rather than after a fence wait because there is no longer a fence
+/// wait to take it after — but the pair it reads is the only thing that can
+/// separate "the GPU is copying megabytes across PCIe" from "the round trip
+/// costs more than the work", so losing it would blind the rail this change is
+/// aimed at.
+///
+/// Sound to read at this point and nowhere else: the reset that invalidates
+/// these results is *recorded* into the command buffer below and executes on the
+/// GPU strictly after the previous copy wrote them, so on the host, right before
+/// that recording, the pool still holds the previous copy's ticks. Never waits —
+/// `NOT_READY` means the previous copy is still running and that sample is
+/// simply skipped, which is the correct answer for a probe rather than a gate.
+///
+/// # Safety
+///
+/// `ctx`'s query pool must not be recording, which is what makes this a read of
+/// the previous copy's results rather than a race with the current one.
+unsafe fn publish_previous_writeback_timestamps(ctx: &context::DeviceContext) {
+    let Some(probe) = ctx.timestamps.as_ref() else {
+        return;
+    };
+    let mut ticks = [0u64; context::TimestampProbe::SLOTS as usize];
+    match unsafe { ctx.device.get_query_pool_results(
+        probe.pool,
+        0,
+        &mut ticks,
+        ash::vk::QueryResultFlags::TYPE_64,
+    ) } {
+        // In f64, not integer ticks-times-period: `timestampPeriod` is a
+        // float and drivers do report values below 1 ns, which an integer
+        // multiply would truncate to zero and report as "the GPU did nothing".
+        Ok(()) => {
+            let us = |from: usize, to: usize| {
+                (ticks[to].saturating_sub(ticks[from]) as f64 * probe.ns_per_tick.max(0.0) as f64
+                    / 1_000.0) as u64
+            };
+            crate::runtime::drain::note_readback_gpu_us(us(0, 1), us(1, 2));
+        }
+        // The previous copy has not finished, so there is nothing to read and
+        // nothing has gone wrong.
+        Err(ash::vk::Result::NOT_READY) => {}
+        Err(e) => crate::observe::Emit::decline(
+            "vk_timestamp_read",
+            &VkCall::new(VkOp::ContextGetQueryPoolResults, e),
+        )
+        .fail_once(0),
+    }
 }
 
 /// Guest memory the device can currently reach through host-pointer imports,

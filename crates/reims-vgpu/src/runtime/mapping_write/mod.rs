@@ -1042,6 +1042,15 @@ pub fn flush_windows_under_bgra8_write<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> bool {
+    // Ahead of both early returns below, and not only ahead of the
+    // `flush_intersecting` that would settle it anyway. A CPU write is about to
+    // land in these pages, and the writeback rail's own copy is submitted rather
+    // than waited — so a copy still executing would overwrite what this caller
+    // is about to write. That is true whether or not this mapping still has a
+    // geometry to compute a window from, which is exactly what the two early
+    // returns give up on.
+    #[cfg(feature = "backend-vulkan")]
+    crate::backend::vulkan::engine::quiesce_guest_writes();
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
     };

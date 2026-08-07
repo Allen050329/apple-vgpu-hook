@@ -303,6 +303,31 @@ static STALLS: AtomicU64 = AtomicU64::new(0);
 static STALL_LINES: AtomicU64 = AtomicU64::new(0);
 
 /// One window of the split, as taken by the per-second census.
+///
+/// # These phases account for less than a third of `draw_us`
+///
+/// Read against `drain_duty` from the same second and the fields below sum to
+/// far less than the draw time they sit inside. One driven Safari window-drag
+/// second, 1 902 draws: `draw_us=152641` on the `drain_duty` line, against
+/// 45 800 us summed here — `record_us=20475`, `pipeline_us=10251`,
+/// `stage_us=7501`, `prep_us=2157`, `descriptors_us=1892`, `submit_us=1188`,
+/// `acquire_sampled_us=1136`, `sampled_upload_us=596`, `acquire_us=528`, and
+/// `wait_us` and `readback_us` both zero. 24 us of the 80 us a draw costs.
+///
+/// The other 56 us is real and it is not missing from the clock: `draw_us`
+/// brackets the whole of `draw::encode_draw_chain`, and every span here is
+/// inside the engine call at the end of it. What no field names is the work
+/// before that call — binding resolution, the Metal-to-Vulkan translate,
+/// texture and buffer resolution, the guest-memory walks. So the largest
+/// unowned cost in this device, once the writeback rail's per-window fence was
+/// removed, is in `encode_draw_chain` ahead of the engine, and **no phase here
+/// can be ranked against it**.
+///
+/// Which is the point of writing it down rather than acting on it. Naming a
+/// suspect inside those 56 us would be a guess, and the ranking above is exactly
+/// the shape that makes a guess look informed — `record_us` is the biggest
+/// number on the line and it is 13 % of a draw. Add a span to the pre-engine
+/// work before optimising any of it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DrawPhaseWindow {
     pub prep_us: u64,

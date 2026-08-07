@@ -867,9 +867,17 @@ fn flush_render_one<M: HostMemory + HostOps>(
             //
             // Ordered against the guest here in the one way that matters: this
             // runs inside `flush_all_windows_before_fence`, which is ordered
-            // before `write_stamp`, and the engine waits its own fence before
-            // returning. The pages hold the frame before the guest is told
-            // anything about the submission that produced it.
+            // before `write_stamp`, and `write_stamp` settles every submitted
+            // writeback before it moves the guest's fence. The pages hold the
+            // frame before the guest is told anything about the submission that
+            // produced it.
+            //
+            // The wait is not taken here, per window, and that is the point.
+            // Doing it inline made this rail one blocking GPU round trip per
+            // landed window — 369 a second, 1 360 us each, of which the device's
+            // own timestamps priced 636 us as the copy and the rest as
+            // submit-to-start plus signal-to-wake. Submitting them all and
+            // settling once lets the queue run them back to back.
             match crate::runtime::mapping_write::write_bgra8_from_resident_gpu(
                 state,
                 host,
@@ -879,7 +887,11 @@ fn flush_render_one<M: HostMemory + HostOps>(
                 key.height,
             ) {
                 Ok(bytes) => {
-                    crate::backend::vulkan::engine::unpin_resident_target(&identity);
+                    // No unpin here, and that is this rail's contract rather
+                    // than an omission: the copy is submitted and not yet
+                    // executed, so the engine has taken the pin and releases it
+                    // when the writeback settles. See
+                    // `engine::copy_target_to_guest_pages`.
                     crate::runtime::drain::note_store_route("render_flush_gpu_direct");
                     return finish_render_flush(
                         state,
