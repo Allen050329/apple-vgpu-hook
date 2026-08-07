@@ -40,6 +40,20 @@ pub const GUEST_IMPORT: &str = "REIMS_VGPU_GUEST_IMPORT";
 /// Verbose per-draw logging on top of the always-on fail sink.
 pub const DRAW_LOG: &str = "REIMS_VGPU_DRAW_LOG";
 
+/// Setting this off makes a completion stamp that follows a guest-page writeback
+/// block the drain worker on that writeback and then write the stamp word
+/// itself, instead of recording the word into the same GPU queue behind the
+/// copy and letting the completion thread raise the interrupt.
+///
+/// A narrowing, like every switch here: the GPU-ordered stamp needs a
+/// host-pointer import to reach the stamp page and `timelineSemaphore` to be
+/// waited off-thread, so `off` selects the rail a host lacking either takes
+/// regardless. It exists because the two rails answer "when may the guest
+/// observe this stamp" with different mechanisms — a CPU wait versus a pipeline
+/// barrier plus a thread — and a hang or a torn frame has to be attributable to
+/// one of them without rebuilding.
+pub const GPU_STAMP: &str = "REIMS_VGPU_GPU_STAMP";
+
 /// What one variable says, including the two ways it says nothing usable.
 ///
 /// Four states rather than a `bool` because "unset", "explicitly on" and
@@ -194,7 +208,7 @@ mod tests {
     /// by grepping their own environment.
     #[test]
     fn every_name_carries_the_crate_prefix() {
-        for name in [DRAW_LOG, GUEST_IMPORT] {
+        for name in [DRAW_LOG, GUEST_IMPORT, GPU_STAMP] {
             assert!(name.starts_with("REIMS_VGPU_"), "{name}");
             assert!(
                 name.bytes()

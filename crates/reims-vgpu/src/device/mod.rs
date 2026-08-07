@@ -271,7 +271,46 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             early_last_ns: AtomicU64::new(0),
         }),
     );
+    // The completion thread's way back to the guest. Installed here rather than
+    // built into the engine because the engine must not know what a
+    // `BoundDevice` is, and looked up by id rather than captured by `Arc` so a
+    // stale hook cannot keep a torn-down device alive.
+    #[cfg(feature = "backend-vulkan")]
+    crate::backend::vulkan::engine::stamp_completion::install_announce(std::sync::Arc::new(
+        move |index: u32| announce_stamp_interrupt(id, index),
+    ));
     Some(id)
+}
+
+/// Raise the gfx interrupt for a stamp whose word the GPU has written.
+///
+/// Runs on the engine's completion thread, so it may touch nothing that needs
+/// the device `inner` lock — the drain worker holds it for most of a busy
+/// second and blocking here would put the guest's wakeup behind exactly the work
+/// it is waiting to be told about.
+///
+/// It does not have to. This is the same three-step the display VBL already
+/// takes from a contended poll ([`vbl_contended_pulse`]): OR the bit into the
+/// lock-free `Arc<AtomicU32>` clone of the interrupt-status register that the
+/// guest ISR reads at 0x1018, push the pulse onto `prompt_actions` — which
+/// `device_pop_action` drains without the device lock — and let `enqueue`'s
+/// prompt rail call the thread-safe `notify_actions`. The stamp *word* is
+/// already in guest memory by construction: the submission that signalled this
+/// thread's timeline value wrote it.
+#[cfg(feature = "backend-vulkan")]
+fn announce_stamp_interrupt(id: u64, index: u32) {
+    let Some(slot) = device_slot(id) else {
+        // The device is gone, so there is no interrupt-status register to set
+        // and nobody to interrupt. Quiet: this is teardown, not a loss.
+        return;
+    };
+    slot.intr_gpu
+        .fetch_or(1u32 << (index & 0x1f), Ordering::AcqRel);
+    let Some(ops) = slot.ops else {
+        return;
+    };
+    let mut scratch = VecDeque::new();
+    QemuHost::new(&ops, &mut scratch, &slot.prompt_actions).enqueue(HostAction::irq_gfx());
 }
 
 pub fn device_reset(id: u64) -> bool {

@@ -1543,7 +1543,7 @@ fn emit_engine_delta() {
     crate::observe::off(format!(
         "engine_delta creates={} allocs={} batch_opens={} batch_joins={} batch_flushes={} \
          batch_flush_draws={} batch_readback_joins={} readbacks={} readback_bytes={} render_post_wait_skips={} \
-         target_reads={} target_read_bytes={} pipeline_misses={} \
+         target_reads={} target_read_bytes={} gpu_stamps={} pipeline_misses={} \
          shader_misses={} pass_misses={} layout_misses={} sampler_misses={} \
          sampled_cache_hits={} sampled_identity_hits={} sampled_cache_hit_bytes={} \
          sampled_cache_misses={} sampled_reuploads={} \
@@ -1572,6 +1572,7 @@ fn emit_engine_delta() {
         d.render_post_wait_skips,
         d.target_reads,
         d.target_read_bytes,
+        d.gpu_stamps,
         d.pipeline_misses,
         d.shader_misses,
         d.pass_misses,

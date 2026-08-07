@@ -26,6 +26,7 @@ mod facade_decline;
 mod host_ram;
 pub mod init_decline;
 mod pools;
+pub(crate) mod stamp_completion;
 /// The ceiling `registry_non_pinned_peak` is read against. Re-exported because
 /// `pools` is private and the census that reports the band lives outside this
 /// module: a peak with no cap beside it is a number, not a reading.
@@ -625,6 +626,187 @@ pub fn quiesce_guest_writes() {
         crate::runtime::drain::ReadbackPhase::Fence,
         started.elapsed().as_micros() as u64,
     );
+}
+
+/// Whether any guest-page writeback is submitted and not yet settled.
+///
+/// The same flag [`quiesce_guest_writes`] short-circuits on, exposed so a caller
+/// can ask whether there is anything to order behind *before* deciding how to
+/// order it. Reading it is one relaxed-acquire load.
+pub fn guest_writes_outstanding() -> bool {
+    GUEST_WRITE_DEBT.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Record the completion stamp's word into the GPU queue behind the writebacks
+/// this device still owes, and return without waiting for any of it.
+///
+/// # The ordering this buys, and the one it does not
+///
+/// The rule is unchanged: the guest may not observe the stamp until the frame is
+/// in its pages. [`quiesce_guest_writes`] enforces it by having this thread block
+/// until the copies have executed and then storing the word itself — one CPU
+/// round trip per stamp, measured at 1 368 us with only 628 us of it the copy.
+/// This records the word as a transfer into the same imported RAMBlock the
+/// copies write, behind a barrier that names every command submitted before it.
+///
+/// The barrier is the whole argument. A pipeline barrier applies to all commands
+/// submitted earlier in submission order on the same queue, not merely to the
+/// rest of its own command buffer — the property `copy_image_level0_to_buffer`'s
+/// image barrier already relies on to order a copy after draws recorded in an
+/// earlier submission. So `ALL_COMMANDS -> TRANSFER` here waits out every
+/// outstanding writeback *and* every outstanding guest read, which is what makes
+/// this rail subsume [`quiesce_guest_reads`] as well.
+///
+/// **It does not order the interrupt**, and that is not an oversight. The guest
+/// reads the stamp word directly and sleeps on it with a one-second deadline, so
+/// the interrupt is its wakeup rather than a hint. The submission signals a
+/// timeline value and `stamp_completion`'s thread raises the interrupt the
+/// moment it lands — see that module for what happens when this is deferred
+/// instead.
+///
+/// # Errors
+///
+/// Every error is a routing answer: the caller still owes the stamp and settles
+/// it the blocking way. Nothing is recorded and no timeline value is left
+/// outstanding — a reservation whose submit fails is signalled from the host so
+/// the completion thread does not block behind it.
+pub fn write_stamp_after_guest_writes(
+    guest_ref: &crate::runtime::guest_ram::GuestRef,
+    index: u32,
+    value: u32,
+) -> Result<(), DrawError> {
+    use host_ram::GuestWriteDecline;
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let ctx = owner.ensure(counters)?;
+    if !ctx.caps.host_pointer.is_available() {
+        return Err(DrawError::GuestPageWrite(GuestWriteDecline::Unsupported {
+            rung: ctx.caps.host_pointer.rung,
+        }));
+    }
+    let Some(completion) = ctx.stamp_completion.as_ref() else {
+        return Err(DrawError::GuestPageWrite(GuestWriteDecline::Unsupported {
+            rung: ctx.caps.host_pointer.rung,
+        }));
+    };
+    unsafe { pools.ensure_init(ctx, counters)? };
+    let bound = unsafe { pools.bind_guest_ram(ctx, guest_ref) }
+        .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
+    // Claimed before the reservation, because `begin_entry` can flush an open
+    // batch and a reservation held across that would be ordered behind work it
+    // does not describe.
+    let appended = pools.batch_open_recording();
+    let (cb, fence) = match appended {
+        Some(pair) => pair,
+        None => unsafe { pools.begin_entry(ctx, counters)? },
+    };
+    let record = || -> Result<(), DrawError> {
+        unsafe {
+            if appended.is_none() {
+                ctx.device
+                    .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
+                    .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteResetCb, e)))?;
+                ctx.device
+                    .begin_command_buffer(
+                        cb,
+                        &ash::vk::CommandBufferBeginInfo::default()
+                            .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )
+                    .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteBeginCb, e)))?;
+            }
+            // `ALL_COMMANDS` on the source side is not caution: what this must
+            // follow is the writeback copies (TRANSFER) *and* any draw still
+            // sourcing guest pages, and only the widest source stage covers both
+            // without this site having to know which are outstanding.
+            let owed = [ash::vk::MemoryBarrier::default()
+                .src_access_mask(
+                    ash::vk::AccessFlags::MEMORY_WRITE | ash::vk::AccessFlags::MEMORY_READ,
+                )
+                .dst_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                ash::vk::PipelineStageFlags::ALL_COMMANDS,
+                ash::vk::PipelineStageFlags::TRANSFER,
+                ash::vk::DependencyFlags::empty(),
+                &owed,
+                &[],
+                &[],
+            );
+            // Little-endian because `gpa_map::write_u32` is, and the guest reads
+            // one word either way this device writes it. `head` is the
+            // granularity rounding in front of the byte asked for, re-based
+            // exactly as the copy planners re-base.
+            ctx.device.cmd_update_buffer(
+                cb,
+                bound.buffer,
+                bound.offset + bound.head,
+                &value.to_le_bytes(),
+            );
+            // Released to the host so the vCPU's read of this word sees it.
+            // Guest RAM is ordinary system memory this process already has
+            // mapped and a PCIe write to it is snooped, so nothing is owed
+            // beyond the release.
+            let visible = [ash::vk::MemoryBarrier::default()
+                .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(ash::vk::AccessFlags::HOST_READ)];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                ash::vk::PipelineStageFlags::TRANSFER,
+                ash::vk::PipelineStageFlags::HOST,
+                ash::vk::DependencyFlags::empty(),
+                &visible,
+                &[],
+                &[],
+            );
+            Ok(())
+        }
+    };
+    record()?;
+    // Reserved after everything fallible that precedes the submit, so the only
+    // way to hold a value is to be about to submit it.
+    let (semaphore, timeline) = completion.reserve(index);
+    let submitted = unsafe {
+        if appended.is_some() {
+            pools.batch_flush_signalling(ctx, counters, semaphore, timeline)
+        } else {
+            ctx.device
+                .end_command_buffer(cb)
+                .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteEndCb, e)))
+                .and_then(|()| {
+                    let cbs = [cb];
+                    let sems = [semaphore];
+                    let vals = [timeline];
+                    let mut timeline_info = ash::vk::TimelineSemaphoreSubmitInfo::default()
+                        .signal_semaphore_values(&vals);
+                    let si = ash::vk::SubmitInfo::default()
+                        .command_buffers(&cbs)
+                        .signal_semaphores(&sems)
+                        .push_next(&mut timeline_info);
+                    ctx.device
+                        .queue_submit(ctx.queue(), &[si], fence)
+                        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteSubmit, e)))
+                })
+                .map(|()| {
+                    let cleanup = pools.seal_entry(Vec::new(), Vec::new());
+                    pools.finish_entry_async(cleanup);
+                })
+        }
+    };
+    if let Err(e) = submitted {
+        // The value will never be signalled by the queue, and the completion
+        // thread is already waiting on it. Stand in for the submission so it
+        // does not block behind a value that is not coming — and with it, every
+        // later stamp.
+        unsafe { completion.abandon(&ctx.device, timeline) };
+        return Err(e);
+    }
+    counters.gpu_stamps.fetch_add(1, Ordering::Relaxed);
+    Ok(())
 }
 
 pub fn quiesce_guest_reads() {

@@ -333,6 +333,15 @@ pub(crate) struct DeviceContext {
     /// caller cannot tell GPU work from the latency of asking. See
     /// [`TimestampProbe`].
     pub timestamps: Option<TimestampProbe>,
+    /// The thread that announces a GPU-written completion stamp, and the
+    /// timeline semaphore its submissions signal.
+    ///
+    /// `None` when the device does not advertise `timelineSemaphore` or the
+    /// thread would not start — the stamp rail then falls back to blocking the
+    /// drain worker, which is what every host did before this existed. See
+    /// [`super::stamp_completion`] for why the interrupt cannot be deferred to
+    /// anything that runs on a schedule.
+    pub stamp_completion: Option<super::stamp_completion::StampCompletion>,
     /// On-disk VkPipelineCache blob for this device (keyed by
     /// pipelineCacheUUID), or None when persistence is unavailable.
     pub pipeline_cache_path: Option<std::path::PathBuf>,
@@ -669,6 +678,23 @@ impl DeviceContext {
                     .ok()
             })
             .flatten();
+        // Gated on the feature actually being enabled, not on the API version.
+        // `timelineSemaphore` is core in 1.2 and this backend's baseline is 1.2,
+        // so a device that declines it is out of spec — which is exactly why the
+        // answer is read from `features` rather than assumed: an assumption here
+        // is a `vkWaitSemaphores` into a driver that never implemented it.
+        let stamp_completion = features.timeline_semaphore
+            .then(|| super::stamp_completion::StampCompletion::start(&device))
+            .transpose()
+            .map_err(|e| {
+                crate::observe::Emit::decline(
+                    "vk_stamp_completion",
+                    &VkCall::new(VkOp::ContextCreateSemaphore, e),
+                )
+                .fail_once(0);
+            })
+            .ok()
+            .flatten();
         let memory_properties = instance.get_physical_device_memory_properties(pd);
         let caps = HostGpuCaps {
             memory: classify_memory(&memory_properties),
@@ -774,6 +800,7 @@ impl DeviceContext {
             features,
             depth_stencil_format,
             timestamps,
+            stamp_completion,
             pipeline_cache_path: Some(pipeline_cache_path),
             pipeline_cache_saved_len: AtomicUsize::new(initial_len),
             #[cfg(feature = "host-window")]
@@ -849,6 +876,12 @@ impl DeviceContext {
     }
 
     pub(crate) unsafe fn destroy(&mut self) {
+        // First, and before anything else this function touches: the completion
+        // thread holds a clone of `self.device` and is blocked inside it. Every
+        // line below is a use-after-free if it is still running.
+        if let Some(mut completion) = self.stamp_completion.take() {
+            unsafe { completion.stop(&self.device) };
+        }
         if let Some(probe) = self.timestamps.take() {
             self.device.destroy_query_pool(probe.pool, None);
         }

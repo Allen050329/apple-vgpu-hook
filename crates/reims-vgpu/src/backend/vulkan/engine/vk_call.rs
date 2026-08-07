@@ -108,6 +108,9 @@ pub enum VkOp {
     ContextPipelineCacheGetData,
     /// `vkCreateQueryPool` for the readback's two-slot timestamp probe.
     ContextCreateQueryPool,
+    /// The timeline semaphore a GPU-written completion stamp signals, so the
+    /// completion thread can wait it without owning a ring fence.
+    ContextCreateSemaphore,
     /// `vkGetQueryPoolResults` reading that probe after its fence signalled.
     ContextGetQueryPoolResults,
 
@@ -384,6 +387,7 @@ impl Decline for VkCall {
 
             VkOp::ContextPipelineCacheGetData => "vk_context_pipeline_cache_get_data",
             VkOp::ContextCreateQueryPool => "vk_context_create_query_pool",
+            VkOp::ContextCreateSemaphore => "vk_context_create_semaphore",
             VkOp::ContextGetQueryPoolResults => "vk_context_get_query_pool_results",
 
             VkOp::DescArenaCreatePool => "vk_desc_arena_create_pool",
@@ -558,6 +562,7 @@ mod tests {
         VkOp::CachesCreateComputePipelines,
         VkOp::ContextPipelineCacheGetData,
         VkOp::ContextCreateQueryPool,
+        VkOp::ContextCreateSemaphore,
         VkOp::ContextGetQueryPoolResults,
         VkOp::DescArenaCreatePool,
         VkOp::DescArenaAllocSets,

@@ -145,6 +145,21 @@ pub struct DeviceFeatures {
     pub float16: bool,
     pub int8: bool,
     pub shader_output_viewport_index: bool,
+    /// `VkPhysicalDeviceVulkan12Features::timelineSemaphore` — whether a
+    /// submission can signal a monotonic counter that a *second* thread may
+    /// wait on.
+    ///
+    /// This is what lets a completion be observed without owning the thing that
+    /// produced it. A `VkFence` has one waiter's worth of lifetime and the ring
+    /// already owns every fence it has — resetting them at retire — so a second
+    /// thread waiting on a ring fence races the reset. A timeline value is
+    /// monotonic, waitable from anywhere, and needs nothing back.
+    ///
+    /// Core in Vulkan 1.2, which is this backend's baseline, so a device that
+    /// declines it is out of spec rather than merely old. Asked anyway, and
+    /// gated on: the rail that uses it falls back to blocking the drain worker,
+    /// which is what every host did before it existed.
+    pub timeline_semaphore: bool,
     pub mirror_clamp_to_edge: MirrorClampToEdge,
     /// `VkPhysicalDeviceFeatures::dualSrcBlend` — whether a pipeline may name
     /// the `SRC1_*` blend factors, which read the fragment shader's second
@@ -243,6 +258,7 @@ impl DeviceFeatures {
     pub fn enabled_vulkan12(&self) -> vk::PhysicalDeviceVulkan12Features<'static> {
         vk::PhysicalDeviceVulkan12Features::default()
             .shader_output_viewport_index(self.shader_output_viewport_index)
+            .timeline_semaphore(self.timeline_semaphore)
             .sampler_mirror_clamp_to_edge(self.mirror_clamp_to_edge == MirrorClampToEdge::Core12)
     }
 
@@ -399,6 +415,7 @@ pub unsafe fn query(
         float16: supported_f16i8.shader_float16 == vk::TRUE,
         int8: supported_f16i8.shader_int8 == vk::TRUE,
         shader_output_viewport_index: supported_vulkan12.shader_output_viewport_index == vk::TRUE,
+        timeline_semaphore: supported_vulkan12.timeline_semaphore == vk::TRUE,
         mirror_clamp_to_edge,
     }
 }
@@ -430,6 +447,7 @@ mod tests {
             float16: true,
             int8: true,
             shader_output_viewport_index: true,
+            timeline_semaphore: true,
             mirror_clamp_to_edge: MirrorClampToEdge::Core12,
             dual_src_blend: true,
             fill_mode_non_solid: true,

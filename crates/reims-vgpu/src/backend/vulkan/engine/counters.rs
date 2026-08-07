@@ -206,6 +206,16 @@ engine_counters! {
         /// separates "the readback moved" from "the readback went away".
         target_reads,
         target_read_bytes,
+        /// Completion stamps whose word was recorded into the GPU queue behind
+        /// the writebacks they follow, rather than stored by this thread after
+        /// blocking on them.
+        ///
+        /// Read against `readback_split`'s `fence`: together they say which rail
+        /// each stamp took. Zero while windows are flushing means every stamp
+        /// fell back to the blocking rail — no host-pointer import, no
+        /// `timelineSemaphore`, or a stamp page that would not resolve — and the
+        /// reason is on the fail channel.
+        gpu_stamps,
         seed_uploads,
         seed_upload_bytes,
         /// Present-boundary seeds satisfied by a GPU resident→target image copy

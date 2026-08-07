@@ -1110,6 +1110,55 @@ fn note_stamp_direction<H: HostMemory + HostOps>(host: &H, gpa: u64, index: u32,
     }
 }
 
+/// Record this stamp's word into the GPU queue behind the writebacks it
+/// follows, so the drain worker never blocks on them.
+///
+/// `false` means the caller still owes the stamp and must settle it the blocking
+/// way. Four things answer `false`, and only the last is a fault: the operator
+/// narrowed the rail with `REIMS_VGPU_GPU_STAMP=off`; nothing was owed, so there
+/// is nothing to order behind and the plain store is both correct and cheaper;
+/// the stamp page would not resolve to imported guest RAM; or the engine
+/// declined, which it reports itself.
+///
+/// The word is four bytes inside one page, so the contiguity rule
+/// `reference_for_pages` enforces is satisfied by construction — but it is asked
+/// rather than assumed, because a stamp page outside an imported RAMBlock is
+/// exactly the case that must fall back rather than be written blind.
+#[cfg(feature = "backend-vulkan")]
+fn stamp_word_ordered_on_gpu<H: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &mut H,
+    index: u32,
+    value: u32,
+) -> bool {
+    if crate::env::switch(crate::env::GPU_STAMP) == crate::env::Switch::Off {
+        return false;
+    }
+    // Nothing owed means nothing to order behind. Taking the GPU rail here would
+    // add a submission and a thread hop to buy an ordering that already holds,
+    // and most stamps in a boot are this case.
+    if !crate::backend::vulkan::engine::guest_writes_outstanding() {
+        return false;
+    }
+    let page_size = state.page_size();
+    let Some(off) = stamp_slot_offset(index, page_size) else {
+        return false;
+    };
+    let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;
+    let page = gpa & !(page_size - 1);
+    let in_page = gpa - page;
+    let Ok(guest_ref) =
+        crate::runtime::guest_ram_map::reference_for_pages(host, &[page], page_size, in_page, 4)
+    else {
+        return false;
+    };
+    // The direction check the CPU rail gets from `note_stamp_direction`. Taken
+    // before the submit, because after it the word is the GPU's and reading it
+    // back says nothing about what this device promised.
+    note_stamp_direction(host, gpa, index, value);
+    crate::backend::vulkan::engine::write_stamp_after_guest_writes(&guest_ref, index, value).is_ok()
+}
+
 /// Write stamp value to FIFO base page slot and set status bit.
 pub fn write_stamp<H: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -1129,6 +1178,24 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     // corruption continued. See `storage_flush::flush_all_windows_before_fence`,
     // which the root completion stamp in `drain_main_fifo` shares.
     crate::runtime::storage_flush::flush_all_windows_before_fence(state, host);
+    // The stamp word ordered behind the copies by the GPU rather than by this
+    // thread blocking. Tried before either quiesce because when it takes,
+    // neither is owed: its leading barrier names every command submitted before
+    // it, which covers the writebacks and the guest reads alike.
+    //
+    // Nothing about the *interrupt* is deferred by this — the completion thread
+    // raises it the moment the submission lands. See
+    // `backend::vulkan::engine::stamp_completion` for the measurement that says
+    // it cannot be deferred to anything slower.
+    #[cfg(feature = "backend-vulkan")]
+    if stamp_word_ordered_on_gpu(state, host, index, stamp_value) {
+        // Advanced at submit, not at completion. From here the guest may see the
+        // word at any moment, so a window still armed has already outlived this
+        // fence — which is what `armed_stamp_seq` is compared against, and
+        // dating it from the completion would call that window punctual.
+        state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(1);
+        return;
+    }
     // The flush above submits its copies without waiting for them, so "owed" is
     // not yet "landed" until this returns. One settle for every window the pass
     // issued, taken after all of them are on the queue, rather than one blocking
@@ -1824,10 +1891,25 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                         // every deferred rail owes guest RAM its bytes here, not
                         // only at `write_stamp`'s child slots.
                         crate::runtime::storage_flush::flush_all_windows_before_fence(state, host);
-                        // And landed, not merely issued — the flush above
-                        // submits without waiting. This is the second site that
-                        // moves a completion word, so it settles the writebacks
-                        // for the same reason `write_stamp` does.
+                        // Root slot 0 stays on the blocking rail, and the
+                        // measurement is the reason rather than caution. Routing
+                        // it through the GPU rail as well was booted and scored
+                        // worse on the thing the guest sees: presents/s 63 -> 53
+                        // against an otherwise identical tree, with draws/s
+                        // 3320 -> 3141. The child slots keep the fast rail
+                        // because there it pays; this is a submission and a
+                        // thread hop for a stamp the guest is already waiting on.
+                        //
+                        // The first attempt at it was also outright broken, and
+                        // that shape is worth keeping: `completed` raises slot
+                        // 0's interrupt *after* this loop, so a GPU-ordered root
+                        // stamp that still set it announced the completion before
+                        // the word moved. The guest treats an interrupt as its
+                        // wakeup, re-read the old value, and slept out its
+                        // one-second deadline — a total stall, draws/s to 0 and
+                        // no presents. Any future attempt here must leave
+                        // `completed` false and let the completion thread
+                        // announce.
                         #[cfg(feature = "backend-vulkan")]
                         crate::backend::vulkan::engine::quiesce_guest_writes();
                         let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;
