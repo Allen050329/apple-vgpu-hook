@@ -1413,11 +1413,27 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
 /// rather than once at import time. A single line at import time could not
 /// distinguish "imported once" from "imported once per window".
 ///
-/// `bytes` is the same level and is not a rate: it is guest RAM the device can
-/// currently reach, so it tracks the count and not the workload.
+/// # Both terms, because the numerator alone is ambiguous
+///
+/// A backend imports a span at its **first reference**, not at device init, so
+/// the imported count is bounded above by the number of spans the shim reported
+/// and starts below it. `ramblocks=1` alone cannot distinguish "this machine has
+/// one RAMBlock and it is imported" from "this machine has two and the workload
+/// has only ever touched one" — and the second is a workload fact, not a defect.
+/// The denominator comes from [`crate::runtime::guest_ram_map::span_census`],
+/// which is the shim's answer, so the pair reads `imported/reported`.
+///
+/// This is not hypothetical on the x86 pathway: `vm/boot-x86.sh` boots `-m 16G`
+/// and q35 splits it around the PCI hole, so the shim reports 2 GiB below 4 GiB
+/// and 14 GiB above it. A driven Safari boot imports only the 14 GiB span, and
+/// the numerator alone would read as 2 GiB of guest RAM having gone missing.
+///
+/// `mib` is the same level and is not a rate: it is guest RAM the device can
+/// currently reach, against what the machine has.
 #[cfg(feature = "backend-vulkan")]
 fn emit_guest_import_levels() {
     let (bytes, count) = crate::backend::vulkan::engine::guest_import_census();
+    let (spans, span_bytes) = crate::runtime::guest_ram_map::span_census();
     // An engine that never imported emits nothing, so a host on a negative
     // `host_pointer` rung — or a boot before the first guest window — costs no
     // line, and a zero here always means the copying rails rather than silence.
@@ -1425,9 +1441,11 @@ fn emit_guest_import_levels() {
         return;
     }
     crate::observe::off(format!(
-        "guest_import_levels (levels, not per-interval) ramblocks={count} \
-         mib={} (flat is healthy; a rising count is a per-resource import)",
+        "guest_import_levels (levels, not per-interval) ramblocks={count}/{spans} \
+         mib={}/{} (imported/reported; a span is imported at first reference, \
+         so below is lazy and above is impossible)",
         bytes / (1024 * 1024),
+        span_bytes / (1024 * 1024),
     ));
 }
 

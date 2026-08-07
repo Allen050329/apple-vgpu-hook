@@ -203,6 +203,28 @@ pub fn reset() {
     *MAP.lock().unwrap_or_else(|p| p.into_inner()) = None;
 }
 
+/// How many RAMBlock spans the shim reported, and how many bytes they cover.
+///
+/// The denominator for the backend's *imported* count. A backend imports a span
+/// at its first reference and not before, so "one imported" means one of these
+/// has been touched — which on a two-span machine is a workload fact, not a
+/// defect. Reporting the count alone cannot tell those apart, which is why the
+/// census line carries both.
+///
+/// Counts rather than clones: this runs once a census window, and cloning an
+/// `Arc` per span to take a length would be a refcount touch per span per
+/// second for a number that does not change after the first reference.
+///
+/// `(0, 0)` before the first reference of a boot and on a host that cannot
+/// import, which is the same reading the census suppresses.
+pub fn span_census() -> (usize, u64) {
+    MAP.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .map(|r| (r.imports.len(), r.imports.iter().map(|i| i.len()).sum()))
+        .unwrap_or((0, 0))
+}
+
 /// Every import this process holds, for a backend that needs to create or
 /// release its device-side handles.
 ///
@@ -543,6 +565,34 @@ mod tests {
                 "the offset is into the second import, not from the first span's base"
             );
             assert_ne!(low.import().id(), high.import().id());
+        });
+    }
+
+    /// The span census counts every span the shim reported, not the ones a
+    /// workload happened to touch.
+    ///
+    /// This is the denominator of the `guest_import_levels` census line, and it
+    /// is the whole reason that line carries two terms. A backend imports a span
+    /// at its first reference, so on this two-span machine — the shape q35 has
+    /// with a PCI hole, which is what `vm/boot-x86.sh` boots — a workload that
+    /// only ever touches high memory leaves the imported count at one. Reported
+    /// against a denominator of one that would read as half of guest RAM having
+    /// gone missing; against two it reads as lazy, which is what it is.
+    #[test]
+    fn the_span_census_counts_what_the_shim_reported_not_what_was_touched() {
+        with_granularity(Some(0x1000), || {
+            assert_eq!(
+                span_census(),
+                (0, 0),
+                "nothing is asked before the first reference"
+            );
+            let mut host = two_spans();
+            reference(&mut host, 0x1_0000_2000, 0x100).expect("in the second span");
+            assert_eq!(
+                span_census(),
+                (2, 0x1_0000_0000),
+                "both spans are reported though only the second was referenced"
+            );
         });
     }
 
