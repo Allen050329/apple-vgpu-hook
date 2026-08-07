@@ -31,9 +31,14 @@ pub const fn visibility_result_mode_recordable(mtl: u32) -> bool {
 
 /// The ordinal that disarms an occlusion query, `MTLVisibilityResultModeDisabled`.
 ///
-/// Named rather than written as a bare `0` at the two sites that test for it,
-/// because `0` is also the first *recordable* ordinal of four other Metal enums
-/// this crate decodes and the reader cannot tell which one a literal means.
+/// Named rather than written as a bare `0`, because `0` is also the first
+/// *recordable* ordinal of four other Metal enums this crate decodes and the
+/// reader cannot tell which one a literal means.
+///
+/// The Vulkan translator matches on it directly. The Metal encoder does not:
+/// by the point it decides, the ordinal has become an
+/// `MTLVisibilityResultMode` and `Disabled` is that type's own spelling of the
+/// same fact, which is the stronger one to compare against.
 pub const VISIBILITY_RESULT_MODE_DISABLED: u32 = 0;
 
 /// One past the highest ordinal the enum declares, for a sweep that wants to

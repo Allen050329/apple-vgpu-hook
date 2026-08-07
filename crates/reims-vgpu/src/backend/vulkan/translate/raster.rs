@@ -160,8 +160,12 @@ pub fn vk_index_type(index: IndexType) -> vk::IndexType {
 /// disarming is a thing the guest is entitled to ask for, and an unknown
 /// ordinal is not.
 pub fn visibility_result_mode(mtl: u32) -> Result<Option<VisibilityResultMode>, TranslateReason> {
+    use crate::contract::visibility::VISIBILITY_RESULT_MODE_DISABLED;
     Ok(match mtl {
-        0 => None,
+        // The one arm that is a *meaning* rather than a mode, so it is the one
+        // arm spelled from the contract rather than as a literal beside its
+        // neighbours.
+        VISIBILITY_RESULT_MODE_DISABLED => None,
         1 => Some(VisibilityResultMode::Boolean),
         2 => Some(VisibilityResultMode::Counting),
         other => return Err(TranslateReason::UnknownVisibilityResultMode(other)),
