@@ -91,7 +91,10 @@
 //! On a host that can import, `runs_us` is no longer this rail's whole traffic:
 //! it is the windows the gather turned away, and on the boot above there were
 //! none. A `runs_us` that has *not* fallen on a capable host means the gather is
-//! declining, and `zc_buf_gather_wide` and the `zc_buf_runs_*` bands say why.
+//! declining; the `vk_buffer_gather` declines name the check that refused, and
+//! the `zc_buf_runs_*` bands say how wide the windows reaching it are. Width
+//! itself is no longer a decline — the region ceiling that used to make it one
+//! is retired.
 //! On a host without `VK_EXT_external_memory_host` every window is still `runs`
 //! and always will be: the same probe under `REIMS_VGPU_GUEST_IMPORT=off` read
 //! `runs_us=1 403 990` over 288 196 windows with `guest_gather_block=0:0:0`, so

@@ -33,8 +33,11 @@
 //!   this module exists to make possible.
 //! - Armed deferred-writeback windows peaked at 656 → **288**. §5's target is
 //!   zero on a UMA host; this is progress toward it and not arrival.
-//! - `gpu_writeback_too_many_regions` never fired, so
-//!   `MAX_GUEST_COPY_REGIONS` is not binding at 1080p.
+//! - `gpu_writeback_too_many_regions` never fired. That decline and the
+//!   `MAX_GUEST_COPY_REGIONS` behind it are now retired: a region ceiling on
+//!   this rail refused whole frames rather than degrading them, and the count
+//!   it bounded is one `plan_regions` derives from the window's own geometry.
+//!   `guest_write_regions` is what reports the width instead.
 //! - The desktop renders correctly — wallpaper, dock and a Safari window, no
 //!   banding or tearing. One screenshot of a near-static desktop is evidence
 //!   against gross corruption and is *not* a regression gate.

@@ -1899,26 +1899,6 @@ pub fn copy_target_to_guest_pages(
     Ok(())
 }
 
-/// Record, submit and wait one image→buffer copy of a resident's level 0.
-///
-/// # Safety
-///
-/// `buffer` must be bound to memory covering `dst`'s extent, and `snap` must
-/// name a live image belonging to `ctx`.
-/// The largest number of copy rectangles this rail will submit for one frame.
-///
-/// Derived, not chosen. The guest backs a surface in 16 KiB physically
-/// contiguous granules, and a stretch yields at most three rectangles — a
-/// leading part-row, the whole rows between merged into one, and a trailing
-/// part-row. So the ceiling is `3 * extent / 16 KiB`, which for a 4K BGRA frame
-/// (33.2 MB, 2025 stretches) is 6075. 8192 clears that with room and is still
-/// far below anything a driver struggles to consume.
-///
-/// A window past it declines by name rather than being truncated: a partial
-/// region list would land part of the frame and leave the rest holding the
-/// previous one, which is the silent loss this crate's rules exist to stop.
-const MAX_GUEST_COPY_REGIONS: usize = 8192;
-
 /// How one frame gets from a resident image into the guest's stretches.
 ///
 /// Two shapes, chosen by whether the guest's rows carry padding
@@ -1987,18 +1967,6 @@ unsafe fn plan_guest_linear_copies(
     dst: &GuestPageTarget,
 ) -> Result<Vec<(ash::vk::Buffer, Vec<ash::vk::BufferCopy>)>, DrawError> {
     use host_ram::GuestWriteDecline;
-    // One region per run here, against up to three in the rectangle path, so
-    // the same ceiling binds later — but it is still checked, because the
-    // failure it prevents (a truncated list landing part of a frame) is
-    // identical in both.
-    if dst.runs.len() > MAX_GUEST_COPY_REGIONS {
-        return Err(DrawError::GuestPageWrite(
-            GuestWriteDecline::TooManyRegions {
-                limit: MAX_GUEST_COPY_REGIONS,
-                runs: dst.runs.len(),
-            },
-        ));
-    }
     let mut grouped: Vec<(ash::vk::Buffer, Vec<ash::vk::BufferCopy>)> = Vec::new();
     for run in &dst.runs {
         let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest) }
@@ -2063,7 +2031,6 @@ unsafe fn plan_guest_copies(
     use host_ram::GuestWriteDecline;
     let geom = dst.geometry();
     let mut grouped: Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)> = Vec::new();
-    let mut total = 0usize;
     for run in &dst.runs {
         let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest) }
             .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
@@ -2073,15 +2040,6 @@ unsafe fn plan_guest_copies(
         let start = run.window_offset;
         let end = start.saturating_add(run.guest.requested());
         for r in crate::runtime::guest_window_regions::plan_regions(&geom, start, end) {
-            total += 1;
-            if total > MAX_GUEST_COPY_REGIONS {
-                return Err(DrawError::GuestPageWrite(
-                    GuestWriteDecline::TooManyRegions {
-                        limit: MAX_GUEST_COPY_REGIONS,
-                        runs: dst.runs.len(),
-                    },
-                ));
-            }
             let region = ash::vk::BufferImageCopy::default()
                 // The rectangle's own offset is in window bytes; `- start`
                 // re-bases it onto this run, which is what `base` names.
@@ -2108,6 +2066,12 @@ unsafe fn plan_guest_copies(
     Ok(grouped)
 }
 
+/// Record, submit and wait one image→buffer copy of a resident's level 0.
+///
+/// # Safety
+///
+/// `buffer` must be bound to memory covering `dst`'s extent, and `snap` must
+/// name a live image belonging to `ctx`.
 unsafe fn copy_image_level0_to_buffer(
     ctx: &context::DeviceContext,
     pools: &mut pools::ResourcePools,
@@ -2918,8 +2882,9 @@ mod guest_page_target_tests {
     /// like any other region.
     ///
     /// Leaving it out would make a linear boot's `guest_write_regions` read as
-    /// exactly the stretch count, which is the number a reader would then
-    /// compare against `MAX_GUEST_COPY_REGIONS` — one short, every frame.
+    /// exactly the stretch count, so the census would understate what this rail
+    /// submits by one, every frame — and that census is now the only account of
+    /// how wide a writeback gets, since nothing caps it.
     #[test]
     fn the_region_census_counts_every_region_a_plan_submits() {
         let null = ash::vk::Buffer::null();

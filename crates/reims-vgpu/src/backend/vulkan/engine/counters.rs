@@ -376,9 +376,15 @@ engine_counters! {
         /// The disposition between `buffer_guest_imports` (nothing copied) and
         /// the `stage_phase` `runs_*` bars (the CPU copied). Bytes are what the
         /// copies name, which is what the CPU no longer moves; regions divided
-        /// by gathers is the mean stretch count, which is the number that says
-        /// whether `MAX_GUEST_GATHER_REGIONS` still has headroom over the
-        /// workload.
+        /// by gathers is the mean stretch count.
+        ///
+        /// There is no ceiling on the region count and there must not be one.
+        /// A run is a whole number of guest pages, so every region this rail
+        /// adds also removes at least one page from the `memcpy` in the
+        /// `runs_*` bars — the two costs move in opposite directions, and no
+        /// region count exists at which the CPU arm becomes the cheaper one. A
+        /// cap here refuses the widest windows, which are exactly the ones with
+        /// the most to gain. See `zc_buf_runs_*` for the live distribution.
         buffer_guest_gathers,
         buffer_guest_gather_bytes,
         buffer_guest_gather_regions,
@@ -455,10 +461,11 @@ engine_counters! {
         guest_write_rects,
         /// Copy regions submitted by the two above, summed.
         ///
-        /// The number the linear path exists to reduce, and the one to quote
-        /// against `MAX_GUEST_COPY_REGIONS`. Divide by the writeback count for
-        /// regions per frame: a 1080p window is ~507 stretches, so ~507 here
-        /// means every frame took the linear path and ~1500 means none did.
+        /// The number the linear path exists to reduce, and — since nothing
+        /// caps a writeback's width any more — the only account of how wide one
+        /// gets. Divide by the writeback count for regions per frame: a 1080p
+        /// window is ~507 stretches, so ~507 here means every frame took the
+        /// linear path and ~1500 means none did.
         guest_write_regions,
     }
 

@@ -2407,10 +2407,26 @@ fn guest_page_window<M: HostOps>(
 /// count would also need an unbounded set of static strings, which
 /// `note_store_route` does not take.
 ///
-/// The bands are the ones a driven boot was first measured in, kept so a later
-/// reading is comparable with that one: 42 windows at 3-4 stretches, 4 322 at
-/// 5-8, **370 716 at 9-32** and 1 261 above — and nothing at all at one or two,
-/// which is what made the single-reference rail unreachable.
+/// The low bands are the ones a driven boot was first measured in, kept so a
+/// later reading is comparable with that one: 42 windows at 3-4 stretches,
+/// 4 322 at 5-8, **370 716 at 9-32** and 1 261 above — and nothing at all at one
+/// or two, which is what made the single-reference rail unreachable.
+///
+/// # Why they reach past 64
+///
+/// These bands stopped at `>32` while the Vulkan engine capped its GPU gather at
+/// 64 regions, so every window that cap turned away landed in one bucket that
+/// *starts below the cap* — a reading of it could not say whether a refused
+/// window overshot by one region or by five hundred, and the cap's own
+/// justification was written from exactly that bucket.
+///
+/// Widening them answered it and retired the cap: on a driven boot the
+/// distribution is bimodal, 99.66 % of windows at 1-32 stretches and a second
+/// population of full-screen surfaces at 257-512, with **nothing between 33 and
+/// 256**. 64 was not a threshold between two regimes; it sat in the empty space
+/// between them, and any value from 33 to 256 would have refused the same 1 162
+/// windows. The bands stay wide because that shape is what a future cap
+/// proposal has to be argued against.
 fn band_runs(runs: usize) -> &'static str {
     match runs {
         0..=1 => "zc_buf_runs_1",
@@ -2418,7 +2434,12 @@ fn band_runs(runs: usize) -> &'static str {
         3..=4 => "zc_buf_runs_3_4",
         5..=8 => "zc_buf_runs_5_8",
         9..=32 => "zc_buf_runs_9_32",
-        _ => "zc_buf_runs_gt32",
+        33..=64 => "zc_buf_runs_33_64",
+        65..=128 => "zc_buf_runs_65_128",
+        129..=256 => "zc_buf_runs_129_256",
+        257..=512 => "zc_buf_runs_257_512",
+        513..=1024 => "zc_buf_runs_513_1024",
+        _ => "zc_buf_runs_gt1024",
     }
 }
 

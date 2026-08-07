@@ -899,35 +899,40 @@ void main() {{
     engine::test_quiesce_ring();
 }
 
-/// **Past `MAX_GUEST_GATHER_REGIONS`, the bytes are still the guest's.**
+/// **A wide window is gathered by the GPU, and every stretch lands where it
+/// belongs.**
 ///
-/// The GPU gather takes one `vkCmdCopyBuffer` region per stretch and stops
-/// offering above 64 of them, because past that the per-region overhead starts
-/// competing with the memcpy it replaces. That bound is a *cost* bound and its
-/// own doc says so: the CPU gather reads the same bytes through the same runs,
-/// so exceeding it must cost throughput and nothing else.
+/// There used to be a `MAX_GUEST_GATHER_REGIONS` here: above 64 copy regions a
+/// window went back to a CPU `memcpy`, on the stated grounds that past that
+/// count "the per-region overhead has started to compete with the memcpy it is
+/// replacing". It cannot. A run is a whole number of guest pages, so each region
+/// this rail adds also removes at least a page from the `memcpy` on the other
+/// side of the choice — the two costs move in opposite directions and no region
+/// count exists at which the CPU arm wins. A driven boot put the refused
+/// population at 257-512 regions and 8.95 GiB of CPU `memcpy` per 25 s, none of
+/// which had anywhere cheaper to go.
 ///
-/// "Nothing else" is the part that was asserted nowhere. `zc_buf_gather_wide`
-/// counts what the bound turns away, so a window going over is visible — but a
-/// counter says a window took the other rail, not that the other rail assembled
-/// it correctly. A fallback that dropped the tail, or reassembled the stretches
-/// in walk order, would raise exactly the same counter.
+/// What the bound did have was this test, asserting that the fallback landed the
+/// same bytes. The interesting assertion is now the other way round: 65 stretches
+/// must be *taken* by the GPU gather, and must still read back correctly. Wide
+/// windows are where a region-ordering bug would hide, because a rail that
+/// reassembled stretches in walk order rather than at their window offsets is
+/// correct for the 3-stretch case and wrong here.
 ///
-/// So this is the over-the-bound twin of
+/// So this is the wide twin of
 /// [`the_gathered_window_reaches_the_shader_with_every_stretch_at_its_window_offset`]:
 /// same shader, same reversed first three stretches, same colour — and 65 runs
-/// instead of 3, which is one past the bound. The GPU gather must decline, and
-/// the picture must not change.
+/// instead of 3.
 #[test]
-fn a_window_past_the_gather_bound_falls_back_and_still_lands_the_right_bytes() {
+fn a_wide_window_is_gathered_by_the_gpu_and_still_lands_the_right_bytes() {
     use reims_vgpu::runtime::guest_ram::{granularity, GuestRamImport, GuestRamRegion, GuestRef};
     use reims_vgpu::runtime::guest_ram_map::GuestWindowRun;
 
     const STRETCH: u64 = 256;
     const WORDS_PER_STRETCH: usize = (STRETCH / 4) as usize;
-    // `MAX_GUEST_GATHER_REGIONS` is 64 and private to the engine. One past it is
-    // the only interesting count: it is the smallest window the bound refuses,
-    // so a bound that moved by one is still caught here.
+    // 65 is where the retired bound used to refuse. Kept as the count precisely
+    // because it is the one a reintroduced cap would turn away first, so this
+    // test fails the moment anyone puts a region ceiling back.
     const RUNS: u64 = 65;
 
     let _guard = engine_test_lock().lock().unwrap();
@@ -1048,17 +1053,20 @@ void main() {{
 
     let d = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
-        d.buffer_guest_gathers, 0,
-        "65 regions is past MAX_GUEST_GATHER_REGIONS; the GPU gather must decline: {d:?}"
+        d.buffer_guest_gathers, 1,
+        "a 65-stretch window must be gathered by the GPU, not sent to the CPU: {d:?}"
+    );
+    assert_eq!(
+        d.buffer_guest_gather_regions, RUNS,
+        "the gather must name one copy region per stretch: {d:?}"
     );
 
     let i = (((H / 2) * W + W / 4) * 4) as usize;
     let got = &px[i..i + 4];
     assert!(
         near(got[0], FILL[2]) && near(got[1], FILL[1]) && near(got[2], FILL[0]),
-        "window past the bound read back as {got:?}; expected ({}, {}, {}). \
-         The bound is a cost bound — the rail that takes over must land the same \
-         bytes the gather would have.",
+        "the wide window read back as {got:?}; expected ({}, {}, {}). \
+         Every stretch must land at its own window offset, not in walk order.",
         FILL[2],
         FILL[1],
         FILL[0],

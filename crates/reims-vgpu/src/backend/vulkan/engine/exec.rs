@@ -80,22 +80,6 @@ impl PendingGuestGather {
     }
 }
 
-/// The largest number of copy regions one guest buffer window may be gathered
-/// with before it goes back to the CPU.
-///
-/// Not a correctness bound — the CPU gather reads the same bytes through the
-/// same runs, so exceeding this costs throughput and nothing else. It is a cost
-/// bound, and it is derived from the distribution rather than chosen: a driven
-/// boot measured this rail at 3-4 stretches for 42 windows, 5-8 for 4 322, 9-32
-/// for 370 716 and above 32 for 1 261. 64 sits above the band that carries
-/// 98.5 % of the traffic with a full band of headroom, and a window past it is
-/// one whose per-region overhead has started to compete with the memcpy it is
-/// replacing.
-///
-/// `zc_buf_gather_wide` counts what it turns away, so this being wrong in either
-/// direction is visible rather than silent.
-const MAX_GUEST_GATHER_REGIONS: usize = 64;
-
 /// The one bind range a window's stretches amount to, when they amount to one.
 ///
 /// A single run starting at window byte zero *is* the whole window:
@@ -307,10 +291,6 @@ unsafe fn gather_guest_buffer_window(
     let Some(runs) = src.pages.as_ref() else {
         return Ok(None);
     };
-    if runs.len() > MAX_GUEST_GATHER_REGIONS {
-        crate::runtime::drain::note_store_route("zc_buf_gather_wide");
-        return Ok(None);
-    }
     // From here on this window costs something, so from here on it is charged.
     // Opening the span above would count every *attempt* — and on a host that
     // cannot import, every attempt returns at the first line, so `gather_n`
@@ -606,10 +586,6 @@ unsafe fn import_sampled_guest_window(
             buffer: bound.buffer,
             offset,
         }));
-    }
-    if runs.len() > MAX_GUEST_GATHER_REGIONS {
-        crate::runtime::drain::note_store_route("zc_sampled_gather_wide");
-        return Ok(None);
     }
     // Plan before acquiring, so a window that turns out not to be gatherable
     // does not take a destination slot out of the pool to abandon it.
