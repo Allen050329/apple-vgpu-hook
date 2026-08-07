@@ -28,9 +28,15 @@ pub use census::*;
 /// stamp-after-paint (that inverted PGDisplay completion and stacked tooltips).
 pub const MAX_UNPAINTED_PRESENTS: u32 = 2;
 
-/// Bit 0 in `translation_order_hold_mask` names the root FIFO. Child FIFOs use
+/// Bit 0 names the root FIFO in every mask over FIFO timelines —
+/// `translation_order_hold_mask` and `stamp_deferred_mask`. Child FIFOs use
 /// their channel bit, matching `translation_deferred_mask`.
-const TRANSLATION_ROOT_FIFO_BIT: u32 = 1;
+///
+/// Bit 0 is free for the root because `is_child_channel` starts child ids at 1,
+/// so no channel bit can collide with it. The constant is not named for either
+/// mask: it is the shared convention, and naming it after the first user is how
+/// the second one ends up spelling `1` by hand.
+const ROOT_FIFO_BIT: u32 = 1;
 
 fn note_translation_order_hold(state: &mut DeviceState, held_mask: u32) {
     let new_mask = held_mask & !state.translation_order_hold_mask;
@@ -800,6 +806,29 @@ fn packet_snapshot_len(header: &[u8], available: u32, ring_capacity: u32) -> u32
 /// indefinitely. Second, the root `DELETE_TASK` waiting one submission behind a
 /// child FIFO's slot is the use-after-free named above, caught in the act: the
 /// task is torn down while the work that sources it has not been drained.
+///
+/// # And what the hold did to it
+///
+/// Third driven boot, same workload, with the packet held on an unmet wait:
+///
+/// ```text
+/// packet_stamp_wait_met       2901      was 1652
+/// packet_stamp_wait_unmet      251      was 1500
+/// packet_stamp_wait_held       239
+/// stamp_hold_retry              74
+/// stamp_hold_handed_back        32
+/// ```
+///
+/// Not one packet now runs with a wait behind it — the 251 are held rather than
+/// executed, and the same packets return as `met` once the slot arrives, which
+/// is where the rise on the met side comes from. `stamp_hold_retry` is
+/// [`retry_stamp_held_timelines`] clearing a hold that the channel-id walk order
+/// created; `stamp_hold_handed_back` is the tail that genuinely had to wait for
+/// the guest to submit the producing work.
+///
+/// The `behind` reading predicted that, and the throughput reading confirms the
+/// cost: the drag probe's worst second is 0.9 Hz both before and after. A hold
+/// that lasts one tranche does not show up as a frame.
 fn note_packet_stamp_records(opcode: u16, waits: &[StampWait]) {
     if waits.is_empty() {
         note_store_route("packet_stamps_none");
@@ -821,79 +850,117 @@ fn note_packet_stamp_records(opcode: u16, waits: &[StampWait]) {
     ));
 }
 
-/// Evaluate a packet's stamp waits against the slots this device has published,
-/// and report every one that is not yet satisfied.
+/// What a packet's stamp waits say the drain should do with it.
 ///
-/// Returns the number of unsatisfied waits, which is the number of orderings
-/// this device is about to violate by executing the packet anyway. Zero is the
-/// healthy reading and the one a driven boot is expected to produce for most
-/// packets, because the drain reaches the producing channel first far more often
-/// than not.
-///
-/// **This reports; it does not hold.** Holding is the correct behaviour and it
-/// needs a per-channel deferral keyed on a stamp rather than on translation
-/// readiness — the shape is in [`note_packet_stamp_records`]'s third bullet, and
-/// the number this function produces is what says how much that machinery buys.
-/// A device that stalled a channel on an unmet wait before anyone had measured
-/// how many waits go unmet would be trading a known ordering slip for an unknown
-/// stall risk.
+/// The three answers are not degrees of the same thing. [`Self::Ready`] and
+/// [`Self::Hold`] are the wait working; [`Self::Unevaluable`] is the device
+/// unable to decide, and collapsing it into `Hold` is how a report becomes a
+/// hang — see the variant's own note.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StampVerdict {
+    /// Every wait is satisfied, or there were none. Run the packet.
+    Ready,
+    /// At least one wait is genuinely behind. Hold the packet: a stamp this
+    /// device will publish is what clears it.
+    Hold,
+    /// A wait this device cannot decide, and **no future event changes that**.
+    ///
+    /// Holding on one would park the timeline forever, which is strictly worse
+    /// than the ordering slip it was meant to prevent: an ordering slip loses
+    /// one packet's ordering, a parked root FIFO loses the guest. So this runs
+    /// the packet, loudly. Every case here is a refusal with a named reason, and
+    /// none of them fired on a driven boot.
+    Unevaluable,
+}
+
+impl StampVerdict {
+    /// Fold one wait's answer into the packet's, most restrictive winning.
+    ///
+    /// `Unevaluable` outranks `Hold`, which outranks `Ready`. That order is the
+    /// whole point: a packet with one wait genuinely behind and one that can
+    /// never be decided must **run**, because holding for the first would still
+    /// park the timeline forever on the second.
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unevaluable, _) | (_, Self::Unevaluable) => Self::Unevaluable,
+            (Self::Hold, _) | (_, Self::Hold) => Self::Hold,
+            _ => Self::Ready,
+        }
+    }
+}
+
+/// Evaluate a packet's stamp waits against the slots this device has published.
 ///
 /// The current value is read back out of the stamp page rather than cached
 /// beside [`write_stamp`]. The page is where the guest reads it, so it is the
 /// only copy whose staleness cannot be this device's own bug, and a cache keyed
 /// by slot would be one more bounded structure to keep honest for four bytes.
+///
+/// Every wait in the packet is evaluated even once one is known unsatisfied.
+/// The verdict would not change, but the census would: a packet carrying two
+/// waits where the second is out of range must say so, and stopping at the first
+/// hold hides it until the first one clears.
 fn note_packet_stamp_waits<H: HostMemory + HostOps>(
     state: &DeviceState,
     host: &H,
     channel: Option<u32>,
     packet: &Packet,
-) -> u32 {
+) -> StampVerdict {
     if packet.stamp_waits.is_empty() {
-        return 0;
+        return StampVerdict::Ready;
     }
-    let mut unmet = 0u32;
+    let mut verdict = StampVerdict::Ready;
     for wait in &packet.stamp_waits {
         let index = stamp_slot_index(wait.index);
-        let Some(off) = stamp_slot_offset(index, state.page_size()) else {
-            // An index past the stamp page is a slot this device could never
-            // write, so no drain can ever satisfy it. That is the guest naming a
-            // FIFO the device does not have, not an ordering slip.
-            unmet += 1;
-            if crate::observe::first_sight("packet_stamp_wait_slot", u64::from(index)) {
+        let unresolvable = |reason: &'static str, detail: String| {
+            note_store_route("packet_stamp_wait_unresolvable");
+            if crate::observe::first_sight("packet_stamp_wait_unresolvable", u64::from(index)) {
                 crate::observe::fail(format!(
-                    "packet_stamp_wait_unresolvable reason=stamp_slot_out_of_range \
-                     opcode={:#x} index={index} slots={} \
-                     (the awaited slot is past the stamp page, so no drain can satisfy it)",
+                    "packet_stamp_wait_unresolvable reason={reason} opcode={:#x} \
+                     index={index} {detail} (the wait cannot be decided and no \
+                     drain can change that, so the packet runs unordered rather \
+                     than parking this timeline forever)",
                     packet.opcode,
-                    stamp_slot_count(state.page_size()),
                 ));
             }
+        };
+        // An index past the stamp page names a FIFO this device does not have,
+        // so no drain could ever write the slot the guest is watching.
+        let Some(off) = stamp_slot_offset(index, state.page_size()) else {
+            unresolvable(
+                "stamp_slot_out_of_range",
+                format!("slots={}", stamp_slot_count(state.page_size())),
+            );
+            verdict = verdict.and(StampVerdict::Unevaluable);
             continue;
         };
+        // No stamp page means no slot to read and no slot `write_stamp` would
+        // write either — it returns early on the same condition.
         if state.gfx.fifo_base_page == 0 {
-            unmet += 1;
+            unresolvable("no_stamp_page", String::from("fifo_base_page=0"));
+            verdict = verdict.and(StampVerdict::Unevaluable);
             continue;
         }
         let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;
         let Ok(current) = crate::runtime::host::read_u32(host, gpa) else {
-            unmet += 1;
+            unresolvable("stamp_slot_unreadable", format!("gpa={gpa:#x}"));
+            verdict = verdict.and(StampVerdict::Unevaluable);
             continue;
         };
         if wait.satisfied_by(current) {
             note_store_route("packet_stamp_wait_met");
             continue;
         }
-        unmet += 1;
         note_store_route("packet_stamp_wait_unmet");
+        verdict = verdict.and(StampVerdict::Hold);
         if crate::observe::first_sight(
             "packet_stamp_wait_unmet",
             (u64::from(packet.opcode) << 32) | u64::from(index),
         ) {
-            crate::observe::fail(format!(
+            crate::observe::off(format!(
                 "packet_stamp_wait_unmet opcode={:#x} {} index={index} awaited={:#x} \
-                 current={current:#x} behind={} \
-                 (this device executes the packet anyway, so it runs ahead of the \
-                  work it was ordered behind)",
+                 current={current:#x} behind={} (the packet is held until the slot \
+                 reaches it)",
                 packet.opcode,
                 packet_site(channel),
                 wait.value,
@@ -901,7 +968,7 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
             ));
         }
     }
-    unmet
+    verdict
 }
 
 /// Decode one packet out of a ring snapshot taken at [`packet_snapshot_len`].
@@ -1620,6 +1687,11 @@ fn process_root_packet<H: HostMemory + HostOps>(
 
 /// Drain the main (root) FIFO while producer != consumer.
 pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    // The hold bit means "the last drain of this timeline stopped on an unmet
+    // stamp wait", so it is cleared on entry and set only by the arm that stops.
+    // Left sticky it would outlive the packet that set it and keep
+    // `retry_stamp_held_timelines` re-entering a ring with nothing in it.
+    state.stamp_deferred_mask &= !ROOT_FIFO_BIT;
     let ring_size = main_ring_data_size(state.gfx.fifo_length, state.gfx.fifo_start);
     if ring_size == 0 || state.gfx.fifo_base_page == 0 {
         state.pending.main_drain = false;
@@ -1710,7 +1782,19 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
             ring_size,
         ) {
             Ok(packet) => {
-                note_packet_stamp_waits(state, host, None, &packet);
+                if note_packet_stamp_waits(state, host, None, &packet) == StampVerdict::Hold {
+                    // Same hold as the child drain, and this is the timeline
+                    // where it matters most: the measured root wait is a
+                    // `DELETE_TASK` ordered behind a child FIFO's stamp, so
+                    // running it early tears down a task whose work has not
+                    // been drained. `fifo_read` stays where it is and no root
+                    // completion stamp is written, so the retry is the same
+                    // packet with the same effects still owed.
+                    note_store_route("packet_stamp_wait_held");
+                    state.stamp_deferred_mask |= ROOT_FIFO_BIT;
+                    state.pending.main_drain = true;
+                    break;
+                }
                 process_root_packet(state, host, &packet);
                 state
                     .gfx
@@ -1779,7 +1863,10 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
             .fetch_or(1, std::sync::atomic::Ordering::AcqRel);
         host.enqueue(HostAction::irq_gfx());
     }
-    state.pending.main_drain = false;
+    // A root head held on an unmet stamp wait is unfinished work, not a drained
+    // ring: clearing the flag unconditionally here would drop the retry and the
+    // packet would only run again if some later doorbell happened to set it.
+    state.pending.main_drain = state.stamp_deferred_mask & ROOT_FIFO_BIT != 0;
 }
 
 fn ensure_child_ring<M: HostMemory>(
@@ -3286,6 +3373,10 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     let bit = 1u32 << channel_id;
     state.draining_channel = channel_id;
     state.draining_mask |= bit;
+    // Cleared on entry and set only by the arm that stops on an unmet stamp
+    // wait, so the bit always describes this drain rather than an older one.
+    // See `drain_main_fifo`'s copy for what a sticky bit would cost.
+    state.stamp_deferred_mask &= !bit;
 
     loop {
         let tail = match crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL) {
@@ -3368,7 +3459,21 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
         }
         match decode_packet(&snap, head, available, ring_length) {
             Ok(packet) => {
-                note_packet_stamp_waits(state, host, Some(channel_id), &packet);
+                if note_packet_stamp_waits(state, host, Some(channel_id), &packet)
+                    == StampVerdict::Hold
+                {
+                    // The guest ordered this packet behind work that has not
+                    // reached its stamp. Hold it: head and completion stamp stay
+                    // untouched, so the retry re-decodes the same bytes and no
+                    // side effect can land twice. Never block — the awaited
+                    // stamp is published by *another* timeline's drain, and this
+                    // one is single-threaded, so waiting here would deadlock
+                    // against the thing being waited for.
+                    note_store_route("packet_stamp_wait_held");
+                    state.stamp_deferred_mask |= bit;
+                    state.pending.child_mask |= bit;
+                    break;
+                }
                 if process_child_packet(state, host, channel_id, &packet)
                     == ChildPacketDisposition::Deferred
                 {
@@ -4178,6 +4283,53 @@ pub(crate) fn fold_rung_child_doorbells(state: &mut DeviceState) {
     state.pending.child_mask |= rung;
 }
 
+/// Re-offer every timeline held on an unmet stamp wait, for as long as the pass
+/// keeps publishing stamps.
+///
+/// The channel loop above walks channels in id order, so a channel held on a
+/// slot that a *higher-numbered* channel publishes is passed over before the
+/// thing it waits for has run. Its bit then sits in `pending.child_mask` with
+/// nothing guaranteed to ring for it: the doorbell that would re-arm it belongs
+/// to the producing channel, whose work this pass already drained. This closes
+/// that window inside the pass.
+///
+/// **The loop is bounded by progress, not by a count.** Each round runs only if
+/// the previous one advanced [`DeviceState::completion_stamp_seq`] — a stamp
+/// reaching guest RAM is the only event that can turn an unmet wait into a met
+/// one, so a round that publishes nothing cannot have unblocked anything and
+/// there is no reason to look again. That makes a mutual wait between two
+/// channels terminate in one round rather than spin, and it needs no cap to say
+/// so: a cap here would be a bound on how far ordering is honoured, which is
+/// exactly the shape this device is trying not to have.
+///
+/// What is left held is handed back with its bit set, which is correct and not a
+/// drop: the awaited work has not been submitted yet, the guest will submit it,
+/// and that submission rings its own doorbell. Holding is what a GPU does with a
+/// wait it cannot yet satisfy.
+fn retry_stamp_held_timelines<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    while state.stamp_deferred_mask != 0 {
+        let seq_before = state.completion_stamp_seq;
+        if state.stamp_deferred_mask & ROOT_FIFO_BIT != 0 {
+            drain_main_fifo(state, host);
+        }
+        for ch in 1..MAX_CHANNELS as u32 {
+            let bit = 1u32 << ch;
+            if state.stamp_deferred_mask & bit == 0 {
+                continue;
+            }
+            drain_child_fifo(state, host, ch);
+            if state.pending.host_action_yield {
+                return;
+            }
+        }
+        if state.completion_stamp_seq == seq_before {
+            note_store_route("stamp_hold_handed_back");
+            return;
+        }
+        note_store_route("stamp_hold_retry");
+    }
+}
+
 pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
     // A queued present action is part of the ordered device timeline. QEMU
     // cannot paint it while this worker owns the device lock, so later worker
@@ -4194,7 +4346,7 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
     let deferred = state.translation_deferred_mask;
     if deferred != 0 {
         if state.pending.main_drain {
-            note_translation_order_hold(state, TRANSLATION_ROOT_FIFO_BIT);
+            note_translation_order_hold(state, ROOT_FIFO_BIT);
         }
         let sibling_pending = state.pending.child_mask & !deferred;
         note_translation_order_hold(state, sibling_pending);
@@ -4265,6 +4417,7 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
     }
     // Whatever the refill cap left, handed back to the next wakeup.
     state.pending.child_mask |= mask;
+    retry_stamp_held_timelines(state, host);
     if state.pending.iosfc {
         drain_iosfc(state, host);
     }

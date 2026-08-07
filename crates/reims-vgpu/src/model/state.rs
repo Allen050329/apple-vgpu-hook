@@ -1855,6 +1855,16 @@ pub struct DeviceState {
     /// remain untouched until retry, so this is scheduler state rather than a
     /// submitted async GPU job.
     pub translation_deferred_mask: u32,
+    /// FIFO timelines whose head packet is held on an unmet stamp wait. Bit 0
+    /// is the root FIFO and child channel N uses bit N, the same convention as
+    /// [`Self::translation_order_hold_mask`].
+    ///
+    /// Held rather than skipped: the head and the completion stamp stay
+    /// untouched, so a retry re-decodes the same packet and no side effect can
+    /// happen twice. The mask is what tells `drain_pending` which timelines to
+    /// re-offer while the pass is still publishing stamps, since another
+    /// timeline's stamp is the only thing that can satisfy one.
+    pub stamp_deferred_mask: u32,
     /// Root/child FIFO timelines held behind a cold-translation EXEC. Bit 0 is
     /// the root FIFO; child channel N uses bit N. This is diagnostic scheduler
     /// ownership, not a guest-visible protocol mask.
@@ -2234,6 +2244,7 @@ impl DeviceState {
             iosfc: IosfcRegs::default(),
             active_child_mask: 0,
             translation_deferred_mask: 0,
+            stamp_deferred_mask: 0,
             translation_order_hold_mask: 0,
             translation_order_holds: 0,
             present_translation_holds: 0,

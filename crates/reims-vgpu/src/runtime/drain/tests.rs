@@ -998,7 +998,7 @@ fn translation_deferred_holds_sibling_unmap_head_and_stamp() {
     assert_eq!(state.translation_order_hold_mask, sibling_bit);
     assert_eq!(state.translation_order_holds, 1, "poll retries coalesce");
 
-    note_translation_order_hold(&mut state, TRANSLATION_ROOT_FIFO_BIT);
+    note_translation_order_hold(&mut state, ROOT_FIFO_BIT);
     assert_eq!(
         state.translation_order_holds, 1,
         "new timeline bits in one ownership interval remain one episode"
@@ -4670,6 +4670,280 @@ fn a_pipe_index_that_looks_like_an_opcode_is_still_a_pipe_index() {
         state.display.shared_gpa,
         state.pfn_gpa(3),
         "and the second word is the page, not a task id"
+    );
+}
+
+/// A packet whose stamp wait is unmet is held, not run: the head does not move,
+/// no completion stamp is written, and the same packet runs once the awaited
+/// slot reaches its value.
+///
+/// Both halves are the test. Only asserting the hold would pass for a device
+/// that dropped the packet, and only asserting the release would pass for one
+/// that never held. The measured workload is 44 % held, so a release that never
+/// fires is a hang rather than a slow path.
+#[test]
+fn a_packet_whose_stamp_wait_is_unmet_is_held_until_the_slot_reaches_it() {
+    use crate::model::DeviceId;
+    use crate::runtime::host::FakeHost;
+
+    const AWAITED_SLOT: u32 = 5;
+    const AWAITED_VALUE: u32 = 7;
+    const ROOT_STAMP: u32 = 0xABC;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page_size = 1usize << PAGE_SHIFT_X86;
+
+    let fifo_pfn = 0x40u32;
+    let fifo_gpa = (fifo_pfn as u64) << PAGE_SHIFT_X86;
+    host.map_range(fifo_gpa, 3 * page_size, 0);
+    state.gfx.fifo_base_page = fifo_pfn;
+    state.gfx.fifo_start = page_size as u32;
+    state.gfx.fifo_length = 2 * page_size as u32;
+
+    // One root packet carrying a single wait record, and nothing else: the
+    // payload is empty so the only thing that can move is the head.
+    let total = PACKET_HEADER_LEN + PACKET_STAMP_LEN;
+    let mut packet = vec![0u8; total as usize];
+    st16(&mut packet[PACKET_OPCODE..], 0);
+    st16(&mut packet[PACKET_STAMP_COUNT..], 1);
+    st32(&mut packet[PACKET_TOTAL_SIZE..], total);
+    st32(&mut packet[PACKET_COMPLETION_STAMP..], ROOT_STAMP);
+    st32(&mut packet[PACKET_HEADER_LEN as usize..], AWAITED_SLOT);
+    st32(&mut packet[PACKET_HEADER_LEN as usize + 4..], AWAITED_VALUE);
+    gpa_map::write_bytes(&mut host, fifo_gpa + page_size as u64, &packet, page_size)
+        .expect("seed the root ring");
+    state
+        .gfx
+        .fifo_read
+        .store(0, std::sync::atomic::Ordering::Release);
+    state.gfx.fifo_written = total;
+
+    let slot_gpa = |slot: u32| fifo_gpa + stamp_slot_offset(slot, page_size as u64).unwrap();
+    let read_slot = |host: &FakeHost, slot: u32| {
+        let mut v = [0u8; 4];
+        crate::runtime::host::HostMemory::read_gpa(host, slot_gpa(slot), &mut v).expect("slot");
+        ld32(&v)
+    };
+
+    // Slot 5 stands at 0, so the wait is seven short of satisfied.
+    drain_main_fifo(&mut state, &mut host);
+
+    assert_eq!(
+        state
+            .gfx
+            .fifo_read
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "the head must not move past a packet the device has not run, or the \
+         retry would skip it entirely"
+    );
+    assert_eq!(
+        read_slot(&host, 0),
+        0,
+        "and no completion stamp may be written, or the guest is told a packet \
+         finished that never started"
+    );
+    assert_ne!(
+        state.stamp_deferred_mask & ROOT_FIFO_BIT,
+        0,
+        "the hold has to be recorded, or nothing re-offers this timeline"
+    );
+    assert!(
+        state.pending.main_drain,
+        "a held root head is unfinished work: clearing the flag would leave the \
+         retry to whichever later doorbell happened to set it again"
+    );
+
+    // A second drain with nothing changed must hold again rather than give up.
+    drain_main_fifo(&mut state, &mut host);
+    assert_eq!(
+        state
+            .gfx
+            .fifo_read
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "a retry that still cannot satisfy the wait holds again"
+    );
+
+    // Another timeline publishes the awaited stamp.
+    gpa_map::write_u32(&mut host, slot_gpa(AWAITED_SLOT), AWAITED_VALUE, page_size)
+        .expect("publish the awaited stamp");
+    drain_main_fifo(&mut state, &mut host);
+
+    assert_eq!(
+        state
+            .gfx
+            .fifo_read
+            .load(std::sync::atomic::Ordering::Acquire),
+        total,
+        "once the slot reaches the awaited value the same packet runs"
+    );
+    assert_eq!(
+        read_slot(&host, 0),
+        ROOT_STAMP,
+        "and its completion stamp lands exactly once, from the run that happened"
+    );
+    assert_eq!(
+        state.stamp_deferred_mask & ROOT_FIFO_BIT,
+        0,
+        "the hold bit describes the last drain, so a drain that ran clears it"
+    );
+    assert!(
+        !state.pending.main_drain,
+        "and a drained ring is not pending work"
+    );
+}
+
+/// A wait naming a slot past the stamp page runs the packet rather than holding
+/// it, and says why.
+///
+/// This is the one case where running unordered is the better answer, and the
+/// asymmetry is the reason: an ordering slip loses one packet's ordering, while
+/// a timeline parked on a wait nothing can ever satisfy loses the guest. No
+/// drain writes a slot outside the page — `write_stamp` returns early on the
+/// same `stamp_slot_offset` that refuses here — so the hold would be permanent.
+#[test]
+fn a_stamp_wait_naming_a_slot_that_cannot_exist_runs_rather_than_parking() {
+    use crate::model::DeviceId;
+    use crate::runtime::host::FakeHost;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page_size = 1usize << PAGE_SHIFT_X86;
+
+    let fifo_pfn = 0x40u32;
+    let fifo_gpa = (fifo_pfn as u64) << PAGE_SHIFT_X86;
+    host.map_range(fifo_gpa, 3 * page_size, 0);
+    state.gfx.fifo_base_page = fifo_pfn;
+    state.gfx.fifo_start = page_size as u32;
+    state.gfx.fifo_length = 2 * page_size as u32;
+
+    // One past the last slot the guest page can hold, which `stamp_slot_offset`
+    // refuses and `stamp_slot_index`'s mask does not fold back into range.
+    let bad_slot = stamp_slot_count(page_size as u64);
+    assert!(
+        stamp_slot_offset(bad_slot, page_size as u64).is_none(),
+        "the test's premise: this slot has no offset in the stamp page"
+    );
+
+    const ROOT_STAMP: u32 = 0xFEED;
+    let total = PACKET_HEADER_LEN + PACKET_STAMP_LEN;
+    let mut packet = vec![0u8; total as usize];
+    st16(&mut packet[PACKET_OPCODE..], 0);
+    st16(&mut packet[PACKET_STAMP_COUNT..], 1);
+    st32(&mut packet[PACKET_TOTAL_SIZE..], total);
+    st32(&mut packet[PACKET_COMPLETION_STAMP..], ROOT_STAMP);
+    st32(&mut packet[PACKET_HEADER_LEN as usize..], bad_slot);
+    st32(&mut packet[PACKET_HEADER_LEN as usize + 4..], 0xFFFF);
+    gpa_map::write_bytes(&mut host, fifo_gpa + page_size as u64, &packet, page_size)
+        .expect("seed the root ring");
+    state
+        .gfx
+        .fifo_read
+        .store(0, std::sync::atomic::Ordering::Release);
+    state.gfx.fifo_written = total;
+
+    drain_main_fifo(&mut state, &mut host);
+
+    assert_eq!(
+        state
+            .gfx
+            .fifo_read
+            .load(std::sync::atomic::Ordering::Acquire),
+        total,
+        "an undecidable wait must not stop the timeline, because nothing will \
+         ever decide it"
+    );
+    assert_eq!(
+        state.stamp_deferred_mask & ROOT_FIFO_BIT,
+        0,
+        "and no hold is recorded, so nothing re-offers a packet that already ran"
+    );
+
+    // A packet carrying both an ordinary unmet wait and an undecidable one still
+    // runs: holding for the first would park the timeline forever on the second.
+    let mut both = vec![0u8; (PACKET_HEADER_LEN + 2 * PACKET_STAMP_LEN) as usize];
+    st16(&mut both[PACKET_OPCODE..], 0);
+    st16(&mut both[PACKET_STAMP_COUNT..], 2);
+    st32(
+        &mut both[PACKET_TOTAL_SIZE..],
+        PACKET_HEADER_LEN + 2 * PACKET_STAMP_LEN,
+    );
+    st32(&mut both[PACKET_HEADER_LEN as usize..], 6);
+    st32(&mut both[PACKET_HEADER_LEN as usize + 4..], 0x99);
+    st32(
+        &mut both[(PACKET_HEADER_LEN + PACKET_STAMP_LEN) as usize..],
+        bad_slot,
+    );
+    st32(
+        &mut both[(PACKET_HEADER_LEN + PACKET_STAMP_LEN) as usize + 4..],
+        1,
+    );
+    let decoded = decode_packet(&both, 0, both.len() as u32, RING).expect("two records decode");
+    assert_eq!(
+        note_packet_stamp_waits(&state, &host, None, &decoded),
+        StampVerdict::Unevaluable,
+        "Unevaluable outranks Hold, or the packet parks forever on the wait that \
+         cannot clear while waiting for the one that could"
+    );
+}
+
+/// `retry_stamp_held_timelines` stops when a round publishes no stamp, so a wait
+/// nothing in the ring can satisfy costs one extra round and not a spin.
+///
+/// This is the property that lets the loop have no iteration cap. A cap would be
+/// a bound on how far ordering is honoured; the progress condition is not, and
+/// this pins that it actually terminates.
+#[test]
+fn a_stamp_hold_nothing_can_satisfy_costs_one_round_and_returns() {
+    use crate::model::DeviceId;
+    use crate::runtime::host::FakeHost;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page_size = 1usize << PAGE_SHIFT_X86;
+
+    let fifo_pfn = 0x40u32;
+    let fifo_gpa = (fifo_pfn as u64) << PAGE_SHIFT_X86;
+    host.map_range(fifo_gpa, 3 * page_size, 0);
+    state.gfx.fifo_base_page = fifo_pfn;
+    state.gfx.fifo_start = page_size as u32;
+    state.gfx.fifo_length = 2 * page_size as u32;
+
+    // The awaited slot is one this ring's only packet cannot advance, because
+    // the packet is the one waiting on it.
+    let total = PACKET_HEADER_LEN + PACKET_STAMP_LEN;
+    let mut packet = vec![0u8; total as usize];
+    st16(&mut packet[PACKET_OPCODE..], 0);
+    st16(&mut packet[PACKET_STAMP_COUNT..], 1);
+    st32(&mut packet[PACKET_TOTAL_SIZE..], total);
+    st32(&mut packet[PACKET_HEADER_LEN as usize..], 9);
+    st32(&mut packet[PACKET_HEADER_LEN as usize + 4..], 0x1000);
+    gpa_map::write_bytes(&mut host, fifo_gpa + page_size as u64, &packet, page_size)
+        .expect("seed the root ring");
+    state
+        .gfx
+        .fifo_read
+        .store(0, std::sync::atomic::Ordering::Release);
+    state.gfx.fifo_written = total;
+
+    state.stamp_deferred_mask = ROOT_FIFO_BIT;
+    let seq_before = state.completion_stamp_seq;
+
+    // Terminating at all is the assertion: a loop without the progress
+    // condition never returns from here.
+    retry_stamp_held_timelines(&mut state, &mut host);
+
+    assert_eq!(
+        state.completion_stamp_seq, seq_before,
+        "nothing ran, so no fence moved"
+    );
+    assert_ne!(
+        state.stamp_deferred_mask & ROOT_FIFO_BIT,
+        0,
+        "and the timeline is handed back still held, which is what a later \
+         doorbell re-offers rather than a drop"
     );
 }
 
