@@ -92,7 +92,7 @@ const ROWS: &[Row] = &[
               object handle, not a byte range, so there is no extent to carry.",
     },
     Row {
-        at: "reims-vgpu/src/backend/vulkan/caps/device_features.rs:234",
+        at: "reims-vgpu/src/backend/vulkan/caps/device_features.rs:253",
         verdict: Verdict::NotASpan,
         why: "A Vec of `*const c_char` extension names for vkCreateDevice; NUL \
               terminates each one and Vulkan reads them that way.",

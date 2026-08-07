@@ -95,8 +95,12 @@ struct PendingDraw {
     fragment_textures: BindTable<TextureBind>,
     vertex_samplers: BindTable<SamplerBind>,
     fragment_samplers: BindTable<SamplerBind>,
-    viewport: Option<[f64; 6]>,
-    scissor: Option<ScissorRect>,
+    /// Every viewport this draw was recorded with, in the guest's order. Empty
+    /// means the stream bound none and the backend's full-target default
+    /// stands — what `None` used to mean, at a capacity of one.
+    viewports: Vec<[f64; 6]>,
+    /// Every scissor rect this draw was recorded with. See [`Self::viewports`].
+    scissors: Vec<ScissorRect>,
     blend_color: Option<[f32; 4]>,
     cull_mode: Option<u32>,
     front_facing: Option<u32>,
@@ -138,8 +142,11 @@ struct StreamAccum {
     fragment_textures: BindTable<TextureBind>,
     vertex_samplers: BindTable<SamplerBind>,
     fragment_samplers: BindTable<SamplerBind>,
-    viewport: Option<[f64; 6]>,
-    scissor: Option<ScissorRect>,
+    /// Every viewport the stream bound, in the guest's order. Empty means the
+    /// stream bound none and the backend's full-target default stands.
+    viewports: Vec<[f64; 6]>,
+    /// Every scissor rect the stream bound, in the guest's order.
+    scissors: Vec<ScissorRect>,
     indexed: Option<IndexedDrawInfo>,
     blend_color: Option<[f32; 4]>,
     cull_mode: Option<u32>,
@@ -207,8 +214,8 @@ impl StreamAccum {
             fragment_textures: self.fragment_textures.clone(),
             vertex_samplers: self.vertex_samplers.clone(),
             fragment_samplers: self.fragment_samplers.clone(),
-            viewport: self.viewport,
-            scissor: self.scissor,
+            viewports: self.viewports.clone(),
+            scissors: self.scissors.clone(),
             blend_color: self.blend_color,
             cull_mode: self.cull_mode,
             front_facing: self.front_facing,
@@ -1599,20 +1606,25 @@ fn handle_render_record<M: HostMemory + HostOps>(
             out.sampler_unbinds = out.sampler_unbinds.saturating_add(cleared);
         }
         RenderKind::SetViewport => {
-            // `cmd.viewport` is entry 0 of the record, which for the singular
-            // opcode is the whole of it. The plural form (`0x83`) used to reach
-            // no arm at all, so a guest that set its viewport through
-            // `setViewports:count:` got none — this rail models one viewport,
-            // and one is what the overwhelming majority of those records carry.
-            note_extra_state_entries("viewport", cmd.count);
-            acc.viewport = Some(cmd.viewport);
+            // The whole array, in the guest's order. `setViewports:count:`
+            // replaces the viewport state rather than adding to it, so this
+            // assigns rather than extends — a record of two after a record of
+            // five leaves two, which is what Metal does.
+            acc.viewports.clone_from(&cmd.viewports);
         }
         RenderKind::SetScissor => {
-            note_extra_state_entries("scissor", cmd.count);
-            if cmd.scissor.is_empty() {
-                note_empty_scissor(task_id, cmd.scissor);
+            // All-or-nothing on an empty rect, which is the singular arm's rule
+            // read at array width. `setScissorRects:count:` replaces the state
+            // atomically and slot order is meaningful — it is what a shader's
+            // `[[viewport_array_index]]` selects — so an array cannot be adopted
+            // with the empty slots left out, and adopting them as written would
+            // make exactly those slots clip however the backend reads a zero
+            // rect. Neither is expressible here, so the record is refused whole
+            // and the previous state stands, as one empty rect always has.
+            if let Some(empty) = cmd.scissors.iter().find(|r| r.is_empty()) {
+                note_empty_scissor(task_id, *empty);
             } else {
-                acc.scissor = Some(cmd.scissor);
+                acc.scissors.clone_from(&cmd.scissors);
             }
         }
         // No `if cmd.has_blend_color` on these five. Each of the five kinds has
@@ -3401,8 +3413,8 @@ fn fill_draw_binds_from_pending(req: &mut draw::DrawEncodeRequest, pd: &PendingD
     req.fragment_textures = pd.fragment_textures.as_ref().clone();
     req.vertex_samplers = pd.vertex_samplers.as_ref().clone();
     req.fragment_samplers = pd.fragment_samplers.as_ref().clone();
-    req.viewport = pd.viewport;
-    req.scissor = pd.scissor;
+    req.viewports.clone_from(&pd.viewports);
+    req.scissors.clone_from(&pd.scissors);
     req.indexed = pd.indexed.clone();
     req.blend_color = pd.blend_color;
     req.cull_mode = pd.cull_mode;
@@ -3537,7 +3549,7 @@ mod report;
 use report::{
     is_indexed_draw_opcode, note_clear_dropped, note_color_subresource_unsupported,
     note_compute_refusal, note_depth_stencil_unsupported, note_draw_encode_fail,
-    note_empty_scissor, note_extra_state_entries, note_indexed_draw_without_buffer,
+    note_empty_scissor, note_indexed_draw_without_buffer,
     note_indirect_draw_refused, note_pass_extent_for_slot, note_pass_target_extent,
     note_stream_draw_drops,
     note_unimplemented_render_opcode, note_unnamed_icb_execute,

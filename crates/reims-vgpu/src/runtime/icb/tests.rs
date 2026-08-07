@@ -3440,7 +3440,7 @@ fn inherit_buffers_encoder_fragment_color() {
             buffer_ref: 13,
             offset: 0,
         }],
-        viewport: Some([0.0, 0.0, 4.0, 4.0, 0.0, 1.0]),
+        viewports: vec![[0.0, 0.0, 4.0, 4.0, 0.0, 1.0]],
         ..draw_request(mapping_id)
     };
     assert_eq!(
@@ -3518,7 +3518,7 @@ fn inherit_pipeline_encoder_fragment_color() {
 
     // Stream-style pipeline on the encode request (parent encoder).
     let req = DrawEncodeRequest {
-        viewport: Some([0.0, 0.0, 4.0, 4.0, 0.0, 1.0]),
+        viewports: vec![[0.0, 0.0, 4.0, 4.0, 0.0, 1.0]],
         ..draw_request(mapping_id)
     };
     assert_eq!(

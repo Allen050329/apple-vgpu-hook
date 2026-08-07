@@ -267,24 +267,46 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
     // Viewport: stream absolute, or full pass when absent (Metal default is not
     // a full drawable — product sets an explicit full RT viewport when the
     // guest stream never issued setViewport).
-    let vp = req
-        .viewport
-        .unwrap_or([0.0, 0.0, pass_w as f64, pass_h as f64, 0.0, 1.0]);
-    enc.set_viewport(MTLViewport {
-        originX: vp[0],
-        originY: vp[1],
-        width: vp[2],
-        height: vp[3],
-        znear: vp[4],
-        zfar: vp[5],
-    });
-    if let Some(r) = req.scissor {
-        enc.set_scissor_rect(MTLScissorRect {
-            x: r.x as u64,
-            y: r.y as u64,
-            width: r.width as u64,
-            height: r.height as u64,
+    // The whole array, through the plural setters, so an ICB executed under a
+    // parent encoder inherits every viewport the stream bound rather than its
+    // first. `setViewports:count:` with one entry is `setViewport:`, so the
+    // single-viewport stream is unchanged.
+    if req.viewports.is_empty() {
+        enc.set_viewport(MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: pass_w as f64,
+            height: pass_h as f64,
+            znear: 0.0,
+            zfar: 1.0,
         });
+    } else {
+        let vps: Vec<MTLViewport> = req
+            .viewports
+            .iter()
+            .map(|vp| MTLViewport {
+                originX: vp[0],
+                originY: vp[1],
+                width: vp[2],
+                height: vp[3],
+                znear: vp[4],
+                zfar: vp[5],
+            })
+            .collect();
+        enc.set_viewports(&vps);
+    }
+    if !req.scissors.is_empty() {
+        let rects: Vec<MTLScissorRect> = req
+            .scissors
+            .iter()
+            .map(|r| MTLScissorRect {
+                x: r.x as u64,
+                y: r.y as u64,
+                width: r.width as u64,
+                height: r.height as u64,
+            })
+            .collect();
+        enc.set_scissor_rects(&rects);
     }
     if let Some(c) = req.blend_color {
         enc.set_blend_color(c[0], c[1], c[2], c[3]);

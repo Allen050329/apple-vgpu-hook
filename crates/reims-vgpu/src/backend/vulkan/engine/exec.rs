@@ -505,7 +505,10 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             DrawValidationDecline::EmptyFragmentSpirv,
         ));
     }
-    if let Some(vp) = &req.viewport {
+    // Every viewport, not just the first: a NaN in slot 3 reaches
+    // `vkCmdSetViewport` exactly as one in slot 0 does, and the driver's
+    // behaviour on it is undefined either way.
+    for vp in &req.viewports {
         if !vp.x.is_finite()
             || !vp.y.is_finite()
             || !vp.width.is_finite()
@@ -1277,6 +1280,28 @@ pub(crate) unsafe fn execute_draw_inner(
         caches.get_or_create_shader(ctx, &req.frag_spirv, counters, pools)?;
     let (dsl, pipeline_layout) = caches.get_or_create_layout(ctx, &layout_key, counters, pools)?;
     let render_pass = caches.get_or_create_pass(ctx, pass_key, counters, pools)?;
+    // How many viewport slots this draw rasterizes into, checked against the
+    // host before it is baked into a pipeline. Refused rather than clamped:
+    // clamping would silently drop the viewports past the host's limit, which
+    // is the loss this list was widened to stop, and a `viewportCount` above
+    // `maxViewports` — or above 1 without `multiViewport` — makes the pipeline
+    // invalid rather than merely unsupported.
+    let slot_count = super::viewport_slot_count(req);
+    let slot_count_u32 = u32::try_from(slot_count).unwrap_or(u32::MAX);
+    let max_slots = if ctx.features.multi_viewport {
+        ctx.features.max_viewports
+    } else {
+        1
+    };
+    if slot_count_u32 > max_slots {
+        return Err(DrawError::Unsupported(
+            super::reason::DrawReason::ViewportSlotsUnsupported {
+                requested: slot_count_u32,
+                limit: max_slots,
+                multi_viewport: ctx.features.multi_viewport,
+            },
+        ));
+    }
     let pipeline_key = PipelineKey {
         vert: vert_digest,
         frag: frag_digest,
@@ -1326,6 +1351,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 front: s.front,
                 back: s.back,
             }),
+        viewport_slots: slot_count_u32,
         layout: layout_key.clone(),
     };
     // One cache, consulted once. `get_or_create_pipeline` already counts the hit
@@ -2481,36 +2507,50 @@ pub(crate) unsafe fn execute_draw_inner(
         min_depth: 0.0,
         max_depth: 1.0,
     };
-    let vp_src = req.viewport.unwrap_or(default_vp);
-    let viewport = vk::Viewport {
-        x: vp_src.x,
-        y: vp_src.y + vp_src.height,
-        width: vp_src.width,
-        height: -vp_src.height,
-        min_depth: vp_src.min_depth,
-        max_depth: vp_src.max_depth,
-    };
-    ctx.device.cmd_set_viewport(cb, 0, &[viewport]);
     let default_sc = ScissorResource {
         x: 0,
         y: 0,
         width: req.width,
         height: req.height,
     };
-    let sc_src = req.scissor.unwrap_or(default_sc);
-    let x = sc_src.x.min(req.width);
-    let y = sc_src.y.min(req.height);
-    let scissor = vk::Rect2D {
-        offset: vk::Offset2D {
-            x: x as i32,
-            y: y as i32,
-        },
-        extent: vk::Extent2D {
-            width: sc_src.width.min(req.width - x),
-            height: sc_src.height.min(req.height - y),
-        },
-    };
-    ctx.device.cmd_set_scissor(cb, 0, &[scissor]);
+    // One count for both, because a Vulkan pipeline declares one and the
+    // dynamic arrays must match it. The pipeline was built from
+    // `viewport_slot_count`, so this must be the same function of the same
+    // request or `vkCmdSetViewport` binds a different count than the pipeline
+    // declared.
+    let slots = crate::backend::vulkan::engine::viewport_slot_count(req);
+    let viewports: Vec<vk::Viewport> = (0..slots)
+        .map(|i| {
+            let vp = req.viewports.get(i).copied().unwrap_or(default_vp);
+            vk::Viewport {
+                x: vp.x,
+                y: vp.y + vp.height,
+                width: vp.width,
+                height: -vp.height,
+                min_depth: vp.min_depth,
+                max_depth: vp.max_depth,
+            }
+        })
+        .collect();
+    ctx.device.cmd_set_viewport(cb, 0, &viewports);
+    let scissors: Vec<vk::Rect2D> = (0..slots)
+        .map(|i| {
+            let sc = req.scissors.get(i).copied().unwrap_or(default_sc);
+            let x = sc.x.min(req.width);
+            let y = sc.y.min(req.height);
+            vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: x as i32,
+                    y: y as i32,
+                },
+                extent: vk::Extent2D {
+                    width: sc.width.min(req.width - x),
+                    height: sc.height.min(req.height - y),
+                },
+            }
+        })
+        .collect();
+    ctx.device.cmd_set_scissor(cb, 0, &scissors);
     // Dynamic stencil reference (Metal `setStencilFrontReferenceValue:back…`)
     // — only bound for stencil pipelines, which list STENCIL_REFERENCE as a
     // dynamic state; front/back set separately to honor Metal's split refs.
@@ -2655,13 +2695,20 @@ pub(crate) unsafe fn execute_draw_inner(
         // target, and both seed forms fill it.
         let rewrites_whole_attachment =
             !load_uses_gpu_content || seed_bytes.is_some() || req.seed_from_target.is_some();
+        // `any`, not the union: one scissor reaching the whole attachment is
+        // enough for this draw to have written anywhere in it. A set of rects
+        // that only covers the target *together* reads as partial here, which
+        // over-states how much a damage-bounded flush could save rather than
+        // under-stating it — the safe direction for an instrument nothing acts
+        // on, and cheaper than computing a union of arbitrary rects.
         counters.note_draw_coverage(if rewrites_whole_attachment {
             super::counters::DrawCoverage::Full
-        } else if scissor.offset.x <= 0
-            && scissor.offset.y <= 0
-            && scissor.extent.width >= req.width
-            && scissor.extent.height >= req.height
-        {
+        } else if scissors.iter().any(|s| {
+            s.offset.x <= 0
+                && s.offset.y <= 0
+                && s.extent.width >= req.width
+                && s.extent.height >= req.height
+        }) {
             super::counters::DrawCoverage::LoadedFullScissor
         } else {
             super::counters::DrawCoverage::LoadedPartialScissor

@@ -635,8 +635,18 @@ pub struct DrawEncodeRequest {
     pub fragment_textures: Vec<TextureBind>,
     pub vertex_samplers: Vec<SamplerBind>,
     pub fragment_samplers: Vec<SamplerBind>,
-    pub viewport: Option<[f64; 6]>,
-    pub scissor: Option<ScissorRect>,
+    /// Every viewport the pass bound, in the guest's order, as
+    /// `[originX, originY, width, height, znear, zfar]`. Empty means the guest
+    /// bound none and the backend's full-target default stands.
+    ///
+    /// A list because `setViewports:count:` is one record with N entries, and
+    /// this device used to keep entry 0 and count the rest as a named loss.
+    /// Both backends take an array natively — `setViewports:count:` and
+    /// `vkCmdSetViewport` — so the only thing bounded to one was this field.
+    pub viewports: Vec<[f64; 6]>,
+    /// Every scissor rect the pass bound, in the guest's order. Entry `i` clips
+    /// viewport `i`; see [`Self::viewports`].
+    pub scissors: Vec<ScissorRect>,
     pub indexed: Option<IndexedDrawInfo>,
     pub blend_color: Option<[f32; 4]>,
     pub cull_mode: Option<u32>,
@@ -773,12 +783,12 @@ fn linux_m2v_draw_failure(error: &DrawError, req: &DrawEncodeRequest) -> crate::
             format!("[{}]", texture_bind_diag(&req.fragment_textures)),
         )
         .field(
-            "viewport",
-            format!("{:?}", req.viewport).replace(char::is_whitespace, ""),
+            "viewports",
+            format!("{:?}", req.viewports).replace(char::is_whitespace, ""),
         )
         .field(
-            "scissor",
-            format!("{:?}", req.scissor).replace(char::is_whitespace, ""),
+            "scissors",
+            format!("{:?}", req.scissors).replace(char::is_whitespace, ""),
         )
 }
 
@@ -1849,30 +1859,34 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         }
     }
 
+    // Both lists were built exactly one entry long from an `Option`, while the
+    // backend ABI beneath them has always taken a slice and `apply_viewports`
+    // has always called `setViewports:count:`. The only thing bounded to one
+    // was the field above; the count these carry is now the guest's own, and
+    // the backend refuses a count past `REIMS_VGPU_BACKEND_MAX_VIEWPORTS`
+    // rather than truncating it.
     let viewports: Vec<ReimsVgpuViewport> = req
-        .viewport
-        .map(|v| {
-            vec![ReimsVgpuViewport {
-                x: v[0] as f32,
-                y: v[1] as f32,
-                width: v[2] as f32,
-                height: v[3] as f32,
-                znear: v[4] as f32,
-                zfar: v[5] as f32,
-            }]
+        .viewports
+        .iter()
+        .map(|v| ReimsVgpuViewport {
+            x: v[0] as f32,
+            y: v[1] as f32,
+            width: v[2] as f32,
+            height: v[3] as f32,
+            znear: v[4] as f32,
+            zfar: v[5] as f32,
         })
-        .unwrap_or_default();
+        .collect();
     let scissors: Vec<ReimsVgpuScissor> = req
-        .scissor
-        .map(|r| {
-            vec![ReimsVgpuScissor {
-                x: r.x,
-                y: r.y,
-                width: r.width,
-                height: r.height,
-            }]
+        .scissors
+        .iter()
+        .map(|r| ReimsVgpuScissor {
+            x: r.x,
+            y: r.y,
+            width: r.width,
+            height: r.height,
         })
-        .unwrap_or_default();
+        .collect();
 
     // Pipeline color0 blend + optional stream blend color.
     let mut blend = ReimsVgpuBlendState {
@@ -2242,11 +2256,23 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         let seed_for_store = store_seed_policy(force_full_store, c.load_action, load_seed);
         // The same coverage question the draw census asks, from the same
         // helper: a scissor that reaches every texel is not a partial store.
-        let gva_partial =
-            seed_for_store.is_some() && req.scissor.is_some_and(|r| !r.covers(width, height));
+        //
+        // Exactly one rect, because this writes back *only* that rect and the
+        // rest of the attachment keeps its seed. With several rects the union
+        // is what the draw could have written, and storing the first alone
+        // would drop every texel the others covered — pixels the guest drew and
+        // this device then failed to publish, which is worse than storing more
+        // than was needed. So a multi-rect draw takes the full store, and the
+        // narrowing stays available for the single-rect case that has always
+        // used it.
+        let store_rect = match req.scissors.as_slice() {
+            [r] if !r.covers(width, height) => Some(*r),
+            _ => None,
+        };
+        let gva_partial = seed_for_store.is_some() && store_rect.is_some();
         let wrote = if c.mapping_id != 0 {
             if gva_partial {
-                let r = req.scissor.expect("gva_partial implies a scissor");
+                let r = store_rect.expect("gva_partial implies exactly one narrowing rect");
                 write_mapping_rgba8_rect(
                     state,
                     host,
@@ -2276,7 +2302,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         } else if c.target_gva != 0 {
             let allowed = sync_store_pages.get(i).and_then(|p| p.as_ref());
             if gva_partial {
-                let r = req.scissor.expect("gva_partial implies a scissor");
+                let r = store_rect.expect("gva_partial implies exactly one narrowing rect");
                 write_gva_rgba8_rect(
                     state,
                     host,

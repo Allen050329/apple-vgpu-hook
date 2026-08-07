@@ -1160,7 +1160,8 @@ fn stream_accum_upserts_buffer_and_viewport() {
         &mut out,
         &mut acc,
     );
-    let v = acc.viewport.expect("viewport");
+    assert_eq!(acc.viewports.len(), 1);
+    let v = acc.viewports[0];
     assert!((v[0] - 1.0).abs() < 1e-9);
     assert!((v[5] - 6.0).abs() < 1e-9);
 }
@@ -1824,8 +1825,8 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
         fragment_textures: Arc::default(),
         vertex_samplers: Arc::default(),
         fragment_samplers: Arc::default(),
-        viewport: None,
-        scissor: None,
+        viewports: Vec::new(),
+        scissors: Vec::new(),
         blend_color: None,
         cull_mode: None,
         front_facing: None,
@@ -1929,8 +1930,8 @@ fn nometal_draw_falls_back_to_type4_clear() {
         fragment_textures: Arc::default(),
         vertex_samplers: Arc::default(),
         fragment_samplers: Arc::default(),
-        viewport: None,
-        scissor: None,
+        viewports: Vec::new(),
+        scissors: Vec::new(),
         blend_color: None,
         cull_mode: None,
         front_facing: None,
@@ -2123,55 +2124,71 @@ fn dropped_clear_logs_once_per_reason_target() {
     ));
 }
 
-/// A plural viewport or scissor applies its first entry and counts the rest.
+/// A plural scissor record reaches the accumulator whole.
 ///
-/// Before `0x83`/`0x76` were decoded the whole record reached no arm, so a
-/// guest setting its viewport through `setViewports:count:` got none at all.
-/// Now it gets the first, and the counter says what a viewport-array model
-/// would have to hold.
+/// Before `0x83`/`0x76` were decoded the record reached no arm at all, so a
+/// guest setting its scissor through `setScissorRects:count:` got none. Then it
+/// got the first and a counter for the rest. Now it gets all of them, and this
+/// asserts the tail specifically: the fixture gives all three rects distinct,
+/// non-empty values, so a rail that kept only entry 0 — or that copied entry 0
+/// three times — fails here rather than passing on a degenerate fixture.
 #[test]
-fn a_plural_viewport_or_scissor_applies_one_and_counts_the_rest() {
+fn a_plural_scissor_record_reaches_the_accumulator_whole() {
     use crate::contract::endian::st64;
-    use crate::runtime::drain::store_route_count;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
 
-    let op = wire_render::OPCODE_SET_SCISSOR_RECTS;
-    let total = reims_vgpu_wire::OP_HEADER_LEN
-        + render::SCISSOR_RECTS_COUNT_LEN
-        + 3 * render::SCISSOR_PAYLOAD_LEN;
-    let mut command = vec![0u8; total];
-    st32(&mut command[0..], op);
-    st32(&mut command[4..], total as u32);
-    st64(&mut command[reims_vgpu_wire::OP_HEADER_LEN..], 3);
-    let e0 = reims_vgpu_wire::OP_HEADER_LEN + render::SCISSOR_RECTS_COUNT_LEN;
-    for (i, val) in [11u64, 22, 33, 44].into_iter().enumerate() {
-        st64(&mut command[e0 + i * 8..], val);
-    }
-
-    let before = store_route_count("render_extra_scissors_dropped");
-    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
-    assert_eq!(
-        acc.scissor,
-        Some(ScissorRect {
+    let rects = [
+        ScissorRect {
             x: 11,
             y: 22,
             width: 33,
-            height: 44
-        }),
-        "the first rect must reach the accumulator"
+            height: 44,
+        },
+        ScissorRect {
+            x: 55,
+            y: 66,
+            width: 77,
+            height: 88,
+        },
+        ScissorRect {
+            x: 99,
+            y: 100,
+            width: 101,
+            height: 102,
+        },
+    ];
+    let op = wire_render::OPCODE_SET_SCISSOR_RECTS;
+    let total = reims_vgpu_wire::OP_HEADER_LEN
+        + render::SCISSOR_RECTS_COUNT_LEN
+        + rects.len() * render::SCISSOR_PAYLOAD_LEN;
+    let mut command = vec![0u8; total];
+    st32(&mut command[0..], op);
+    st32(&mut command[4..], total as u32);
+    st64(
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN..],
+        rects.len() as u64,
     );
+    let e0 = reims_vgpu_wire::OP_HEADER_LEN + render::SCISSOR_RECTS_COUNT_LEN;
+    for (n, r) in rects.iter().enumerate() {
+        let at = e0 + n * render::SCISSOR_PAYLOAD_LEN;
+        for (i, val) in [r.x, r.y, r.width, r.height].into_iter().enumerate() {
+            st64(&mut command[at + i * 8..], u64::from(val));
+        }
+    }
+
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
     assert_eq!(
-        store_route_count("render_extra_scissors_dropped") - before,
-        2,
-        "the counter must name the entries dropped, not the record"
+        acc.scissors,
+        rects.to_vec(),
+        "every rect the guest set, in the guest's order"
     );
 
-    // One entry is the singular record and drops nothing.
-    let before = store_route_count("render_extra_scissors_dropped");
+    // The singular opcode is the same record at length one, and replaces the
+    // array rather than appending to it.
     let total = reims_vgpu_wire::OP_HEADER_LEN + render::SCISSOR_PAYLOAD_LEN;
     let mut command = vec![0u8; total];
     let op = wire_render::OPCODE_SET_SCISSOR;
@@ -2182,15 +2199,73 @@ fn a_plural_viewport_or_scissor_applies_one_and_counts_the_rest() {
     }
     handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
     assert_eq!(
-        acc.scissor,
-        Some(ScissorRect {
+        acc.scissors,
+        vec![ScissorRect {
             x: 1,
             y: 2,
             width: 3,
             height: 4
-        })
+        }],
+        "a record of one leaves one, not one prepended to the previous three"
     );
-    assert_eq!(store_route_count("render_extra_scissors_dropped"), before);
+}
+
+/// An empty rect anywhere in a plural record refuses the whole record.
+///
+/// The singular arm has always refused an empty rect and kept the previous one,
+/// because this rail cannot express "clip everything" and adopting a zero rect
+/// would leave the next draw's clip to whatever the backend makes of it. At
+/// array width the same reasoning forbids adopting the record with the empty
+/// slots left out: slot order is what a shader's `[[viewport_array_index]]`
+/// selects, so dropping slot 1 silently renumbers slot 2.
+#[test]
+fn an_empty_rect_in_a_plural_scissor_record_keeps_the_previous_state() {
+    use crate::contract::endian::st64;
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+
+    let good = ScissorRect {
+        x: 3,
+        y: 4,
+        width: 5,
+        height: 6,
+    };
+    acc.scissors = vec![good];
+
+    // Two rects, the second of them zero-width.
+    let op = wire_render::OPCODE_SET_SCISSOR_RECTS;
+    let total = reims_vgpu_wire::OP_HEADER_LEN
+        + render::SCISSOR_RECTS_COUNT_LEN
+        + 2 * render::SCISSOR_PAYLOAD_LEN;
+    let mut command = vec![0u8; total];
+    st32(&mut command[0..], op);
+    st32(&mut command[4..], total as u32);
+    st64(&mut command[reims_vgpu_wire::OP_HEADER_LEN..], 2);
+    let e0 = reims_vgpu_wire::OP_HEADER_LEN + render::SCISSOR_RECTS_COUNT_LEN;
+    for (i, val) in [11u64, 22, 33, 44].into_iter().enumerate() {
+        st64(&mut command[e0 + i * 8..], val);
+    }
+    let e1 = e0 + render::SCISSOR_PAYLOAD_LEN;
+    for (i, val) in [55u64, 66, 0, 88].into_iter().enumerate() {
+        st64(&mut command[e1 + i * 8..], val);
+    }
+
+    let before = store_route_count("render_scissor_empty_kept_previous");
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    assert_eq!(
+        store_route_count("render_scissor_empty_kept_previous") - before,
+        1,
+        "an empty rect must name itself even when it is not the only one"
+    );
+    assert_eq!(
+        acc.scissors,
+        vec![good],
+        "the record is refused whole, including the non-empty rect beside the empty one"
+    );
 }
 
 /// A bind past the table's last slot says how many slots it dropped, and
@@ -2674,13 +2749,13 @@ fn a_decoded_record_that_no_arm_applies_names_what_happened_instead() {
     let (op, command) = scissor(64, 32);
     handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
     assert_eq!(
-        acc.scissor,
-        Some(ScissorRect {
+        acc.scissors,
+        vec![ScissorRect {
             x: 7,
             y: 9,
             width: 64,
             height: 32
-        })
+        }]
     );
 
     let before = store_route_count("render_scissor_empty_kept_previous");
@@ -2692,13 +2767,13 @@ fn a_decoded_record_that_no_arm_applies_names_what_happened_instead() {
         "an empty scissor must name itself"
     );
     assert_eq!(
-        acc.scissor,
-        Some(ScissorRect {
+        acc.scissors,
+        vec![ScissorRect {
             x: 7,
             y: 9,
             width: 64,
             height: 32
-        }),
+        }],
         "and behaviour is unchanged: the previous rect is still what is kept"
     );
 

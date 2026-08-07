@@ -303,14 +303,17 @@ pub struct DrawRequest {
     /// Metal baseInstance / Vulkan firstInstance. Constant step-function shift uses this.
     pub base_instance: u32,
     pub primitive_topology: PrimitiveTopology,
-    /// The guest's viewport, when it bound one. At most one: Metal's
-    /// `setViewports:` array reaches us as a single decoded viewport per draw,
-    /// and the engine binds exactly `cmd_set_viewport(.., &[one])`. `None`
-    /// takes the full-target default.
-    pub viewport: Option<ViewportResource>,
-    /// The guest's scissor rect, when it bound one, on the same terms as
-    /// [`Self::viewport`].
-    pub scissor: Option<ScissorResource>,
+    /// Every viewport the guest bound, in its order. Empty takes the
+    /// full-target default, and so does any slot past the end of this list when
+    /// [`Self::scissors`] is longer — the two counts are independent in Metal
+    /// and must be one number in a Vulkan pipeline, so the shorter list is
+    /// defaulted per slot rather than the longer one truncated.
+    pub viewports: Vec<ViewportResource>,
+    /// Every scissor rect the guest bound, in its order, on the same terms as
+    /// [`Self::viewports`]. Slot `i` clips viewport `i`.
+    pub scissors: Vec<ScissorResource>,
+    // `viewport_slot_count` below is the one reader that turns the two lists
+    // above into the single number Vulkan wants.
     pub indexed: Option<IndexedDrawResource>,
     pub vertex_attributes: Vec<VertexAttributeResource>,
     pub storage_buffers: Vec<StorageBufferResource>,
@@ -403,6 +406,27 @@ pub struct DrawRequest {
     /// an INPUT_ATTACHMENT descriptor pointing at the color target's view.
     /// `false` (default) keeps the pass byte-identical to the pre-fetch engine.
     pub color_input: bool,
+}
+
+/// How many viewport/scissor slots one draw rasterizes into.
+///
+/// The single number a Vulkan pipeline declares and `vkCmdSetViewport` /
+/// `vkCmdSetScissor` must then bind exactly. It exists as a function rather
+/// than as two `len()` calls at two sites because those two sites are the
+/// pipeline key and the dynamic bind: if they ever disagree the draw is
+/// invalid, and the disagreement would be a validation-layer message rather
+/// than a compile error.
+///
+/// The maximum, not either count alone. Metal lets a guest set three viewports
+/// and one scissor rect; Vulkan requires `scissorCount == viewportCount`, so
+/// the shorter list is defaulted per slot in the bind rather than the longer
+/// one truncated — truncating would drop a viewport the guest set, which is the
+/// thing this list exists to stop doing.
+///
+/// Never zero: a pipeline with no viewport rasterizes nothing, and an empty
+/// list means "the guest bound none", which takes the full-target default.
+pub fn viewport_slot_count(req: &DrawRequest) -> usize {
+    req.viewports.len().max(req.scissors.len()).max(1)
 }
 
 /// Descriptor binding of the attachment-0 framebuffer-fetch input attachment.

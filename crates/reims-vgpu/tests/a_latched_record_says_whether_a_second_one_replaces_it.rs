@@ -200,17 +200,20 @@ const VERDICTS: &[(&str, &str, Second, &str)] = &[
     ),
     (
         "StreamAccum",
-        "viewport",
+        "viewports",
         Second::ReplacesIt,
-        "setViewport:. A second one moves the viewport; it does not add a \
-         second. The plural `setViewports:` is a different record this rail \
-         declines rather than folding in here",
+        "setViewports:count:. A second record moves the viewports; it does not \
+         append to them, so this is assigned rather than extended and a record \
+         of two after a record of five leaves two. It is a collection because \
+         one *record* carries several, which is a different question from what \
+         a second record does — the singular `setViewport:` is this same field \
+         at length one",
     ),
     (
         "StreamAccum",
-        "scissor",
+        "scissors",
         Second::ReplacesIt,
-        "setScissorRect:, on the same reading as the viewport above",
+        "setScissorRects:count:, on the same reading as the viewports above",
     ),
     (
         "StreamAccum",

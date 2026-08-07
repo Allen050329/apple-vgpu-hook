@@ -28,11 +28,21 @@ use crate::observe::Decline;
 /// A request the engine understood and declined.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrawReason {
-    /// More than one viewport/scissor in a draw. Metal's multi-viewport
-    /// rasterization is not modelled.
     /// A resident target bound as a sampled image must be a plain 2D image;
     /// arrayed and volume residents have no bind path.
     ResidentSampledNot2d { binding: u32 },
+    /// The draw rasterizes into more viewport/scissor slots than the host can
+    /// declare in a pipeline.
+    ///
+    /// `limit` is `maxViewports` where `multiViewport` is advertised and `1`
+    /// where it is not, which is why both travel: "the host refused 4" reads
+    /// very differently from "the host refused 4 because it offers no multiple
+    /// viewports at all", and only the second is a whole missing feature.
+    ViewportSlotsUnsupported {
+        requested: u32,
+        limit: u32,
+        multi_viewport: bool,
+    },
     /// Same for a zero-copy guest-run sampled bind.
     GuestRunSampledNot2d { binding: u32 },
     /// More MRT secondary attachments than the render pass can carry.
@@ -139,6 +149,7 @@ impl crate::observe::Decline for DrawReason {
             Self::ResidentSampledNot2d { .. } => "resident_sampled_not_2d",
             Self::GuestRunSampledNot2d { .. } => "guest_run_sampled_not_2d",
             Self::SecondaryAttachmentCap { .. } => "secondary_attachment_cap",
+            Self::ViewportSlotsUnsupported { .. } => "viewport_slots_unsupported",
             Self::DepthWithSecondaryAttachments => "depth_with_secondary_attachments",
             Self::SamplerAnisotropyUnsupported => "sampler_anisotropy_unsupported",
             Self::SamplerMirrorClampToEdgeUnsupported => "sampler_mirror_clamp_to_edge_unsupported",
@@ -186,6 +197,15 @@ impl std::fmt::Display for DrawReason {
             Self::SecondaryAttachmentCap { requested, cap } => {
                 write!(f, " requested={requested} cap={cap}")
             }
+            Self::ViewportSlotsUnsupported {
+                requested,
+                limit,
+                multi_viewport,
+            } => write!(
+                f,
+                " requested={requested} limit={limit} multi_viewport={}",
+                u8::from(*multi_viewport)
+            ),
             Self::VertexFormat(reason) => write!(f, " value={}", reason.value()),
             Self::InstanceRateDivisorUnsupported { step_rate } => write!(f, " rate={step_rate}"),
             Self::InstanceRateDivisorOverLimit { step_rate, limit } => {
@@ -256,6 +276,11 @@ mod tests {
         DrawReason::SecondaryAttachmentCap {
             requested: 0,
             cap: 0,
+        },
+        DrawReason::ViewportSlotsUnsupported {
+            requested: 0,
+            limit: 0,
+            multi_viewport: false,
         },
         DrawReason::DepthWithSecondaryAttachments,
         DrawReason::SamplerAnisotropyUnsupported,

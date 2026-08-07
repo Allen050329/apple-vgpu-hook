@@ -5206,32 +5206,41 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             ),
             ..crate::backend::vulkan::engine::DrawRequest::default()
         };
-        resources.viewport =
-            req.viewport
-                .map(|vp| crate::backend::vulkan::engine::ViewportResource {
-                    x: vp[0] as f32,
-                    y: vp[1] as f32,
-                    width: vp[2] as f32,
-                    height: vp[3] as f32,
-                    min_depth: vp[4] as f32,
-                    max_depth: vp[5] as f32,
-                });
-        if let Some(scissor) = req.scissor {
+        resources.viewports = req
+            .viewports
+            .iter()
+            .map(|vp| crate::backend::vulkan::engine::ViewportResource {
+                x: vp[0] as f32,
+                y: vp[1] as f32,
+                width: vp[2] as f32,
+                height: vp[3] as f32,
+                min_depth: vp[4] as f32,
+                max_depth: vp[5] as f32,
+            })
+            .collect();
+        // The census takes slot 0, which is the rect it has always taken: with
+        // one scissor it is the whole answer, and with several it is the one a
+        // single-rect damage bound would have to start from.
+        if let Some(scissor) = req.scissors.first() {
             note_draw_coverage(
-                scissor,
+                *scissor,
                 w,
                 h,
                 req.colors.first().map(|c| c.load_action),
                 target_rgba8.is_some(),
                 chain_load_from_target,
             );
-            resources.scissor = Some(crate::backend::vulkan::engine::ScissorResource {
-                x: scissor.x,
-                y: scissor.y,
-                width: scissor.width,
-                height: scissor.height,
-            });
         }
+        resources.scissors = req
+            .scissors
+            .iter()
+            .map(|s| crate::backend::vulkan::engine::ScissorResource {
+                x: s.x,
+                y: s.y,
+                width: s.width,
+                height: s.height,
+            })
+            .collect();
         if let Some(idx) = req.indexed.as_ref() {
             let index_type = translate::raster::index_type(idx.index_type).ok_or({
                 DrawError::DrawPreparation(DrawPreparationDecline::IndexLoad {
@@ -8526,7 +8535,7 @@ mod vulkan_split_tests {
             "linux_m2v_draw reason=draw_prepare_pipeline_missing \
              task_id=0 pipeline_ref=41 pipe=41 task=0 geom=0x0 vtx=0 inst=0 \
              prim=0 first=0 idx=0 colors=[] vbuf=[] fbuf=[] vtex=[] ftex=[] \
-             viewport=None scissor=None"
+             viewports=[] scissors=[]"
         );
     }
 

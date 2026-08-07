@@ -178,22 +178,120 @@ fn viewport_scissor_known_color() {
     let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 32, 32);
-    req.viewport = Some(ViewportResource {
+    req.viewports = vec![ViewportResource {
         x: 0.0,
         y: 0.0,
         width: 32.0,
         height: 32.0,
         min_depth: 0.0,
         max_depth: 1.0,
-    });
-    req.scissor = Some(ScissorResource {
+    }];
+    req.scissors = vec![ScissorResource {
         x: 0,
         y: 0,
         width: 32,
         height: 32,
-    });
+    }];
     if let Some(px) = draw_or_skip("viewport_scissor", &req) {
         assert_fullscreen_fragment_color("viewport_scissor", &px, 32, 32);
+    }
+}
+
+/// A draw carrying several viewports builds a pipeline that declares as many,
+/// and binds exactly that many — on real hardware.
+///
+/// This is the pair that has to agree and that nothing else here can catch.
+/// `VkPipelineViewportStateCreateInfo::viewportCount` is **not** dynamic below
+/// `vkCmdSetViewportWithCount`, which is core in 1.3 while this device's floor
+/// is 1.2 — so the count is baked into the pipeline and `vkCmdSetViewport` must
+/// bind that same number. If the pipeline key and the bind ever compute it
+/// differently the draw is invalid, and the symptom is a validation-layer
+/// message or a driver-defined result rather than a compile error. Both sides
+/// call `engine::viewport_slot_count`; this runs them against a GPU.
+///
+/// Slot 0 covers the target and slot 1 is a quarter of it. With no
+/// `ViewportIndex` written by the fixture's vertex shader every primitive goes
+/// to slot 0, so the pixels must be exactly what the single-viewport test above
+/// produces: the second slot changes what the pipeline declares without
+/// changing what this geometry rasterizes.
+///
+/// Where the host advertises no `multiViewport` the engine declines by name and
+/// `draw_or_skip` yields nothing, which is the contract rather than a failure.
+#[test]
+fn two_viewports_build_and_bind_a_two_slot_pipeline() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let (w, h) = (32u32, 32u32);
+    let mut req = engine_req(&v, &f, w, h);
+    let vp = |width: f32, height: f32| ViewportResource {
+        x: 0.0,
+        y: 0.0,
+        width,
+        height,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    };
+    req.viewports = vec![vp(w as f32, h as f32), vp((w / 2) as f32, (h / 2) as f32)];
+    req.scissors = vec![
+        ScissorResource {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        },
+        ScissorResource {
+            x: 0,
+            y: 0,
+            width: w / 2,
+            height: h / 2,
+        },
+    ];
+    assert_eq!(
+        reims_vgpu::backend::vulkan::engine::viewport_slot_count(&req),
+        2,
+        "both lists are two long, so the pipeline must declare two slots"
+    );
+    if let Some(px) = draw_or_skip("two_viewports", &req) {
+        assert_fullscreen_fragment_color("two_viewports", &px, w, h);
+    }
+}
+
+/// The two lists need not be the same length, and the shorter one is defaulted
+/// per slot rather than the longer one truncated.
+///
+/// Metal lets a guest set two viewports and one scissor rect; Vulkan requires
+/// `scissorCount == viewportCount`. Truncating to the shorter list would drop a
+/// viewport the guest set, which is the loss this rail was widened to stop — so
+/// the count is the maximum and the missing scissor falls back to the full
+/// target.
+#[test]
+fn a_shorter_scissor_list_is_defaulted_rather_than_truncating_the_viewports() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let (w, h) = (32u32, 32u32);
+    let mut req = engine_req(&v, &f, w, h);
+    let vp = |width: f32, height: f32| ViewportResource {
+        x: 0.0,
+        y: 0.0,
+        width,
+        height,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    };
+    req.viewports = vec![vp(w as f32, h as f32), vp(4.0, 4.0)];
+    req.scissors = vec![ScissorResource {
+        x: 0,
+        y: 0,
+        width: w,
+        height: h,
+    }];
+    assert_eq!(
+        reims_vgpu::backend::vulkan::engine::viewport_slot_count(&req),
+        2,
+        "the longer list decides the count; the single scissor does not truncate it"
+    );
+    if let Some(px) = draw_or_skip("uneven_viewport_scissor", &req) {
+        assert_fullscreen_fragment_color("uneven_viewport_scissor", &px, w, h);
     }
 }
 
@@ -1996,12 +2094,12 @@ fn partial_draw_preserves_rgba_seed_on_bgra_target() {
     req.output_bgra = true;
     req.skip_readback = true;
     req.target_rgba8 = Some(std::sync::Arc::new(seed_rgba.repeat((w * h) as usize)));
-    req.scissor = Some(ScissorResource {
+    req.scissors = vec![ScissorResource {
         x: 0,
         y: 0,
         width: 1,
         height: 1,
-    });
+    }];
 
     match engine::execute_draw_request(&req) {
         Ok(_) => {}
@@ -2128,12 +2226,12 @@ fn a_bgra_ordered_seed_lands_the_same_pixels_as_the_rgba_ordered_one() {
         req.skip_readback = true;
         req.target_rgba8 = Some(std::sync::Arc::new(bytes.repeat((w * h) as usize)));
         req.target_seed_order = order;
-        req.scissor = Some(ScissorResource {
+        req.scissors = vec![ScissorResource {
             x: 0,
             y: 0,
             width: 1,
             height: 1,
-        });
+        }];
         match engine::execute_draw_request(&req) {
             Ok(_) => {}
             Err(e) if skip_if_no_gpu(&e.to_string()) => {
@@ -2384,7 +2482,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     // corner, read back, re-upload those pixels as the next pass's seed.
     let mut d1 = engine_req(&v, &f, w, h);
     d1.target_rgba8 = Some(std::sync::Arc::new(prior.clone()));
-    d1.scissor = Some(dot(0, 0));
+    d1.scissors = vec![dot(0, 0)];
     let p1 = match engine::execute_draw_request(&d1) {
         Ok(o) => semantic_rgba(&o),
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
@@ -2395,7 +2493,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     };
     let mut d2_cpu = engine_req(&v, &f, w, h);
     d2_cpu.target_rgba8 = Some(std::sync::Arc::new(p1.clone()));
-    d2_cpu.scissor = Some(dot(8, 8));
+    d2_cpu.scissors = vec![dot(8, 8)];
     let p2_cpu =
         semantic_rgba(&engine::execute_draw_request(&d2_cpu).expect("cpu seed after readback"));
 
@@ -2420,7 +2518,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     let mut g1 = engine_req(&v, &f, w, h);
     g1.target_identity = Some(identity.clone());
     g1.target_rgba8 = Some(std::sync::Arc::new(prior));
-    g1.scissor = Some(dot(0, 0));
+    g1.scissors = vec![dot(0, 0)];
     g1.skip_readback = false;
     let p1_resident =
         semantic_rgba(&engine::execute_draw_request(&g1).expect("resident store with readback"));
@@ -2434,7 +2532,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     g2.target_identity = Some(identity.clone());
     g2.load_from_target = true;
     g2.target_rgba8 = None;
-    g2.scissor = Some(dot(8, 8));
+    g2.scissors = vec![dot(8, 8)];
     g2.skip_readback = false;
     let p2_gpu = semantic_rgba(
         &engine::execute_draw_request(&g2).expect("load from a target that was read back"),

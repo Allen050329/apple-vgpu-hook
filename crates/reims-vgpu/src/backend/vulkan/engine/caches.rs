@@ -203,6 +203,18 @@ pub(crate) struct PipelineKey {
     /// distinct references reuse one pipeline. `None` keeps the depth-only /
     /// no-depth pipelines byte-identical to the pre-stencil engine.
     pub stencil: Option<StencilKey>,
+    /// How many viewport/scissor slots the pipeline declares.
+    ///
+    /// In the key because `VkPipelineViewportStateCreateInfo::viewportCount` is
+    /// **not** dynamic below `VK_EXT_extended_dynamic_state`
+    /// (`vkCmdSetViewportWithCount`), which is core in 1.3 and this device's
+    /// floor is 1.2. So the count is baked, `vkCmdSetViewport` must bind exactly
+    /// that many, and two draws sharing shaders and pass shape but rasterizing
+    /// into different numbers of viewports need different pipelines. It is one
+    /// number for both counts because Vulkan requires `scissorCount` to equal
+    /// `viewportCount`; [`super::viewport_slot_count`] is the only place that
+    /// decides it.
+    pub viewport_slots: u32,
     pub layout: LayoutKey,
 }
 
@@ -1100,9 +1112,12 @@ impl ObjectCaches {
         }
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        // Both counts are the key's one number: the viewports and scissors
+        // themselves are dynamic, but how many of them there are is not, and
+        // Vulkan requires the two counts to be equal.
         let vp_state = vk::PipelineViewportStateCreateInfo::default()
-            .viewport_count(1)
-            .scissor_count(1);
+            .viewport_count(key.viewport_slots)
+            .scissor_count(key.viewport_slots);
         // Cull mode, winding, fill mode and depth clip mode all come from the
         // guest; the last two were refused above where the host cannot spell
         // them, so reaching here means both are bindable.

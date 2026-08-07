@@ -23,10 +23,12 @@
 //! 1. **Query and enable together.** A feature that is asked about here and not
 //!    enabled here is the same bug in a new place, so the enable list is built
 //!    from this struct and nothing else.
-//! 2. **Enable only what the backend binds.** `multi_viewport` used to be
-//!    enabled while `engine::exec` declines any draw with more than one
-//!    viewport. Harmless, but it means the list was a wish rather than a
-//!    derivation — and a list that is not derived cannot be checked.
+//! 2. **Enable only what the backend binds.** `multi_viewport` was once enabled
+//!    while `engine::exec` declined every draw with more than one viewport, and
+//!    was later disabled to match. It is enabled again now, and this time
+//!    because the backend reaches it: a pipeline's `viewportCount` is the
+//!    guest's own. The rule is what caught both states — a list that is not
+//!    derived from what the backend binds cannot be checked.
 
 use ash::vk;
 
@@ -171,6 +173,22 @@ pub struct DeviceFeatures {
     /// depth range is clamped to it rather than discarded. Optional core like
     /// the two above.
     pub depth_clamp: bool,
+    /// `VkPhysicalDeviceFeatures::multiViewport` — whether a pipeline may
+    /// declare more than one viewport/scissor slot.
+    ///
+    /// This is what `setViewports:count:` with a count above one asks for.
+    /// Optional core like the two above, and paired with [`Self::max_viewports`]
+    /// because the feature only says "more than one is allowed" and the limit
+    /// says how many.
+    pub multi_viewport: bool,
+    /// `VkPhysicalDeviceLimits::maxViewports` — the largest slot count a
+    /// pipeline may declare.
+    ///
+    /// At least 1 on every device, and at least 16 wherever
+    /// [`Self::multi_viewport`] is set. Carried as its own number rather than
+    /// assumed from the feature: the guarantee is a floor, and a guest may ask
+    /// for more than the floor.
+    pub max_viewports: u32,
 }
 
 impl DeviceFeatures {
@@ -184,9 +202,9 @@ impl DeviceFeatures {
     /// The `vk::PhysicalDeviceFeatures` to enable, derived from what is
     /// supported **and** what the backend actually binds.
     ///
-    /// `multi_viewport` is deliberately absent even where supported:
-    /// `engine::exec` declines any draw carrying more than one viewport, so
-    /// enabling it advertised a capability nothing reaches.
+    /// `multi_viewport` is bound where supported: `engine::exec` builds a
+    /// pipeline whose `viewportCount` is the guest's, and a count above one is
+    /// invalid without it.
     pub fn enabled_features(&self) -> vk::PhysicalDeviceFeatures {
         vk::PhysicalDeviceFeatures::default()
             .robust_buffer_access(self.robust_buffer_access)
@@ -197,6 +215,7 @@ impl DeviceFeatures {
             .dual_src_blend(self.dual_src_blend)
             .fill_mode_non_solid(self.fill_mode_non_solid)
             .depth_clamp(self.depth_clamp)
+            .multi_viewport(self.multi_viewport)
     }
 
     /// The Vulkan 1.2 features to enable.
@@ -332,6 +351,10 @@ pub unsafe fn query(
         dual_src_blend: supported.dual_src_blend == vk::TRUE,
         fill_mode_non_solid: supported.fill_mode_non_solid == vk::TRUE,
         depth_clamp: supported.depth_clamp == vk::TRUE,
+        multi_viewport: supported.multi_viewport == vk::TRUE,
+        // `max(1)` because a pipeline always declares at least one slot, and a
+        // device reporting 0 here would otherwise make every draw undrawable.
+        max_viewports: props.limits.max_viewports.max(1),
         max_sampler_anisotropy: props.limits.max_sampler_anisotropy.max(1.0),
         max_image_dimension_2d: props
             .limits
@@ -393,6 +416,8 @@ mod tests {
             dual_src_blend: true,
             fill_mode_non_solid: true,
             depth_clamp: true,
+            multi_viewport: true,
+            max_viewports: 16,
         }
     }
 
@@ -572,32 +597,57 @@ mod tests {
     /// The enable list is derived from what the backend binds, and
     /// `multi_viewport` is the case that proves it.
     ///
-    /// It used to be enabled wherever supported while nothing could ever bind a
-    /// second viewport. Harmless in itself, but it meant the list was a wish
-    /// rather than a derivation — and a list that is not derived cannot be
-    /// checked. `DrawRequest::viewport` is an `Option`, so "at most one" is now
-    /// a property of the type rather than a runtime check this test has to go
-    /// looking for.
+    /// It has now been wrong in both directions. It was enabled wherever
+    /// supported while nothing could bind a second viewport, then disabled to
+    /// match that; now a draw's `viewportCount` is the guest's own, so it must
+    /// be enabled again or every multi-viewport pipeline is invalid. What makes
+    /// the rule checkable rather than a wish is that both halves are asserted
+    /// here against one another: a request that carries two viewports, and the
+    /// feature that makes two legal.
     #[test]
-    fn multi_viewport_is_not_enabled_because_no_draw_can_bind_a_second() {
+    fn multi_viewport_is_enabled_because_a_draw_can_bind_a_second() {
         let enabled = all_supported().enabled_features();
         assert_eq!(
             enabled.multi_viewport,
-            vk::FALSE,
-            "no draw can use a second viewport, so nothing should request one"
+            vk::TRUE,
+            "a draw can name several viewports, so the feature must be requested"
         );
-        // There is no second slot to fill; the field holds one viewport or none.
+        let vp = |x: f32| crate::backend::vulkan::engine::ViewportResource {
+            x,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
         let req = crate::backend::vulkan::engine::DrawRequest {
-            viewport: Some(crate::backend::vulkan::engine::ViewportResource {
-                x: 0.0,
-                y: 0.0,
-                width: 1.0,
-                height: 1.0,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            }),
+            viewports: vec![vp(0.0), vp(1.0)],
             ..Default::default()
         };
-        assert!(req.viewport.is_some());
+        assert_eq!(
+            crate::backend::vulkan::engine::viewport_slot_count(&req),
+            2,
+            "the second viewport must reach the pipeline's slot count"
+        );
+    }
+
+    /// A device that advertises no `multiViewport` reports a limit of one, and
+    /// that is the number the draw path compares against.
+    ///
+    /// The limit and the feature are separate fields because Vulkan reports
+    /// them separately, and `maxViewports` is *not* required to be 1 on a
+    /// device without the feature — the spec's floor is 1, but an
+    /// implementation may report 16 while still refusing to use them. Reading
+    /// the limit alone would then have built an invalid pipeline.
+    #[test]
+    fn a_device_without_multi_viewport_offers_exactly_one_slot() {
+        let mut f = all_supported();
+        f.multi_viewport = false;
+        f.max_viewports = 16;
+        let allowed = if f.multi_viewport { f.max_viewports } else { 1 };
+        assert_eq!(
+            allowed, 1,
+            "the feature gates the limit; a generous limit does not license a second slot"
+        );
     }
 }

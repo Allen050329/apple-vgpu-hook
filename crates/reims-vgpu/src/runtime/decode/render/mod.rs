@@ -487,6 +487,31 @@ impl ScissorRect {
     }
 }
 
+/// Lift one wire rect. Shared by the singular and plural scissor opcodes, which
+/// carry the identical element and differ only in how many of it follow.
+fn scissor_from_wire(r: &wire::ScissorRect) -> ScissorRect {
+    ScissorRect {
+        x: r.x.get() as u32,
+        y: r.y.get() as u32,
+        width: r.width.get() as u32,
+        height: r.height.get() as u32,
+    }
+}
+
+/// Lift one wire viewport, in the `[originX, originY, width, height, znear,
+/// zfar]` order both backends read it back in. Shared by the singular and
+/// plural viewport opcodes for the same reason as [`scissor_from_wire`].
+fn viewport_from_wire(v: &wire::Viewport) -> [f64; 6] {
+    [
+        v.origin_x.get(),
+        v.origin_y.get(),
+        v.width.get(),
+        v.height.get(),
+        v.znear.get(),
+        v.zfar.get(),
+    ]
+}
+
 /// The subresource coordinates and resolve target shared by all three
 /// attachment shapes, lifted so the arms that read them cannot drift apart.
 ///
@@ -614,8 +639,16 @@ pub struct Command {
     /// declares it `q` where every count beside it is `Q`, and a negative
     /// offset read as unsigned becomes a large index rather than an error.
     pub base_vertex: i64,
-    pub viewport: [f64; 6],
-    pub scissor: ScissorRect,
+    /// Every viewport a [`Kind::SetViewport`] record carried, in the guest's
+    /// order — the singular opcode's one, or all of `setViewports:count:`.
+    ///
+    /// A `Vec` rather than one entry plus a count, because the two forms are the
+    /// same record with a different length and the count used to be kept only to
+    /// say how many entries were being thrown away. Empty for every other kind.
+    pub viewports: Vec<[f64; 6]>,
+    /// Every scissor rect a [`Kind::SetScissor`] record carried, in the guest's
+    /// order. See [`Self::viewports`].
+    pub scissors: Vec<ScissorRect>,
     pub fence_ref: u32,
     /// Value of a [`Kind::SetRasterState`], [`Kind::SetStoreAction`] or
     /// [`Kind::SetVisibilityResultMode`] record.
@@ -1227,19 +1260,13 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             let v = wire::set_viewport(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetViewport;
             out.count = 1;
-            out.viewport = [
-                v.origin_x.get(),
-                v.origin_y.get(),
-                v.width.get(),
-                v.height.get(),
-                v.znear.get(),
-                v.zfar.get(),
-            ];
+            out.viewports = vec![viewport_from_wire(v)];
             Ok(out)
         }
         wire::OPCODE_SET_VIEWPORTS => {
-            // Count is kept: the executor models one viewport; further rects are
-            // a named loss. First viewport is still lifted.
+            // The whole array is lifted. `count` is the record's own, and the
+            // slice the wire view returns is already that long, so the two
+            // cannot disagree about how many the guest set.
             let (head, ports) = wire::set_viewports(&op).map_err(|_| DecodeStatus::ErrShort)?;
             let count = head.count.get();
             if count == 0 {
@@ -1247,27 +1274,14 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             }
             out.kind = Kind::SetViewport;
             out.count = count;
-            let v = ports.first().ok_or(DecodeStatus::ErrShort)?;
-            out.viewport = [
-                v.origin_x.get(),
-                v.origin_y.get(),
-                v.width.get(),
-                v.height.get(),
-                v.znear.get(),
-                v.zfar.get(),
-            ];
+            out.viewports = ports.iter().map(viewport_from_wire).collect();
             Ok(out)
         }
         wire::OPCODE_SET_SCISSOR => {
             let r = wire::set_scissor(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetScissor;
             out.count = 1;
-            out.scissor = ScissorRect {
-                x: r.x.get() as u32,
-                y: r.y.get() as u32,
-                width: r.width.get() as u32,
-                height: r.height.get() as u32,
-            };
+            out.scissors = vec![scissor_from_wire(r)];
             Ok(out)
         }
         wire::OPCODE_SET_SCISSOR_RECTS => {
@@ -1279,15 +1293,9 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             let Ok(count) = u32::try_from(count) else {
                 return Err(DecodeStatus::ErrCountOutOfRange);
             };
-            let r = rects.first().ok_or(DecodeStatus::ErrShort)?;
             out.kind = Kind::SetScissor;
             out.count = count;
-            out.scissor = ScissorRect {
-                x: r.x.get() as u32,
-                y: r.y.get() as u32,
-                width: r.width.get() as u32,
-                height: r.height.get() as u32,
-            };
+            out.scissors = rects.iter().map(scissor_from_wire).collect();
             Ok(out)
         }
         wire::OPCODE_SET_BLEND_COLOR => {

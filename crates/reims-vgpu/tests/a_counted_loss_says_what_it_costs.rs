@@ -297,23 +297,6 @@ const ROWS: &[(&str, Counted, &str)] = &[
          beside",
     ),
     (
-        "render_extra_viewports_dropped",
-        Counted::StateNotApplied,
-        "the plural viewport record carries `count` entries and this rail models \
-         exactly one, so `count - 1` are dropped and the counter is raised by \
-         that many with `note_store_route_n`. Narrower than it sounds — the \
-         plural selector is how a Metal app sets a single rect as often as not, \
-         and `count == 1` raises nothing. A non-zero reading is the argument for \
-         a viewport array and says how wide it would need to be",
-    ),
-    (
-        "render_extra_scissors_dropped",
-        Counted::StateNotApplied,
-        "the scissor half of the same record and the same tail, counted apart so \
-         a guest that sets many viewports and one scissor is distinguishable \
-         from one that sets many of both",
-    ),
-    (
         "mrt_secondary_dropped",
         Counted::BesideATypedDecline,
         "the `dropped` half of the MRT census, raised when an MRT draw arrived \
@@ -443,7 +426,7 @@ fn every_counted_loss_says_what_it_costs() {
     // directory carries: a scan that matched no counter argument would report
     // an empty population as fully adjudicated.
     assert!(
-        found.len() >= 30,
+        found.len() >= 28,
         "the scan found only {} counter-only loss slugs, so it is not parsing \
          `note_store_route` arguments and its verdict means nothing: {found:?}",
         found.len()
@@ -499,7 +482,7 @@ fn no_counted_loss_is_unread() {
 /// population without changing anything the guest sees.
 #[test]
 fn the_counted_loss_census_only_shrinks() {
-    const COUNTED_LOSS_CEILING: usize = 25;
+    const COUNTED_LOSS_CEILING: usize = 23;
     let losses = ROWS
         .iter()
         .filter(|(_, c, _)| matches!(c, Counted::StateNotApplied | Counted::WorkNotExecuted))

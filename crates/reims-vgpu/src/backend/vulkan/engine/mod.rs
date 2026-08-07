@@ -56,6 +56,7 @@ pub use types::{
     VertexAttributeResource, VertexStepFunction, ViewportResource, WindowPresentSource,
     COLOR_INPUT_BINDING,
 };
+pub use types::viewport_slot_count;
 pub(crate) use vk_call::{VkCall, VkOp};
 #[cfg(feature = "host-window")]
 pub(crate) use window_present::{WindowCpuFrame, WindowPresentOutcome};

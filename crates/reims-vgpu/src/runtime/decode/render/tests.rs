@@ -1802,14 +1802,22 @@ fn a_plural_viewport_or_scissor_is_the_singular_record_behind_its_own_count() {
     assert_eq!(c.kind, Kind::SetScissor);
     assert_eq!(c.count, 2);
     assert_eq!(
-        c.scissor,
-        ScissorRect {
-            x: 0x11,
-            y: 0x22,
-            width: 0x33,
-            height: 0x44
-        },
-        "the record was read at the viewport record's count width"
+        c.scissors,
+        vec![
+            ScissorRect {
+                x: 0x11,
+                y: 0x22,
+                width: 0x33,
+                height: 0x44
+            },
+            ScissorRect {
+                x: 0x55,
+                y: 0x66,
+                width: 0x77,
+                height: 0x88
+            }
+        ],
+        "both rects, in the guest's order, at the record's own count width"
     );
 
     // Two viewports, four-byte count.
@@ -1826,7 +1834,14 @@ fn a_plural_viewport_or_scissor_is_the_singular_record_behind_its_own_count() {
     let c = decode(&v).expect("two viewports");
     assert_eq!(c.kind, Kind::SetViewport);
     assert_eq!(c.count, 2);
-    assert_eq!(c.viewport, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    assert_eq!(
+        c.viewports,
+        vec![
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            [100.0, 101.0, 102.0, 103.0, 104.0, 105.0]
+        ],
+        "the second viewport is the guest's second, not a copy of the first"
+    );
 
     // A count of zero names no rect, and a record that cannot hold the
     // count it claims is refused rather than read short.
@@ -1850,7 +1865,8 @@ fn a_plural_viewport_or_scissor_is_the_singular_record_behind_its_own_count() {
     );
     st64(&mut v[OP_HEADER_LEN..], 0x99);
     let c = decode(&v).expect("singular scissor");
-    assert_eq!(c.scissor.x, 0x99);
+    assert_eq!(c.scissors.len(), 1);
+    assert_eq!(c.scissors[0].x, 0x99);
     assert_eq!(c.count, 1);
 }
 

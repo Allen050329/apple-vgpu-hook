@@ -137,33 +137,6 @@ pub(super) fn reset_unimplemented_opcode_dedup_for_test() {
     }
 }
 
-/// Count the entries of a plural viewport or scissor record this rail cannot
-/// hold.
-///
-/// Both records carry `count` entries and this rail models exactly one, so
-/// entries past the first are dropped. That is a narrower loss than it sounds —
-/// the plural selectors are how Metal apps set a single rect as often as not,
-/// and `count == 1` is the same record as the singular opcode — but it is a
-/// loss, and before these opcodes were decoded at all the *whole* record was
-/// dropped rather than its tail.
-///
-/// A non-zero reading is the argument for modelling a viewport array, and it
-/// says how many entries such a model would have to hold. `count == 0` never
-/// reaches here: the decoder refuses it.
-pub(super) fn note_extra_state_entries(what: &'static str, count: u32) {
-    let extra = count.saturating_sub(1);
-    if extra == 0 {
-        return;
-    }
-    crate::runtime::drain::note_store_route_n(
-        match what {
-            "viewport" => "render_extra_viewports_dropped",
-            _ => "render_extra_scissors_dropped",
-        },
-        extra as u64,
-    );
-}
-
 /// A `setScissorRect:` naming a rect with no area.
 ///
 /// The five `has_*` guards beside this one in the render dispatch are the
