@@ -360,6 +360,37 @@ pub fn host_alloc_len(bytes: u64) -> Option<usize> {
         .filter(|&n| n <= isize::MAX as usize)
 }
 
+/// The vertex fetch stride in force for one buffer index.
+///
+/// `setVertexBuffer:offset:attributeStride:atIndex:` overrides whatever the
+/// pipeline's `MTLVertexBufferLayoutDescriptor` declared for that index, so the
+/// bind wins where it carried one and `pipeline_stride` stands where it did not.
+///
+/// One function rather than the rule spelled at each backend, because both arms
+/// consume the same two inputs and a divergence between them would be a
+/// difference in *geometry* — a mesh fetched at the wrong stride still
+/// rasterizes, so nothing downstream reports it. The Metal arm reads this into
+/// `ReimsVgpuBuffer::attribute_stride`; the Vulkan arm reads it into
+/// `AttrKey::stride`, where it is already part of the pipeline key.
+///
+/// A stride wider than `u32` is left to the pipeline's own: it cannot reach
+/// either backend, since Metal's ABI mirror and Vulkan's
+/// `VkVertexInputBindingDescription::stride` are both 32-bit, and silently
+/// truncating a guest `u64` would fetch at an unrelated stride rather than at
+/// the one asked for.
+pub fn bind_attribute_stride(
+    vertex_buffers: &[BufferBind],
+    buffer_index: u32,
+    pipeline_stride: u32,
+) -> u32 {
+    vertex_buffers
+        .iter()
+        .find(|b| b.index == buffer_index)
+        .and_then(|b| b.attribute_stride)
+        .and_then(|s| u32::try_from(s).ok())
+        .unwrap_or(pipeline_stride)
+}
+
 /// BGRA<->RGBA channel swap (swap byte 0 and 2 of each 4-byte pixel) producing a
 /// fresh `Vec`, in a SINGLE read+write pass. Replaces the `src.to_vec()` +
 /// in-place `chunks_exact_mut(4)` swizzle-loop idiom, which walked the pixel data
@@ -1735,6 +1766,12 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         // `raw_metal::set_buffer_with_attribute_stride` reads them — and the
         // render path wrote zeros into them because nothing above it carried a
         // stride to write.
+        // The `Option` itself, not `bind_attribute_stride`. That function
+        // answers "which stride is in force", which needs a pipeline stride to
+        // fall back to and this rail has none to hand — and collapsing the
+        // absent case onto a zero would lose `Some(0)`, a legal Metal request
+        // that fetches every vertex from one address. `has_attribute_stride`
+        // is precisely the `is_some`, which is why the ABI carries both fields.
         if let Some(stride) = req
             .vertex_buffers
             .iter()

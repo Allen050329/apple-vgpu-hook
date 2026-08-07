@@ -4420,13 +4420,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // against this device's 1.2 floor. So two draws sharing shaders and
             // differing only in a guest-supplied stride already get their own
             // pipelines, with no change to the key.
-            let stride = req
-                .vertex_buffers
-                .iter()
-                .find(|b| b.index == a.buffer_index)
-                .and_then(|b| b.attribute_stride)
-                .and_then(|s| u32::try_from(s).ok())
-                .unwrap_or(a.stride);
+            let stride =
+                super::bind_attribute_stride(&req.vertex_buffers, a.buffer_index, a.stride);
             if a.format == 0 || stride == 0 {
                 continue;
             }

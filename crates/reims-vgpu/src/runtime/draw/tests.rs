@@ -4967,3 +4967,40 @@ fn every_buffer_span_refusal_has_its_own_reason_slug() {
     assert!(super::buffer_refusal_detail(all[0], 12).is_empty());
     assert!(super::buffer_refusal_detail(all[3], 12).is_empty());
 }
+
+/// The bind's stride wins over the pipeline's, and only where it exists.
+///
+/// Four cases, and three of them are the ones a shorter test would miss. The
+/// interesting field is `Option<u64>` against a `u32` consumer, so:
+///
+/// * `Some(0)` must not read as "no stride". A zero stride is a legal Metal
+///   request — every vertex fetched from one address — and collapsing it onto
+///   the absent case would silently restore the pipeline's stride instead.
+/// * a stride wider than `u32` must fall back rather than truncate. Both
+///   backends carry a 32-bit stride, and `s as u32` on a guest `u64` fetches at
+///   an unrelated number rather than at the one asked for.
+/// * a bind at a *different* index must not answer for this one.
+#[test]
+fn a_bind_stride_overrides_the_pipeline_stride_only_where_it_exists() {
+    let bind = |index: u32, attribute_stride: Option<u64>| BufferBind {
+        index,
+        buffer_ref: 1,
+        offset: 0,
+        attribute_stride,
+    };
+
+    // No bind at this index: the pipeline's stride stands.
+    assert_eq!(bind_attribute_stride(&[bind(3, Some(64))], 0, 12), 12);
+    // A bind carrying none: likewise.
+    assert_eq!(bind_attribute_stride(&[bind(0, None)], 0, 12), 12);
+    // A bind carrying one: it wins.
+    assert_eq!(bind_attribute_stride(&[bind(0, Some(64))], 0, 12), 64);
+    // Zero is a stride, not an absence.
+    assert_eq!(bind_attribute_stride(&[bind(0, Some(0))], 0, 12), 0);
+    // Past `u32`: the pipeline's stands rather than a truncation of the guest's.
+    assert_eq!(
+        bind_attribute_stride(&[bind(0, Some(u64::from(u32::MAX) + 1))], 0, 12),
+        12,
+        "a stride neither backend can carry must not be truncated into one they can"
+    );
+}
