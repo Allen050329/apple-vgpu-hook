@@ -4306,6 +4306,30 @@ pub(crate) fn fold_rung_child_doorbells(state: &mut DeviceState) {
 /// drop: the awaited work has not been submitted yet, the guest will submit it,
 /// and that submission rings its own doorbell. Holding is what a GPU does with a
 /// wait it cannot yet satisfy.
+///
+/// # The failure mode honouring the wait creates, named because it is new
+///
+/// A channel whose head packet cannot be decoded stops there: `drain_child_fifo`
+/// records the fault and breaks without advancing the head or writing the
+/// stamp, so that channel's slot never moves again. That has always been a
+/// stall of one channel. It is now a stall of **every timeline waiting on that
+/// channel's slot**, because they are correctly refusing to run ahead of work
+/// that will never complete.
+///
+/// This is faithful — a real GPU's waiters do not proceed past a wedged engine —
+/// and it is the direction to prefer, since the alternative was those timelines
+/// running ahead and corrupting silently. But it changes the *shape* of the
+/// symptom, and that is worth knowing before debugging one: a device that has
+/// gone quiet on several channels at once is more likely to have one wedged
+/// producer than several independent faults. `MalformedChildPacket` on the
+/// producing channel is the line to look for, and it will be the *earliest* of
+/// them; `stamp_hold_handed_back` climbing while nothing else moves is the
+/// secondary signal.
+///
+/// No escape hatch is offered on purpose. A hold that gave up after N rounds
+/// would be a bound on how long ordering is honoured, and it would fire on the
+/// healthy case — a guest that simply has not submitted the producing work yet —
+/// long before it ever reached a wedged one.
 fn retry_stamp_held_timelines<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
     while state.stamp_deferred_mask != 0 {
         let seq_before = state.completion_stamp_seq;
