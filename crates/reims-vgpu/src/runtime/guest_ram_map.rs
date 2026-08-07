@@ -221,6 +221,98 @@ pub fn reference<H: HostOps + ?Sized>(
     GuestRef::new(Arc::clone(import), slice).map_err(MapRefusal::OutsideImport)
 }
 
+/// One stretch of a scattered window: where it starts in the window, and the
+/// import reference covering it.
+///
+/// `window_offset` is a byte offset from the first byte the caller asked for,
+/// not from the start of a page and not from the start of the import. It is
+/// what a copy's source offset is measured in, which is the only thing a
+/// consumer needs and the only thing it may not compute for itself.
+#[derive(Debug)]
+pub struct GuestWindowRun {
+    /// Byte offset of this run's first byte within the requested window.
+    pub window_offset: u64,
+    /// The bindable reference for this run's bytes.
+    pub guest: GuestRef,
+}
+
+/// [`reference_for_pages`] for a window that is *not* one contiguous stretch:
+/// one reference per maximal GPA run, in window order.
+///
+/// # Why this exists as well as [`reference_for_pages`]
+///
+/// A driven x86 boot measured every guest surface at four 4 KiB pages per run —
+/// the guest backs a surface in 16 KiB physically-contiguous granules — so a
+/// 1920x1080 window is 2025 pages in 507 runs and *always* will be. See
+/// [`MapRefusal::Scattered`] for the distribution. A rail that only takes one
+/// contiguous stretch therefore never runs on a real workload, which is what
+/// the boot found: the import was `supported` and bound 8 KiB in 25 seconds.
+///
+/// # What the caller owes
+///
+/// Every returned run is a separate bind. A consumer that issues one GPU copy
+/// per run is correct; one that concatenates them is not, because nothing
+/// relates two runs' import offsets. The runs tile the window exactly — no
+/// gaps, no overlaps, ascending — and the tests below assert that rather than
+/// leaving it to be re-derived.
+///
+/// Runs are **not** bounded here. A bound belongs where the cost is, which is
+/// the consumer's region array, and a cap in this function would silently hand
+/// back a partial window — the failure mode that loses guest work quietly. A
+/// consumer that cannot issue N copies must refuse by name on the count it got.
+pub fn references_for_runs<H: HostOps + ?Sized>(
+    host: &mut H,
+    gpas: &[u64],
+    page_size: u64,
+    in_page: u64,
+    len: u64,
+) -> Result<Vec<GuestWindowRun>, MapRefusal> {
+    if gpas.is_empty() || page_size == 0 || len == 0 {
+        return Err(report_once(MapRefusal::Scattered {
+            pages: gpas.len(),
+            runs: 0,
+            first: gpas.first().copied().unwrap_or(0),
+        }));
+    }
+    // Absolute byte range this window occupies, measured from the first byte of
+    // `gpas[0]` — the same frame `in_page` is stated in. Page indices and run
+    // boundaries are both in this frame, so no step below re-derives it.
+    let window_start = in_page;
+    let window_end = in_page.checked_add(len).ok_or(MapRefusal::Scattered {
+        pages: gpas.len(),
+        runs: 0,
+        first: gpas[0],
+    })?;
+
+    let mut out = Vec::new();
+    for run in crate::runtime::gva_view::contig_page_runs(gpas, page_size) {
+        let run_start = (run.start as u64) * page_size;
+        let run_end = (run.end as u64) * page_size;
+        // Clip to the window: the first run usually starts before it (the
+        // window begins `in_page` bytes in) and the last usually ends after it.
+        let start = run_start.max(window_start);
+        let end = run_end.min(window_end);
+        if start >= end {
+            continue;
+        }
+        // Within a run the GPAs are contiguous by construction, so one add
+        // reaches any byte of it.
+        let gpa = gpas[run.start] + (start - run_start);
+        out.push(GuestWindowRun {
+            window_offset: start - window_start,
+            guest: reference(host, gpa, end - start)?,
+        });
+    }
+    if out.is_empty() {
+        return Err(report_once(MapRefusal::Scattered {
+            pages: gpas.len(),
+            runs: 0,
+            first: gpas[0],
+        }));
+    }
+    Ok(out)
+}
+
 /// [`reference`] for a decoded page list: `len` bytes starting `in_page` bytes
 /// into `gpas[0]`.
 ///
@@ -640,6 +732,117 @@ mod tests {
             assert!(
                 !matches!(out, Err(MapRefusal::Scattered { .. })),
                 "one contiguous stretch must not refuse as scattered"
+            );
+        });
+    }
+
+    /// The runs tile the requested window exactly: ascending, no gap, no
+    /// overlap, and summing to the length asked for.
+    ///
+    /// This is the property that keeps a scattered writeback from corrupting
+    /// guest memory, and every part of it is a real failure mode rather than a
+    /// tidiness rule. A gap leaves a band of the guest's surface holding the
+    /// previous frame while the rest updates. An overlap writes one stretch of
+    /// guest RAM twice from two different source offsets, so the winner is
+    /// whichever copy the GPU retires last. A sum short of `len` is a torn
+    /// frame; a sum past it is a write beyond the window the caller was given
+    /// — which the import's own bound would catch, but only after the plan had
+    /// already decided to make it.
+    ///
+    /// Asserted as a walk over the returned runs rather than as expected
+    /// tuples, so the test states the invariant instead of restating one
+    /// fixture's arithmetic.
+    #[test]
+    fn scattered_runs_tile_the_window_exactly() {
+        const PAGE: u64 = 4096;
+        // Four stretches, deliberately uneven: 3 + 1 + 2 + 3 pages.
+        let gpas: Vec<u64> = vec![
+            0x1000, 0x2000, 0x3000, // run 1
+            0x9000, // run 2
+            0x20000, 0x21000, // run 3
+            0x50000, 0x51000, 0x52000, // run 4
+        ];
+        // Start part-way into the first page and end part-way into the last, so
+        // the head and tail clips are both exercised. Neither end is page
+        // aligned, which is the normal case for a sample window.
+        let in_page = 100u64;
+        let len = PAGE * 8 + 55;
+
+        with_granularity(Some(PAGE), || {
+            let mut host = two_spans();
+            let runs = references_for_runs(&mut host, &gpas, PAGE, in_page, len)
+                .expect("a scattered window still resolves");
+            assert_eq!(runs.len(), 4, "one reference per contiguous stretch");
+
+            let mut expected_offset = 0u64;
+            for run in &runs {
+                assert_eq!(
+                    run.window_offset, expected_offset,
+                    "runs must be ascending and leave no gap"
+                );
+                let bound = run.guest.bound().expect("each run resolves in its import");
+                // `requested` is what the caller asked for; `bound_len` may be
+                // larger because the import rounds to its granularity. The tiling
+                // is a statement about the former.
+                expected_offset += run.guest.requested();
+                assert!(bound.len >= run.guest.requested());
+            }
+            assert_eq!(
+                expected_offset, len,
+                "the runs together must cover exactly the window asked for"
+            );
+        });
+    }
+
+    /// A window inside one stretch yields one run, so the widened path is not a
+    /// different answer for the case that already worked.
+    ///
+    /// Worth pinning because the two entry points now compute the same thing by
+    /// different routes: a divergence would mean a contiguous surface landed
+    /// differently depending on which rail asked, which is exactly the "two arms
+    /// consume one wire form" class.
+    #[test]
+    fn a_contiguous_window_is_one_run_and_agrees_with_the_single_reference() {
+        const PAGE: u64 = 4096;
+        let gpas: Vec<u64> = (0..4).map(|i| 0x1000 + i * PAGE).collect();
+        with_granularity(Some(PAGE), || {
+            let mut host = two_spans();
+            let runs = references_for_runs(&mut host, &gpas, PAGE, 64, PAGE * 3)
+                .expect("contiguous resolves");
+            assert_eq!(runs.len(), 1);
+            assert_eq!(runs[0].window_offset, 0);
+
+            let single = reference_for_pages(&mut host, &gpas, PAGE, 64, PAGE * 3)
+                .expect("and so does the single-range entry point");
+            assert_eq!(
+                runs[0].guest.bound().expect("bound"),
+                single.bound().expect("bound"),
+                "one stretch must bind identically whichever entry point asked"
+            );
+        });
+    }
+
+    /// A host with no import refuses the widened path by the same name, on the
+    /// same channel, as the narrow one.
+    ///
+    /// The widened path calls `reference` once per run, so a naive
+    /// implementation reports the host-wide refusal once per run — five hundred
+    /// identical lines for one fact about the machine. `report_once` is what
+    /// stops that, and this asserts it still does through the new caller.
+    #[test]
+    fn no_backend_import_stays_one_line_through_the_widened_path() {
+        const PAGE: u64 = 4096;
+        let gpas: Vec<u64> = vec![0x1000, 0x2000, 0x9000, 0x20000];
+        with_granularity(None, || {
+            let capture = crate::observe::FailCapture::start();
+            let mut host = two_spans();
+            let err = references_for_runs(&mut host, &gpas, PAGE, 0, PAGE).unwrap_err();
+            assert_eq!(err, MapRefusal::NoBackendImport);
+            let lines = capture.lines();
+            assert_eq!(
+                lines,
+                vec!["OFF guest_ram_map reason=guest_ram_map_no_backend_import"],
+                "one statement about the host, not one per run"
             );
         });
     }
