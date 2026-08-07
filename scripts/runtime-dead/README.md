@@ -282,3 +282,54 @@ discrete RTX 5080. The plan's §5 claim is about a **UMA** host, where the armed
 window count should go to zero. This boot cannot measure that, and its non-zero
 coverage is the dGPU rail working as designed rather than evidence against the
 claim.
+
+## The copying rails, measured: `--import-off`
+
+`--import-off` exports `REIMS_VGPU_GUEST_IMPORT=off` and reports into
+`/tmp/reims-vgpu-runtime-dead-import-off`. It is the other half of the ordinary
+run, not a variant of it: where the host can import guest RAM every guest window
+takes the import, so the copying rails run zero times and the ordinary report
+says nothing about them. Reason 7 above is that whole class.
+
+The run refuses unless `vk_caps` reports `host_pointer_import=disabled_by_env`.
+That guard is the point of the flag — an override that silently did not take
+produces a full report, self-consistent counters, and a directory named
+`-import-off` whose coverage is the ordinary run's. Diffed, it would show no
+copying rails at all, which reads as "the copying rails are dead".
+
+First paired reading, `cda0f2ff`, both runs x86 / Vulkan / host-window, driven
+`--seconds 25 --app Safari`:
+
+```
+import on    3450 functions   1413 never ran   regions 53.65%   functions 61.13%
+import off   3450 functions   1457 never ran   regions 52.50%   functions 59.72%
+```
+
+**Diff at file granularity, not at mangled-name granularity.** The mangled-name
+diff says 26 functions ran only with the import off and 70 only with it on, and
+both numbers are inflated for the reason the generics note above gives: one
+entry per instantiation, so a monomorphization that moved between runs counts as
+two changes and a workload that differed slightly counts as many.
+`model/lru_memo.rs` is the worked example — 4 of 10 functions executed in *both*
+runs, with three mangled names in the "only off" set. Per file, 20 files moved
+at all:
+
+| direction | files | what |
+|---|---|---|
+| import on reaches more | 14 | `runtime/guest_ram.rs` **19 → 2**, `engine/mod.rs` 84 → 71, `engine/exec.rs` 41 → 37, `engine/context.rs` 29 → 26, `engine/host_ram.rs` 4 → 1, `runtime/guest_window_regions.rs` 2 → 0 |
+| import off reaches more | 6 | `runtime/objects/mod.rs` +3, `runtime/draw/mod.rs` +3, `runtime/mapping_write/mod.rs` +1, `runtime/storage_flush/land.rs` +1, `runtime/decode/fifo.rs` +1, `engine/pools/mod.rs` +1 |
+
+Two things to take from it. First, `runtime/guest_ram.rs` collapsing from 19
+executed functions to 2 is an independent confirmation that the override took —
+it does not depend on the `vk_caps` string the guard reads, and it is the shape
+you should expect to see. Second, **the copying rails are about ten functions
+across six files, not a subsystem.** They are still not a deletion — the plan
+this instrument serves is explicit that they are the dGPU rail and the only rail
+on a host without the extension, and now there is a boot behind that rather than
+an argument. But do not quote the 26.
+
+What is *not* established: the two runs are two different Safari drags, so a
+one-function delta on a file that has nothing to do with importing is as likely
+to be workload variance as a rail. The deltas worth trusting are the large ones
+and the ones whose file is about the import decision. A third run would separate
+them and has not been done.
