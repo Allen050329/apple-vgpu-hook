@@ -52,6 +52,29 @@ pub mod blob;
 /// can be served as one.
 pub mod render_pso_key;
 
+// There is no fourth. `AGENTS.md` asks for pure logic under `backend/metal/` to
+// be moved out here so its tests run on every arm rather than on none, and the
+// three above are what that yielded; a survey of the rest found the remaining
+// candidates blocked rather than overlooked, and it is cheaper to say so than to
+// have the survey run again.
+//
+// Only `abi.rs`, `error.rs` and `util.rs` name nothing from the `metal` crate —
+// `abi.rs`'s apparent references are `MTL*` type names in prose, and its sole
+// import is `core::mem::offset_of`. All three are chained to `abi`, and `abi`
+// must stay where it is: it is a **mirror of an archived C header**, its
+// provenance is the point, and `contract::dispatch` and `contract::pass_action`
+// record the reasoning. The values that are genuinely shared — the ones that
+// arrive on the wire and are consumed by both backends — were already lifted
+// into `contract/`, with `const` assertions in the mirror pinning the two
+// spellings equal. Those assertions fire on every arm that compiles the mirror,
+// including the cross-compiled `--target aarch64-apple-darwin` clippy run, so
+// the mirror is not an untested file; it is tested by a mechanism `#[test]` was
+// the wrong tool for.
+//
+// `error.rs` then cannot follow on its own, because `Status::code` is defined in
+// terms of that header's `REIMS_VGPU_OK` / `_ERR_ARGS` / `_ERR_EXECUTE`, and
+// re-spelling three constants out here to free five tests is the duplication
+// `AGENTS.md` says to derive away rather than create.
 #[cfg(feature = "backend-metal")]
 // `Status` is 264 bytes — six inline `(key, value)` fields, no allocation — and
 // it is the `Err` of most of this module's functions, so `result_large_err` and
