@@ -14,7 +14,7 @@
 //!
 //! See [[map-memory2]] GPU-import model and HostOps `map_pages` / `unmap_pages`.
 
-use crate::contract::gva_resolve::{read_task_root, translate_root_run, ResolveStatus, Task};
+use crate::contract::gva_resolve::Task;
 use crate::model::{DeviceState, GvaHostView, TaskEntry, TaskTable};
 use crate::runtime::gva_mem::geometry_for_page_shift;
 use crate::runtime::host::{HostMemory, HostOps, MemError};
@@ -217,39 +217,22 @@ fn collect_span_gpas<M: HostMemory>(
         active: true,
         directory_pfn: task.directory_pfn,
     };
-    let root = read_task_root(&reader, &gr_task, geom).map_err(|_| MemError::TaskRootRead)?;
-    // The run walker declines a zero root or depth by not visiting at all,
-    // which below would read as an empty span. Refuse them with the status the
-    // per-page walk used to return.
-    if root.root_pfn == 0 {
-        return Err(MemError::Unresolved(ResolveStatus::ErrZeroRootPfn));
-    }
-    if root.depth == 0 {
-        return Err(MemError::Unresolved(ResolveStatus::ErrZeroDepth));
-    }
-    let pages = crate::runtime::gva_mem::pages_spanned(gva, length, page_size);
-    let mut gpas = Vec::with_capacity(pages as usize);
+    let mut gpas =
+        Vec::with_capacity(crate::runtime::gva_mem::pages_spanned(gva, length, page_size) as usize);
     let mut refused = None;
-    translate_root_run(
-        &reader,
-        geom,
-        root.root_pfn,
-        root.depth,
-        gva & !(page_size - 1),
-        pages,
-        &mut |_, r| match r {
-            Ok(gpa) => {
-                // HostOps map_pages expects page-aligned GPAs (page base, not
-                // +offset).
-                gpas.push(gpa & !(page_size - 1));
-                true
-            }
-            Err(status) => {
-                refused = Some(status);
-                false
-            }
-        },
-    );
+    // `walk_span` reports each page's own base, which is what HostOps
+    // `map_pages` takes.
+    crate::runtime::gva_mem::walk_span(&reader, geom, &gr_task, gva, length, &mut |_, r| match r {
+        Ok(page_base) => {
+            gpas.push(page_base);
+            true
+        }
+        Err(status) => {
+            refused = Some(status);
+            false
+        }
+    })
+    .map_err(crate::runtime::gva_mem::span_setup_error)?;
     if let Some(status) = refused {
         return Err(MemError::Unresolved(status));
     }
@@ -774,6 +757,7 @@ mod tests {
     use super::*;
     use crate::contract::endian::st32;
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::contract::gva_resolve::ResolveStatus;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
 

@@ -6,14 +6,30 @@
 //! 14 = arm64e). There is no arm-default overload — callers must choose.
 
 use crate::contract::gva_resolve::{
-    read_task_root, resolve_status_name, translate_root, translate_root_run, Geometry,
-    ResolveStatus, Task, ARM64E_GEOMETRY, X86_64_GEOMETRY,
+    read_task_root, resolve_status_name, translate_root, Geometry, ResolveStatus, Task,
+    ARM64E_GEOMETRY, X86_64_GEOMETRY,
 };
 use crate::model::{TaskEntry, TaskTable};
 use crate::runtime::host::{HostMemory, MemError};
 use reims_vgpu_wire::mem::GuestMemory;
 
-pub use reims_vgpu_paging::span::pages_spanned;
+pub use reims_vgpu_paging::span::{pages_spanned, walk_span};
+
+/// A span walk's setup refusal as this device's memory error.
+///
+/// One spelling, because three rails read bytes through [`walk_span`] and each
+/// would otherwise decide for itself which refusals mean "the directory did not
+/// read" and which mean "the walk refused". `ErrZeroRootPfn` and `ErrZeroDepth`
+/// are the walk's own answer about a table it could read; everything else here
+/// is a failure to get as far as the table.
+pub(crate) fn span_setup_error(status: ResolveStatus) -> MemError {
+    match status {
+        ResolveStatus::ErrZeroRootPfn | ResolveStatus::ErrZeroDepth => {
+            MemError::Unresolved(status)
+        }
+        _ => MemError::TaskRootRead,
+    }
+}
 
 /// [`HostMemory`]'s guest-physical reads as the wire crate's guest-memory
 /// seam. One address space — guest-physical — per that trait's hard rule.
@@ -62,41 +78,35 @@ pub fn read_task_gva<M: HostMemory>(
         active: true,
         directory_pfn: task.directory_pfn,
     };
-    let root = read_task_root(&reader, &gr_task, geom).map_err(|_| MemError::TaskRootRead)?;
-    // The run walker declines a zero root or depth by not visiting at all,
-    // which here would read as a successful read of nothing. Refuse them with
-    // the status the per-page walk used to return.
-    if root.root_pfn == 0 {
-        return Err(MemError::Unresolved(ResolveStatus::ErrZeroRootPfn));
-    }
-    if root.depth == 0 {
-        return Err(MemError::Unresolved(ResolveStatus::ErrZeroDepth));
-    }
     let (page, mask) = (geom.page_size(), geom.page_offset_mask());
-    let pages = pages_spanned(gva, buf.len() as u64, page);
     let mut filled = 0usize;
     let mut result: Result<(), MemError> = Ok(());
-    translate_root_run(&reader, geom, root.root_pfn, root.depth, gva, pages, &mut |_, r| {
-        let gpa = match r {
-            Ok(gpa) => gpa,
-            Err(status) => {
-                result = Err(MemError::Unresolved(status));
+    walk_span(
+        &reader,
+        geom,
+        &gr_task,
+        gva,
+        buf.len() as u64,
+        &mut |_, r| {
+            let page_base = match r {
+                Ok(gpa) => gpa,
+                Err(status) => {
+                    result = Err(MemError::Unresolved(status));
+                    return false;
+                }
+            };
+            let cur = gva.saturating_add(filled as u64);
+            let page_left = page - (cur & mask);
+            let n = (buf.len() - filled).min(page_left as usize);
+            if let Err(e) = host.read_gpa(page_base + (cur & mask), &mut buf[filled..filled + n]) {
+                result = Err(e);
                 return false;
             }
-        };
-        let cur = gva.saturating_add(filled as u64);
-        // Every page's answer carries the first page's offset; rebase it onto
-        // this page's own read position.
-        let read_gpa = (gpa & !mask) + (cur & mask);
-        let page_left = page - (cur & mask);
-        let n = (buf.len() - filled).min(page_left as usize);
-        if let Err(e) = host.read_gpa(read_gpa, &mut buf[filled..filled + n]) {
-            result = Err(e);
-            return false;
-        }
-        filled += n;
-        true
-    });
+            filled += n;
+            true
+        },
+    )
+    .map_err(span_setup_error)?;
     result
 }
 
@@ -293,26 +303,24 @@ pub fn write_task_gva<M: HostMemory>(
     let mut refused = None;
     {
         let reader = HostPhys(&*host);
-        let root = read_task_root(&reader, &gr_task, geom).map_err(|_| MemError::TaskRootRead)?;
-        if root.root_pfn == 0 {
-            return Err(MemError::Unresolved(ResolveStatus::ErrZeroRootPfn));
-        }
-        if root.depth == 0 {
-            return Err(MemError::Unresolved(ResolveStatus::ErrZeroDepth));
-        }
-        let pages = pages_spanned(gva, buf.len() as u64, page);
-        translate_root_run(&reader, geom, root.root_pfn, root.depth, gva, pages, &mut |_, r| {
-            match r {
-                Ok(gpa) => {
-                    page_gpas.push(gpa & !mask);
+        walk_span(
+            &reader,
+            geom,
+            &gr_task,
+            gva,
+            buf.len() as u64,
+            &mut |_, r| match r {
+                Ok(page_base) => {
+                    page_gpas.push(page_base);
                     true
                 }
                 Err(status) => {
                     refused = Some(status);
                     false
                 }
-            }
-        });
+            },
+        )
+        .map_err(span_setup_error)?;
     }
     if let Some(status) = refused {
         return Err(MemError::Unresolved(status));
@@ -614,9 +622,6 @@ fn visit_task_gva_pages<M: HostMemory>(
     page_shift: u32,
     visit: &mut dyn FnMut(Option<u64>) -> bool,
 ) {
-    if span == 0 {
-        return;
-    }
     let Some(geom) = geometry_for_page_shift(page_shift) else {
         return;
     };
@@ -631,22 +636,17 @@ fn visit_task_gva_pages<M: HostMemory>(
         active: true,
         directory_pfn: task.directory_pfn,
     };
-    let Ok(root) = read_task_root(&reader, &gr_task, geom) else {
-        return;
-    };
-    let page = geom.page_size();
     // Every page of the run, which is the shape the licence check and the
     // guest-run resolvers ask for. One descent is shared across the pages whose
     // upper indices match, instead of `depth` guest reads per page.
-    translate_root_run(
-        &reader,
-        geom,
-        root.root_pfn,
-        root.depth,
-        gva & !(page - 1),
-        pages_spanned(gva, span, page),
-        &mut |_, gpa| visit(gpa.ok().map(|g| g & !(page - 1))),
-    );
+    //
+    // A setup refusal visits nothing and is dropped rather than reported: this
+    // function's contract is that a caller compares what it saw against what it
+    // expected, so it is the only one of the span readers for which "no pages"
+    // is an answer rather than an error.
+    let _ = walk_span(&reader, geom, &gr_task, gva, span, &mut |_, r| {
+        visit(r.ok())
+    });
 }
 
 /// Every page of `[gva, gva+span)` in order, resolved through one root read and
