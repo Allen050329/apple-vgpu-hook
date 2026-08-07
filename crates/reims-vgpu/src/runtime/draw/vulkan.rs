@@ -2341,6 +2341,29 @@ pub(super) fn task_gva_guest_run_window<M: HostMemory + HostOps>(
 /// class is counted here, and the stretch count banded, on the census rather
 /// than the fail channel — nothing here is a new loss of guest work, it is the
 /// existing loss made countable.
+///
+/// # Four call sites, and only one of them is worth a fix
+///
+/// This function serves the draw-time buffer rail and three sampled ones, so a
+/// reader sizing the gather that these counters argue for will find both
+/// populations here and should not spend the effort twice. From the same boot,
+/// through `engine_delta`:
+///
+/// | rail | gathers | bytes the CPU moved |
+/// |---|---:|---:|
+/// | buffer (`stage_phase`'s `runs`) | 15 758 per second | 3.6 GB **per second** |
+/// | sampled (`sampled_gathers`) | 211 for the boot | 254 MB for the boot |
+///
+/// So the sampled rail is around two orders of magnitude off being the problem,
+/// even though its gathers are individually large (~1.2 MB each, they are
+/// textures). It is also the *easier* one to widen — its consumer already
+/// records a GPU copy into a command buffer, where the buffer rail's binds the
+/// span straight into the draw — which is exactly the trap: the tractable one
+/// and the expensive one are not the same rail.
+///
+/// `sampled_guest_imports` reads 4, for 8 192 bytes, against
+/// `buffer_guest_imports` at 0. Those four are single-page windows that happened
+/// to be one stretch, which is the same story the bands above tell.
 fn guest_page_window<M: HostOps>(
     host: &mut M,
     gpas: Vec<u64>,
