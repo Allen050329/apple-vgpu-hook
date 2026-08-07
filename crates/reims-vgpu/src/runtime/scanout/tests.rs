@@ -668,7 +668,8 @@ fn capture_forces_paint_even_when_painted_mid_gen_already_match() {
 /// The full-frame readback exists for exactly one reason: the DISPLAY needs
 /// CPU pixels. Two halves:
 ///
-/// - dmabuf carrying → NO readback, ever, however long since the last one.
+/// - a resident carrying (`display_from_resident`) → NO readback, ever, however
+///   long since the last one.
 ///   The proxies are fed by the GPU reduction instead, so there is no
 ///   sampling floor forcing a copy any more. `frame_bgra` is dropped rather
 ///   than left holding the previous readback, while the present metadata
@@ -679,7 +680,7 @@ fn capture_forces_paint_even_when_painted_mid_gen_already_match() {
 ///   buffer is what the content verdict and the console blit read as the
 ///   CURRENT frame. `full_captures` counts readbacks directly, so it answers
 ///   the question the assertion was actually asking.
-/// - dmabuf NOT carrying → the window blits `frame_bgra`, so the readback
+/// - no resident carrying → the window blits `frame_bgra`, so the readback
 ///   runs. This is what keeps the display off any env gate.
 #[test]
 fn readback_runs_only_for_the_display_never_for_the_proxies() {
@@ -701,7 +702,7 @@ fn readback_runs_only_for_the_display_never_for_the_proxies() {
     }
     assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
 
-    // dmabuf NOT carrying: the display needs pixels, so the readback runs.
+    // No resident carrying: the display needs pixels, so the readback runs.
     let frame_a = [0x11u8, 0x22, 0x33, 0xFF].repeat(4);
     assert!(write_bgra8(&mut state, &mut host, mid, &frame_a, 8, 2, 2));
     let gen_a = state.mappings.get(&mid).unwrap().content_generation;
@@ -709,12 +710,12 @@ fn readback_runs_only_for_the_display_never_for_the_proxies() {
     assert_eq!(
         &state.present.frame_bgra[..16],
         &frame_a[..],
-        "display fallback must read back when no dmabuf carries the frame"
+        "display fallback must read back when no resident carries the frame"
     );
     assert_eq!(state.present.full_captures, 1);
     assert_eq!(state.present.light_captures, 0);
 
-    // dmabuf carrying: there must be no readback.
+    // A resident carrying: there must be no readback.
     state.present.display_from_resident = true;
     let frame_b = [0x44u8, 0x55, 0x66, 0xFF].repeat(4);
     assert!(write_bgra8(&mut state, &mut host, mid, &frame_b, 8, 2, 2));

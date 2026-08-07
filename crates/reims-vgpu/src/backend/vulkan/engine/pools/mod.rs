@@ -374,13 +374,11 @@ pub(crate) struct ResourcePools {
     /// `vkAllocateMemory` whatever its size, and the pool takes ~1 500 of them
     /// a boot, clustered on the first composite after idle.
     host_slab: host_slab::HostSlabPool,
-    /// Guest page windows imported as `VkBuffer`s, kept across frames. Lives
-    /// here rather than beside its one consumer so it is destroyed by the same
-    /// teardown that destroys every other device object, and so the bound is
-    /// enforced against the pool that owns it. See [`dmabuf::ImportCache`].
     /// Every RAMBlock this device has imported as a host pointer. Not a cache:
     /// one entry per span the shim reported, held for the device's life, with
     /// no eviction — see `host_ram` for why adding one would be a mistake.
+    /// Lives here rather than beside its one consumer so it is destroyed by the
+    /// same teardown that destroys every other device object.
     host_ram_imports: host_ram::HostRamImports,
     /// Whether any command buffer recorded or submitted since the last quiesce
     /// **reads** guest RAM when it executes.
@@ -2202,25 +2200,27 @@ mod pool_trim_order_tests {
 /// its delivery site rather than here, because the pointer it lends is a `usize`
 /// the borrower reads after the engine lock is dropped.
 ///
-/// # What a driven boot measured
+/// # Which boot exercises this
 ///
-/// All three rails are on the copying path, which a host that can import a
-/// dma-buf never takes — so the boot that exercises them is the one with
-/// `REIMS_VGPU_DMABUF=off`, per `AGENTS.md`. Driven with the window-drag probe
-/// against Safari, x86 PCI attach, over 37 census windows: `zc_buffer_gathered`
-/// 266 319 CPU gathers through [`staging_write_ptr`], `render_flush_leased`
-/// 7 172 leases, `swap_rb_kb` 281 227 KiB through the swizzling writer, and
-/// `render_flush_gpu_declined` 7 172 — every flush taking the copying route.
-/// `dma_buf_import=disabled_by_env` and one `backend_cannot_import`, with no
-/// `guest_dmabuf_*` counter present at all, which is what says nothing exported
-/// past the closed gate.
+/// All three rails are on the copying path, which a host that can import guest
+/// RAM as a host pointer never takes — so the boot that exercises them is the
+/// one with `REIMS_VGPU_GUEST_IMPORT=off`, per `AGENTS.md`, driven with the
+/// window-drag probe rather than left idle. It took when `vk_caps` reports
+/// `host_pointer_import=disabled_by_env` and one `OFF guest_ram_map
+/// reason=guest_ram_map_no_backend_import` appears; nothing may then report a
+/// bound import, which is what says nothing bound past the closed gate. Such a
+/// boot puts the copying path's whole traffic through this one comparison —
+/// `zc_buffer_gathered` CPU gathers through [`staging_write_ptr`],
+/// `render_flush_leased` leases, `swap_rb_kb` through the swizzling writer, and
+/// one `render_flush_gpu_declined` per lease, every flush taking the copying
+/// route. No such boot has been run against this rail, so no traffic figures are
+/// quoted here rather than a stale one being read as current.
 ///
-/// None of the three refusals fired, which is the expected reading rather than a
-/// null one: `acquire_staging` and `acquire_readback` round a request up to a
-/// power-of-two bucket and record the *bucket* as the slot's size, so every live
-/// caller's span is inside it. The number worth keeping is the traffic — a
-/// quarter of a million gathers and seven thousand leases went through the new
-/// comparison without one false refusal.
+/// The three refusals not firing is the expected reading rather than a null one:
+/// `acquire_staging` and `acquire_readback` round a request up to a power-of-two
+/// bucket and record the *bucket* as the slot's size, so every live caller's
+/// span is inside it. One firing means a caller reached a span the bucketing
+/// does not cover, which is the thing worth knowing.
 ///
 /// Split out as a plain function so the rule is reachable without a Vulkan
 /// device, which is the same reason `ContextOwner::note_init_failure` is its

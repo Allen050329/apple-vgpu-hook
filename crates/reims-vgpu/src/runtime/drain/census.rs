@@ -255,9 +255,11 @@ pub enum ReadbackPhase {
     /// moving bytes is measured by what it does instead.
     Vouch,
     /// Everything else a flush does before the copy: resolve the sample window,
-    /// turn the page list into a dma-buf, and mark the write footprint. Also
-    /// `O(pages)`, and separate from `Vouch` because the two have different
-    /// fixes — one is a cache, the other is a smaller walk.
+    /// turn the page list into a slice of the imported RAMBlock, and mark the
+    /// write footprint. Also `O(pages)`, and separate from `Vouch` because the
+    /// two walks answer different questions and would be shortened differently —
+    /// this one turns page entries into addresses, that one licenses writing to
+    /// them at all.
     Resolve,
 }
 

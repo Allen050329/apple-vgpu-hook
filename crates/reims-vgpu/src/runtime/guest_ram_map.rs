@@ -32,7 +32,7 @@
 //!
 //! Every refusal here puts the whole boot on the copying rails for the
 //! addresses it covers, so none of them is a slow path and none may be silent.
-//! The one *expected* refusal is [`MapRefusal::NoBackendImport`]: a host without
+//! The one *expected* refusal is [`MapRefusal::NoBackendImport`](crate::runtime::guest_ram_map::MapRefusal::NoBackendImport): a host without
 //! the extension, or an operator who set
 //! [`crate::env::GUEST_IMPORT`](crate::env::GUEST_IMPORT) off. That one is a
 //! statement about the host rather than a loss, so it is reported once on the

@@ -10,10 +10,10 @@
 //!
 //! # One import per RAMBlock, and no cache
 //!
-//! The dma-buf rail this replaces needed a cache with an LRU and a pinned-byte
-//! bound, because creating an fd walked every page and took a kernel reference
-//! on each. Here the expensive step happens once per RAMBlock for the device's
-//! life and the cheap step — naming a range inside it — is a bounds check.
+//! The expensive step happens once per RAMBlock for the device's life, and the
+//! cheap step — naming a range inside it — is a bounds check. Nothing on the
+//! path a draw takes walks a page list, allocates, or takes a per-page kernel
+//! reference, so there is nothing left for a cache to amortise.
 //!
 //! So [`HostRamImports`] is a map with no eviction policy and no capacity. It
 //! holds at most one entry per span the shim reported, which on an ordinary

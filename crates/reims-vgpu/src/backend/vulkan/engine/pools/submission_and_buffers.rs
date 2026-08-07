@@ -1193,7 +1193,8 @@ impl ResourcePools {
     ///
     /// Split from the wait so the ledger half is testable without a device: it
     /// is what decides whether a stamp pays for this rail at all, and on a host
-    /// that cannot export a dma-buf the answer is always `false`.
+    /// that cannot import guest RAM as a host pointer the answer is always
+    /// `false`.
     pub(crate) fn take_guest_read_debt(&mut self) -> bool {
         std::mem::take(&mut self.guest_reads_in_flight)
     }
@@ -1218,7 +1219,7 @@ impl ResourcePools {
     /// ordered behind every draw the flush read.
     ///
     /// A no-op when nothing recorded a guest read, which is every packet on a
-    /// host with no dma-buf import.
+    /// host with no host-pointer import.
     pub(crate) unsafe fn quiesce_guest_reads(
         &mut self,
         ctx: &DeviceContext,
@@ -3415,7 +3416,7 @@ mod recycle_tests {
         assert!(
             !pools.take_guest_read_debt(),
             "a device that has recorded nothing owes no wait; this is every \
-             packet on a host with no dma-buf exporter"
+             packet on a host with no host-pointer import"
         );
 
         pools.note_guest_read_recorded();

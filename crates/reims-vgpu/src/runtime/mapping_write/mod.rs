@@ -196,15 +196,16 @@ fn refuse(mapping_id: u32, why: SurfaceWriteRefusal) -> bool {
 /// for alpha with nothing in the device able to say so.
 ///
 /// Neither case is reached on a healthy x86 desktop. Measured on driven Ventura
-/// boots with a Safari window drag, both with the dma-buf import available and
-/// with `REIMS_VGPU_DMABUF=off` — which is the run that matters here, because a
-/// capable host takes the import for every guest window and leaves the copying
-/// rails at zero. With the gate closed (`dma_buf_import=disabled_by_env`,
-/// `guest_dmabuf_*` absent) the copying rails carried the whole workload —
-/// `rt_type5_view_same` 7396, `t11rung_resident` 19177, `surface_flush` 7396
-/// against 55080 draws — and **no window failed to resolve**. Every bind came
-/// from a published descriptor, so the estimate above is the state before the
-/// guest fills one rather than a rung this device leans on.
+/// boots with a Safari window drag, both with the host-pointer import available
+/// and with `REIMS_VGPU_GUEST_IMPORT=off` — which is the run that matters here,
+/// because a capable host takes the import for every guest window and leaves the
+/// copying rails at zero. With the gate closed
+/// (`host_pointer_import=disabled_by_env`, nothing reporting a bound import) the
+/// copying rails carried the whole workload — every type-5 view, every type-11
+/// resident rung and every surface flush of the drag — and **no window failed to
+/// resolve**. Every bind came from a published descriptor, so the estimate above
+/// is the state before the guest fills one rather than a rung this device leans
+/// on.
 fn sample_window(
     m: &MappingEntry,
     plane_index: Option<u32>,
@@ -618,9 +619,9 @@ pub fn write_bgra8_uncached<M: HostMemory + HostOps>(
 /// Every variant is a routing answer and not a loss — the caller still lands the
 /// frame — but each one is a whole frame's worth of memcpy the device paid twice
 /// over, on the rail that is 69% of the drain worker's time. So they are named
-/// individually: "the GPU writeback declined" cannot tell a host with no
-/// `/dev/udmabuf` from a surface whose row pitch is not a whole texel, and those
-/// have different fixes.
+/// individually: "the GPU writeback declined" cannot tell a host whose GPU
+/// cannot import guest RAM from a surface whose row pitch is not a whole texel,
+/// and those have different fixes.
 #[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GpuWritebackDecline {
@@ -658,8 +659,8 @@ pub enum GpuWritebackDecline {
     OffsetNotTexelAligned { in_page: u64 },
     /// The mapping's page list does not cover the sample window.
     PageListShort { need: usize, have: usize },
-    /// A page in the window carries no valid entry, so there is no guest frame
-    /// to name in the export list.
+    /// A page in the window carries no valid entry, so there is no guest page
+    /// to resolve a reference against.
     PageUnbacked { index: usize },
     /// The page walk refused: these are no longer provably the mapping's pages.
     /// The copying rail refuses for the same reason and reports it.
@@ -734,11 +735,11 @@ crate::observe::decline::decline_display!(GpuWritebackDecline);
 /// Which of a mapping's pages a writeback's texels live in, and where inside
 /// them the first one is.
 ///
-/// A dma-buf names whole pages and starts at a page boundary; a sample window
-/// starts wherever the guest's plane descriptor put it. This is the translation
-/// between the two, and getting it wrong lands a frame at the wrong offset in
-/// the guest's memory — which is a visibly shifted surface at best and another
-/// allocation's bytes at worst.
+/// The guest reference this rail binds names whole pages and starts at a page
+/// boundary; a sample window starts wherever the guest's plane descriptor put
+/// it. This is the translation between the two, and getting it wrong lands a
+/// frame at the wrong offset in the guest's memory — which is a visibly shifted
+/// surface at best and another allocation's bytes at worst.
 #[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct GuestWindowPlan {
@@ -746,7 +747,7 @@ struct GuestWindowPlan {
     first_page: usize,
     last_page: usize,
     /// Byte offset of the frame's first texel within page `first_page`, which is
-    /// therefore its offset within the dma-buf.
+    /// therefore its offset within the guest reference the copy binds.
     in_page: u64,
     /// Guest row pitch in texels (`bufferRowLength`).
     row_length_texels: u32,
@@ -797,10 +798,10 @@ fn plan_guest_window(
             have: page_entries,
         });
     }
-    // The dma-buf starts at a page boundary, so the frame's first texel sits
-    // this far into it. Whole texels only, which is what `bufferOffset` requires
-    // and what a guest pitch in texels already implies for every row but the
-    // first.
+    // The guest reference starts at a page boundary, so the frame's first texel
+    // sits this far into it. Whole texels only, which is what `bufferOffset`
+    // requires and what a guest pitch in texels already implies for every row
+    // but the first.
     let in_page = base_off % page_size;
     if !in_page.is_multiple_of(u64::from(RGBA8_BPP)) {
         return Err(GpuWritebackDecline::OffsetNotTexelAligned { in_page });

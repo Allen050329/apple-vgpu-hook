@@ -22,8 +22,8 @@
 //!
 //! `AGENTS.md` bans source-grep scanners, and the test that used to hold the old
 //! ban was one. Its replacement is rule 1 of the "Before A Broad Sweep" ladder —
-//! *make the invariant unrepresentable*. [`GuestSlice`] has exactly one
-//! constructor, [`GuestRamImport::slice`], which bounds-checks with checked
+//! *make the invariant unrepresentable*. [`GuestSlice`](crate::runtime::guest_ram::GuestSlice) has exactly one
+//! constructor, [`GuestRamImport::slice`](crate::runtime::guest_ram::GuestRamImport::slice), which bounds-checks with checked
 //! arithmetic against the import's own length. There is no second way to build
 //! one, no public field that hands back a raw pointer or an absolute offset a
 //! call site could re-add to something, and no `From` conversion. A new import
@@ -32,7 +32,7 @@
 //!
 //! The absolute position of a slice inside its import is obtainable only by
 //! presenting the slice back to the import that made it
-//! ([`GuestRamImport::resolve`]), which is also where the cross-import check
+//! ([`GuestRamImport::resolve`](crate::runtime::guest_ram::GuestRamImport::resolve)), which is also where the cross-import check
 //! lives. That is the same rule as the C shim boundary in `AGENTS.md`: export
 //! what the backend binds, not the inputs it binds from.
 //!
@@ -57,7 +57,7 @@
 //!
 //! GPA → HVA is linear *within* a RAMBlock, so one import covers every guest
 //! page in it and a resource becomes an `(offset, len)` pair rather than a page
-//! list somebody has to export. That is what makes [`GuestRamImport::slice`]
+//! list somebody has to export. That is what makes [`GuestRamImport::slice`](crate::runtime::guest_ram::GuestRamImport::slice)
 //! free — no ioctl, no allocation, no cache, no kernel reference per page — and
 //! it is why a scattered surface is not un-importable: it is N slices over one
 //! import.

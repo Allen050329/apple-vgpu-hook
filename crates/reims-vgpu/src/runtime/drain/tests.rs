@@ -3947,16 +3947,16 @@ fn display_txn_trailer_width_matches_the_emitting_command() {
     assert_eq!(display_txn_trailer_len(CHILD_OP_DISPLAY_SWAP), 0x0c);
 }
 
-/// A present the dmabuf carried is not a black present.
+/// A present a resident carried is not a black present.
 ///
-/// Route B skips the full-frame GPU→CPU readback on purpose, so `frame_bgra` is
-/// empty by design and any `max_rgb == 0` test reports black on every present —
-/// a live boot logged 1338 `present_black_retain` records against 1312 presents.
-/// An always-on failure sink that fires on every healthy frame cannot surface the
-/// unhealthy one, so "no pixels" must be its own verdict rather than folded into
-/// "black".
+/// When the window presents the engine's own resident, the capture skips the
+/// full-frame GPU→CPU readback on purpose, so `frame_bgra` is empty by design and
+/// any `max_rgb == 0` test reports black on every present — a live boot logged
+/// 1338 `present_black_retain` records against 1312 presents. An always-on
+/// failure sink that fires on every healthy frame cannot surface the unhealthy
+/// one, so "no pixels" must be its own verdict rather than folded into "black".
 #[test]
-fn a_dmabuf_carried_present_is_unsampled_not_black() {
+fn a_resident_carried_present_is_unsampled_not_black() {
     assert_eq!(
         present_content_verdict(&[], 0),
         PresentContentVerdict::Unsampled,

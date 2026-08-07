@@ -281,11 +281,12 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// ```
 ///
 /// The third line is what a draw costs once it stops copying guest RAM on the
-/// CPU: the guest's pages reach the GPU as dma-buf imports for sampled textures
-/// and for vertex/storage binds, `stage_phase runs_us` falls from 111 ms of a
-/// worker second to 3.3 ms, and a draw goes from 111 µs to 78 µs. Nothing about
-/// the flush changed between the second and third lines. It is 59% of the worker
-/// because it is the last rail that still moves a whole frame per fence.
+/// CPU: the guest's pages reach the GPU as host-pointer imports for sampled
+/// textures and for vertex/storage binds, so the gather phase
+/// (`stage_phase runs_us`) all but vanishes from a worker second and a draw
+/// gets cheaper with it. Nothing about the flush changed between the second and
+/// third lines. It is 59% of the worker because it is the last rail that still
+/// moves a whole frame per fence.
 ///
 /// ## What is left inside a flush, and which lever moves it
 ///
@@ -318,8 +319,8 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// `registry_mark_ready` (which every path leaving new pixels in a resident
 /// already goes through, the same property that makes the `content_epoch`
 /// invalidation total), taken and reset by the flush, and used to narrow the
-/// copy, the page list, the dma-buf and the pin to a band of rows. Fail-closed
-/// on a CLEAR load action, on either seed form, and on a recycled image.
+/// copy, the page list and the imported range to a band of rows. Fail-closed on
+/// a CLEAR load action, on either seed form, and on a recycled image.
 ///
 /// It narrowed **nothing**. On a driven x86 Safari window-drag boot the census
 /// pair `flush_rows` / `flush_surface_rows` read *exactly equal on every line of
@@ -431,10 +432,11 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// needing to flush at all. Three routes were named; one has been built.
 ///
 /// - **Built.** The host copies are gone: the GPU writes the frame into the
-///   guest's pages through an imported dma-buf, so the flush is one copy instead
-///   of three passes over the frame. This is the near half of the "zero-copy
-///   endgame" — the *destination* is guest memory, though the resident's own
-///   image memory still is not, and cannot be while the resident is tiled.
+///   guest's pages through a host-pointer import, so the flush is one copy
+///   instead of three passes over the frame. This is the near half of the
+///   "zero-copy endgame" — the *destination* is guest memory, though the
+///   resident's own image memory still is not, and cannot be while the resident
+///   is tiled.
 /// - Making the undeclared guest read observable, so the writeback becomes
 ///   demand-driven everywhere rather than only on `SynchronizeResources`. That
 ///   is what would make the rail's cost proportional to its 0.7% of consumed
@@ -576,20 +578,21 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 ///   that reason. A registration on that range does trap the vCPU.
 ///
 ///   Guest RAM is **shmem, not anonymous**, and that changes which uffd mode
-///   applies. `vm/boot-x86.sh` passes `memory-backend-memfd,share=on` because a
-///   dma-buf export needs an fd-backed RAMBlock, so the paragraph this replaces
-///   — "plain `-m`, a conventional anonymous mapping, the case uffd handles
-///   best" — described a boot script that no longer exists.
+///   applies. Nothing about how the GPU reaches guest pages asks for that — a
+///   host-pointer import is taken over an ordinary mapping, so a plain `-m`
+///   allocation would serve it. `vm/boot-x86.sh` passes
+///   `memory-backend-memfd,share=on` for this section's own reason, and the
+///   consequence is favourable rather than not.
 ///
-///   The consequence is favourable rather than not. `MISSING` mode over shmem
-///   needs the page punched out of the *file*, which is the third hazard below;
-///   but a shared memfd keeps the content in the page cache, so the applicable
-///   primitive is minor-fault mode (`UFFD_FEATURE_MINOR_SHMEM`, Linux 5.19+;
-///   this host runs 7.1.3). A page unmapped from the VMA but still in the page
-///   cache raises a *minor* fault, and `UFFDIO_CONTINUE` maps the cached page
-///   back with no copy and no content to have captured first. That is the mode
-///   post-copy uses for shared memory, and it is the one a rail re-arming the
-///   same pages every frame wants: arming costs an unmap, not a punch.
+///   `MISSING` mode over shmem needs the page punched out of the *file*, which
+///   is the third hazard below; but a shared memfd keeps the content in the
+///   page cache, so the applicable primitive is minor-fault mode
+///   (`UFFD_FEATURE_MINOR_SHMEM`, Linux 5.19+; this host runs 7.1.3). A page
+///   unmapped from the VMA but still in the page cache raises a *minor* fault,
+///   and `UFFDIO_CONTINUE` maps the cached page back with no copy and no
+///   content to have captured first. That is the mode post-copy uses for shared
+///   memory, and it is the one a rail re-arming the same pages every frame
+///   wants: arming costs an unmap, not a punch.
 ///
 ///   None of which makes uffd available here — see the privilege section below,
 ///   which is unchanged and is what actually decides the mechanism.

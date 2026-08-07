@@ -1509,9 +1509,8 @@ fn every_admitted_resident_survives_past_the_retired_slot_cap() {
 }
 
 /// A `output_bgra` + `skip_readback` resident draw leaves content that
-/// [`engine::read_target`] can read back twice with the same answer — the
-/// property the deleted dmabuf-export case used as its precondition, kept
-/// because nothing else in this suite reads the same resident twice.
+/// [`engine::read_target`] can read back twice with the same answer — asserted
+/// here because nothing else in this suite reads the same resident twice.
 /// A `TargetIdentity::Surface` resident renders and reads back in guest scanout
 /// order **without the caller asking**, and says so; a pooled target does not.
 ///

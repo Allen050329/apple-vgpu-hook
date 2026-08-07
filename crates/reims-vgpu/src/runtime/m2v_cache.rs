@@ -395,8 +395,8 @@ impl Slot {
 ///
 /// It is also the shape the rest of this crate uses:
 /// [`crate::model::content_cache`] buckets by a `u64` prefilter and decides on
-/// `CacheEntry::matches`, and `runtime::guest_dmabuf` buckets by a digest of a
-/// page list and compares the list.
+/// `CacheEntry::matches`, and [`crate::backend::blob`] buckets a shader by its
+/// digest and decides on the retained bytes.
 ///
 /// This doc used to close by calling itself "the one digest-keyed cache in the
 /// crate that trusted its key", on the strength of a sweep run when it was

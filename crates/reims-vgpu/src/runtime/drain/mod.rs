@@ -533,14 +533,16 @@ pub(crate) enum PresentContentVerdict {
 
 /// Judge a present's captured frame.
 ///
-/// An empty `frame_bgra` is **not** a black frame. When a dmabuf carries the
-/// present (route B), `capture_present_frame` deliberately skips the full-frame
-/// GPU→CPU readback and leaves the buffer empty, so a plain `max_rgb == 0` test
-/// reports black on every such present — 1338 `present_black_retain` records
-/// against 1312 presents on a live boot. That buries the always-on log under a
-/// wolf-cry and hides the genuinely black frame the record exists to catch,
-/// which is the opposite of what an always-on failure sink is for. With no
-/// pixels there is no evidence either way, so the absence has its own verdict.
+/// An empty `frame_bgra` is **not** a black frame. When an engine resident
+/// carries the present — the window presents it from the engine's own device, so
+/// the frame never crosses host memory — `capture_present_frame` deliberately
+/// skips the full-frame GPU→CPU readback and drops the buffer, so a plain
+/// `max_rgb == 0` test reports black on every such present — 1338
+/// `present_black_retain` records against 1312 presents on a live boot. That
+/// buries the always-on log under a wolf-cry and hides the genuinely black frame
+/// the record exists to catch, which is the opposite of what an always-on
+/// failure sink is for. With no pixels there is no evidence either way, so the
+/// absence has its own verdict.
 pub(crate) fn present_content_verdict(frame_bgra: &[u8], max_rgb: u8) -> PresentContentVerdict {
     if frame_bgra.is_empty() {
         PresentContentVerdict::Unsampled
@@ -1129,7 +1131,7 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     crate::runtime::storage_flush::flush_all_windows_before_fence(state, host);
     // And the other half of that sentence: everything this device is still
     // *reading* out of guest RAM has to be done reading. A draw that binds guest
-    // pages through an imported dma-buf reads them when its command buffer
+    // pages through the imported RAMBlock reads them when its command buffer
     // executes, and this stamp is what tells the guest those pages are free to
     // repaint. The owed-writes flush above cannot stand in for it — it settles
     // residents into guest memory and knows nothing about what a submission
@@ -2550,13 +2552,14 @@ fn present_named_mapping<H: HostMemory + HostOps>(
             let (rgb_nz, max_rgb, px0) = crate::observe::bgra_rgb_stats(&state.present.frame_bgra);
             let verdict = present_content_verdict(&state.present.frame_bgra, max_rgb);
             if verdict == PresentContentVerdict::Unsampled {
-                // Not a decline: the dmabuf rail carried the frame, so there are
-                // no CPU pixels to judge and no guest work was lost.
-                // `present_black` below is the alarm. On that rail this is the
+                // Not a decline: an engine resident carried the frame to the
+                // window, so there are no CPU pixels to judge and no guest work
+                // was lost. `present_black` below is the alarm. Wherever the
+                // window presents from the engine's own device this is the
                 // normal outcome of every present.
                 crate::observe::line(format!(
                     "present_content_unsampled mid={mapping} {w}x{h} gen={gen} \
-                     (dmabuf carried the frame; no CPU pixels to judge)"
+                     (a resident carried the frame; no CPU pixels to judge)"
                 ));
             } else if verdict == PresentContentVerdict::Black {
                 // Both lines name the mapping the guest asked us to show and say
@@ -3829,11 +3832,11 @@ pub fn signal_display_vbl<H: HostMemory + HostOps>(
 ///   gathering scattered guest pages into staging. The CPU-copy arm of a
 ///   guest-sourced bind, and the one the import rail exists to empty.
 /// - `sampled_guest_imports` / `sampled_guest_import_bytes` — the same binds
-///   served by the GPU reading the guest's pages through a dma-buf, with no CPU
-///   copy at all. Ranked against `sampled_gathers`, these two divide every
-///   guest-sourced bind that had to move bytes into the ones that moved them
-///   over the host CPU and the ones that did not; a host with no exporter reads
-///   zero here and all of it there.
+///   served by the GPU reading the guest's pages through the imported RAMBlock,
+///   with no CPU copy at all. Ranked against `sampled_gathers`, these two divide
+///   every guest-sourced bind that had to move bytes into the ones that moved
+///   them over the host CPU and the ones that did not; a host that cannot import
+///   a host pointer reads zero here and all of it there.
 /// - `draw_cover_*` — how much of its target each draw could have written.
 ///   Nothing acts on it; it is what says whether bounding a flush to a damage
 ///   rect could pay, and the answer is a rate against `surface_flush` rather

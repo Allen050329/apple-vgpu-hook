@@ -5,12 +5,13 @@
 //! either by a decision or by the one-shot `vk_caps` line. There is
 //! deliberately no derived taxonomy on top of it: a classification nothing
 //! branches on cannot be wrong in a way anyone notices, and the one that used to
-//! live here was wrong — it printed `handoff=dmabuf_fd handoff_declined=[]` on
-//! boots where the dmabuf arm was never entered, because the ladder that produced
-//! the string and the branch that picks the present path were separate pieces of
-//! code that had never been made to agree. The `dmabuf` bit itself went the same
-//! way once the export rail it described was deleted: nothing branched on it and
-//! nothing could.
+//! live here was wrong. It was a `vk_caps` field naming which handoff the
+//! present path would take, and it named an arm those boots never entered —
+//! because the ladder that produced the string and the branch that picks the
+//! path were separate pieces of code that had never been made to agree. A
+//! capability line reports what was measured; the moment it becomes a second
+//! implementation of a decision, it is free to disagree with the first and
+//! nothing will catch it.
 //!
 //! * [`memory_topology::MemoryTopology`] — `Unified` vs `Discrete` selects an
 //!   allocation *preference*, never a different observable result. Live: every
@@ -19,8 +20,9 @@
 //!   enabled, in one place, so no site can ask about one it did not request.
 //! * [`host_pointer::HostPointerImport`] — whether guest RAM can reach the GPU
 //!   as a host-pointer import over a whole RAMBlock, and at what granularity.
-//!   The rail that replaces the dma-buf one on every host, because it is the
-//!   only primitive Linux, Windows and macOS all have. Same rule again: the
+//!   The one guest-memory rail on every host, because it is the only primitive
+//!   Linux, Windows and macOS all have — dma-buf is a Linux kernel object with
+//!   no equivalent on the other two. Same rule again: the
 //!   import site branches on it, and a negative rung names the check that
 //!   refused rather than reading as a slow host.
 //! * [`DriverQuirk`] — the only place driver identity may change behavior.

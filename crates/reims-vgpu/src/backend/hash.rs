@@ -1,10 +1,11 @@
 //! The two content hashes the Metal backend's compiled-object caches key on.
 //!
 //! Both are built from the FNV-1a parameters in [`crate::contract::fnv`]. The
-//! constants live there rather than here because three of the crate's four
-//! FNV callers are not backends at all, and this module was behind
-//! `feature = "backend-metal"` when they were written — so they could not name
-//! these and wrote the basis and the prime out as literals instead. Its
+//! constants live there rather than here because callers of theirs are not
+//! backends at all — the sampled gather witness and the panic latch both fold
+//! with them — and this module was behind `feature = "backend-metal"` when
+//! those were written, so they could not name these and wrote the basis and
+//! the prime out as literals instead. Its
 //! declaration in [`crate::backend`] says why it is no longer gated; the
 //! constants stay where they are, because that split is about who can *see*
 //! them and moving the module did not change who needs them.

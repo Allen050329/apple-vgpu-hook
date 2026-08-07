@@ -2,15 +2,16 @@
 //!
 //! # Why a backend-neutral home
 //!
-//! Four places in this crate fold with FNV-1a, and only one of them is a
-//! backend: the dma-buf window cache keys its page lists with it, the sampled
-//! gather witness names a window with it, and the Metal pipeline and sampler
-//! caches key shaders and descriptors with it. The constants used to be
-//! declared inside the Metal backend's own hash module, behind
-//! `feature = "backend-metal"` — so the two runtime sites *could not* name them
-//! even if their authors had looked, and both wrote the basis and the prime out
-//! as literals instead. (That module is [`crate::backend::hash`] now, and
-//! ungated, for a different reason its own doc gives.)
+//! Several places in this crate fold with FNV-1a, and only one family of them
+//! is a backend: the sampled gather witness names a window with it, the panic
+//! latch folds an entry point and its raise site into the discriminant it
+//! dedupes on, and the Metal backend's compiled-object caches key shaders and
+//! descriptors with it. The constants used to be declared inside the Metal
+//! backend's own hash module, behind `feature = "backend-metal"` — so the sites
+//! outside it *could not* name them even if their authors had looked, and wrote
+//! the basis and the prime out as literals instead. (That module is
+//! [`crate::backend::hash`] now, and ungated, for a different reason its own doc
+//! gives.)
 //!
 //! They wrote them out in different shapes. Before this module existed the
 //! basis appeared as `0xcbf2_9ce4_8422_2325` at three sites and as
@@ -22,7 +23,7 @@
 //! # What this module does and does not promise
 //!
 //! It promises the published FNV-1a 64-bit parameters and the exact fold every
-//! caller was already performing. It does **not** promise that the four callers
+//! caller was already performing. It does **not** promise that the callers
 //! produce comparable digests: each folds a different sequence, and two add
 //! their own finishing steps. Sharing the constants makes them agree on the
 //! algorithm, not on the keyspace — which is what was wanted, since the
@@ -49,10 +50,10 @@ pub fn fold_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
 
 /// Continue an FNV-1a fold over `value`'s little-endian bytes.
 ///
-/// Little-endian is not a choice this module gets to make: it is what the two
-/// runtime callers already did, and their digests key live caches. The byte
-/// order is fixed by [`fold_bytes`] seeing the same sequence on every host, so
-/// `to_le_bytes` is spelled here rather than `to_ne_bytes`.
+/// Little-endian is not a choice this module gets to make: it is what the
+/// runtime caller already did, and its digests name live sampled windows. The
+/// byte order is fixed by [`fold_bytes`] seeing the same sequence on every host,
+/// so `to_le_bytes` is spelled here rather than `to_ne_bytes`.
 pub fn fold_u64(hash: u64, value: u64) -> u64 {
     fold_bytes(hash, &value.to_le_bytes())
 }
@@ -85,11 +86,10 @@ mod tests {
         assert_eq!(FNV_PRIME, 1099511628211);
     }
 
-    /// [`fold_u64`] is [`fold_bytes`] over eight little-endian bytes, and the
-    /// two runtime callers depended on exactly that before they shared this
-    /// code. Written as an independent fold rather than by calling
-    /// `fold_bytes`, so a change to the byte order inside `fold_u64` is
-    /// visible here.
+    /// [`fold_u64`] is [`fold_bytes`] over eight little-endian bytes, and its
+    /// runtime caller depended on exactly that before it shared this code.
+    /// Written as an independent fold rather than by calling `fold_bytes`, so a
+    /// change to the byte order inside `fold_u64` is visible here.
     #[test]
     fn a_u64_folds_as_its_little_endian_bytes() {
         let value = 0x0123_4567_89ab_cdef_u64;
@@ -102,8 +102,9 @@ mod tests {
     }
 
     /// A fold is order-dependent, so a digest over a sequence names the
-    /// sequence and not just its members. Both runtime callers rely on this —
-    /// one folds a page list, the other a discriminant followed by fields.
+    /// sequence and not just its members. Both non-backend callers rely on this
+    /// — the gather witness folds a discriminant followed by its window's
+    /// fields, and the panic latch an entry point followed by its raise site.
     #[test]
     fn folding_two_values_depends_on_their_order() {
         let a = fold_u64(fold_u64(FNV_OFFSET_BASIS, 1), 2);

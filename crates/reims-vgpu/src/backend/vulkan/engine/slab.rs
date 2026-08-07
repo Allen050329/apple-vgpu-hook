@@ -369,7 +369,7 @@ impl SlabPool {
     ///
     /// Exact for what it covers and honest about what it does not: this is the
     /// DEVICE_LOCAL *image* slab only. HOST_VISIBLE staging (`host_slab`),
-    /// standalone compute-storage allocations, dma-buf imports and the present
+    /// standalone compute-storage allocations, imported guest RAM and the present
     /// path's own allocations are outside it. It is the pool the render-target
     /// population actually lands in, which is why it is the one worth having
     /// first.

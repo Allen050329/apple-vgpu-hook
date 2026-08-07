@@ -77,9 +77,9 @@ fn the_surface_window_names_which_measurement_is_which() {
 /// occupy, and no more.
 ///
 /// The last page is the one holding the last *texel*, not the one holding
-/// `bpr * height`. A plan that rounded up to the row pitch would pin — and
-/// hand the GPU write access to — a page past the surface on every flush of
-/// a padded layout, and the guest owns whatever is in it.
+/// `bpr * height`. A plan that rounded up to the row pitch would hand the GPU
+/// write access to a page past the surface on every flush of a padded layout,
+/// and the guest owns whatever is in it.
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_tight_window_names_the_pages_its_texels_occupy() {
@@ -98,12 +98,12 @@ fn a_tight_window_names_the_pages_its_texels_occupy() {
 }
 
 /// A window starting part-way into a page reports that offset, and the page
-/// it starts in is the first the dma-buf names.
+/// it starts in is the first the guest reference names.
 ///
-/// This is the whole reason the plan exists. The fd starts at a page
+/// This is the whole reason the plan exists. The reference starts at a page
 /// boundary and the sample window does not, so a copy that took the window's
 /// mapping offset as its `bufferOffset` would land the frame `first_page *
-/// page_size` bytes early — off the front of the export entirely for any
+/// page_size` bytes early — off the front of the reference entirely for any
 /// surface past the first page.
 #[cfg(feature = "backend-vulkan")]
 #[test]
@@ -120,7 +120,7 @@ fn a_window_starting_inside_a_page_carries_the_offset_and_not_the_mapping_one() 
 
 /// Page shift is explicit, so the same window plans differently on the two
 /// guests. A helper that assumed 4 KiB would name four times too many pages
-/// on arm64 and export three quarters of a surface it was never asked for.
+/// on arm64 and expose three quarters of a surface it was never asked for.
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn the_same_window_spans_fewer_pages_on_a_sixteen_kilobyte_guest() {

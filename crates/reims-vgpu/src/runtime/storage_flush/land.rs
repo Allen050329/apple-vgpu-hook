@@ -117,7 +117,7 @@ pub fn gva_window_identity(
 /// 24.4 µs over 18 KB is ~750 MB/s, which is the cache-cold guest-page write
 /// rate the ledger already quotes.
 ///
-/// ## The dma-buf arm is refuted, and not on performance grounds
+/// ## The GPU-direct arm is refuted, and not on performance grounds
 ///
 /// Giving this rail `render_flush_gpu_direct`'s shape — guest pages as the
 /// copy's destination — would delete `gva_write_us`, a quarter of the flush. It
@@ -130,10 +130,13 @@ pub fn gva_window_identity(
 /// what `read_target` exists to produce.
 ///
 /// So a GPU-direct arm would have to keep the readback *and* add a second
-/// submission for the dma-buf copy: it would pay `gva_read_us` unchanged, add a
-/// round trip, and save only the scatter. Strictly worse. The two channel-order
-/// and format questions it also raises (a GVA resident is RGBA where
-/// `copy_target_to_guest_pages` demands scanout order, and
+/// submission for the GPU-side copy: it would pay `gva_read_us` unchanged, add
+/// a round trip, and save only the scatter. Strictly worse — and the reference
+/// being cheap does not rescue it: naming the destination is a range check on
+/// an already-held import, but what the second submission adds is another fence
+/// to wait on, and that is the expensive half everywhere else in this file. The
+/// two channel-order and format questions it also raises (a GVA resident is RGBA
+/// where `copy_target_to_guest_pages` demands scanout order, and
 /// `convert_rgba8_to_row` is a straight copy only for the two RGBA8 formats)
 /// are real but do not need answering, because this one closes it first.
 ///
@@ -234,9 +237,10 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
     // `readback_split fence_us` pools this rail's fence with the render rail's,
     // so how much of a GVA flush is the GPU round trip and how much is the
     // three host passes has only ever been derived by algebra off `gpu_us`.
-    // The two answers point at different builds: a dma-buf destination removes
-    // the host passes and keeps the round trip, and recording the copy into the
-    // draw's own command buffer removes the round trip and keeps the passes.
+    // The two answers point at different builds: a guest-pages destination
+    // removes the host passes and keeps the round trip, and recording the copy
+    // into the draw's own command buffer removes the round trip and keeps the
+    // passes.
     let read_started = std::time::Instant::now();
     let read_target = crate::backend::vulkan::engine::read_target(&identity);
     crate::runtime::drain::note_store_route_us(
@@ -271,8 +275,9 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
         guest = "skip_drift";
     } else if guest_write {
         // The CPU scatter, timed against `gva_read_us`. This is the pass a
-        // dma-buf destination would delete and the round trip above is the one
-        // it would keep, so the two readings are what choose between the builds.
+        // guest-pages destination would delete and the round trip above is the
+        // one it would keep, so the two readings are what choose between the
+        // builds.
         let write_started = std::time::Instant::now();
         let written = crate::runtime::draw::write_gva_rgba8_within(
             state,
@@ -889,11 +894,11 @@ fn flush_render_one<M: HostMemory + HostOps>(
                     );
                 }
                 Err(decline) => {
-                    // Latched per mapping as well as per reason. A host with no
-                    // `/dev/udmabuf` declines every flush of every surface, and
-                    // a line per flush would drown the channel; a line per
-                    // (reason, mapping) says which surfaces are paying the copy
-                    // and why, once each.
+                    // Latched per mapping as well as per reason. A host without
+                    // `VK_EXT_external_memory_host` declines every flush of
+                    // every surface, and a line per flush would drown the
+                    // channel; a line per (reason, mapping) says which surfaces
+                    // are paying the copy and why, once each.
                     crate::observe::Emit::decline("render_flush_gpu_declined", &decline)
                         .field("mapping", key.mapping_id)
                         .field("geom", format!("{}x{}", key.width, key.height))
