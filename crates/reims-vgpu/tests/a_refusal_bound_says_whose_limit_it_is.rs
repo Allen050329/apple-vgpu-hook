@@ -196,7 +196,7 @@ struct Row {
 /// it has the measurement rather than the argument.
 const ROWS: &[Row] = &[
     Row {
-        at: "reims-vgpu/src/backend/metal/compute.rs:512",
+        at: "reims-vgpu/src/backend/metal/compute.rs:526",
         bound: "REIMS_VGPU_METAL_MAX_SAMPLERS",
         verdict: Verdict::ContractLimit,
         why: "Metal's sampler argument table, pinned at the declaration to \
@@ -204,7 +204,7 @@ const ROWS: &[Row] = &[
               truncating a plural sampler bind at 16 per stage.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/compute.rs:1036",
+        at: "reims-vgpu/src/backend/metal/compute.rs:1064",
         bound: "REIMS_VGPU_METAL_MAX_TEXTURES",
         verdict: Verdict::ContractLimit,
         why: "Metal's texture argument table, pinned to draw::MAX_TEXTURE_BIND_SLOTS, \
@@ -242,7 +242,7 @@ const ROWS: &[Row] = &[
               inside PER_INSTANCE.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/render.rs:1696",
+        at: "reims-vgpu/src/backend/metal/render.rs:1716",
         bound: "REIMS_VGPU_METAL_MAX_COLOR_RTS",
         verdict: Verdict::WireField,
         why: "Metal's eight colour attachments, held equal by a const assertion to \
@@ -250,7 +250,7 @@ const ROWS: &[Row] = &[
               Apple's serialized render-pass record.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/render.rs:1706",
+        at: "reims-vgpu/src/backend/metal/render.rs:1726",
         bound: "REIMS_VGPU_METAL_MAX_COLOR_RTS",
         verdict: Verdict::WireField,
         why: "The same eight, tested against a slot number rather than a count: a \
@@ -258,7 +258,7 @@ const ROWS: &[Row] = &[
               to have carried.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/render.rs:1791",
+        at: "reims-vgpu/src/backend/metal/render.rs:1811",
         bound: "REIMS_VGPU_BACKEND_MAX_VIEWPORTS",
         verdict: Verdict::ContractLimit,
         why: "Metal's own array width: MSL declares [[viewport_array_index]] as 0 \
@@ -270,7 +270,7 @@ const ROWS: &[Row] = &[
               Metal's rather than a ceiling this device picked.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/render.rs:1797",
+        at: "reims-vgpu/src/backend/metal/render.rs:1817",
         bound: "REIMS_VGPU_BACKEND_MAX_SCISSORS",
         verdict: Verdict::ContractLimit,
         why: "The scissor twin of the viewport row above and the same limit for the \

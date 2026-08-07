@@ -63,6 +63,19 @@ pub enum MetalMipmapError {
         requested: u32,
         actual: u64,
     },
+    /// `newTextureWithDescriptor:` returned nil — the device has no memory for
+    /// this texture.
+    ///
+    /// Distinct from [`Self::LevelCountRejected`] on purpose, because that
+    /// variant used to absorb this case and name it wrongly: an unchecked nil
+    /// answers `mipmapLevelCount` with 0, and `0 < levels` reported a device
+    /// that had refused the *level count* when what it had refused was the
+    /// allocation.
+    TextureAllocationFailed {
+        width: u32,
+        height: u32,
+        levels: u32,
+    },
     CommandBufferFailed,
     LevelSpanOverflow {
         level: u32,
@@ -82,6 +95,7 @@ impl crate::observe::Decline for MetalMipmapError {
             Self::BaseSpanOverflow { .. } => "metal_mipmap_base_span_overflow",
             Self::Level0TooShort { .. } => "metal_mipmap_level0_too_short",
             Self::LevelCountRejected { .. } => "metal_mipmap_level_count_rejected",
+            Self::TextureAllocationFailed { .. } => "metal_mipmap_texture_allocation_failed",
             Self::CommandBufferFailed => "metal_mipmap_command_buffer_failed",
             Self::LevelSpanOverflow { .. } => "metal_mipmap_level_span_overflow",
         }
@@ -105,6 +119,15 @@ impl crate::observe::Decline for MetalMipmapError {
             Self::LevelCountRejected { requested, actual } => vec![
                 ("requested", requested.to_string()),
                 ("actual", actual.to_string()),
+            ],
+            Self::TextureAllocationFailed {
+                width,
+                height,
+                levels,
+            } => vec![
+                ("width", width.to_string()),
+                ("height", height.to_string()),
+                ("levels", levels.to_string()),
             ],
             Self::LevelSpanOverflow {
                 level,

@@ -71,29 +71,48 @@ pub fn new_buffer_from_host(device: &Device, data: *const u8, len: usize) -> Opt
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
     let addr = data as usize;
     if page != 0 && addr.is_multiple_of(page) && len.is_multiple_of(page) {
-        let buf = device.new_buffer_with_bytes_no_copy(
+        // A nil here is the device refusing the allocation, and it arrives as
+        // `None` rather than as a `Buffer`. This used to read
+        // `device.new_buffer_with_bytes_no_copy(..)`, whose return type is
+        // `metal::Buffer` — a `NonNull` — so the nil became an invalid value
+        // before anything could test it, and the comment that stood here said a
+        // null Metal result "behaves as a zero-length Objective-C receiver". The
+        // *messaging* does; the Rust wrapper does not, and `.length()` returning
+        // zero was reading a value that already had no legal representation.
+        let allocated = unsafe {
+            crate::backend::metal::raw_metal::new_buffer_no_copy(
+                device,
+                data as *mut _,
+                len as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
+        if let Some(buf) = allocated {
+            let actual_len = buf.length();
+            let status = no_copy_buffer_length_status(len, actual_len);
+            if status.is_ok() {
+                return Some(buf);
+            }
+            // A length Metal did not honour is not an allocation failure, so the
+            // copy fallback below is still correct. Make the performance
+            // degradation visible once per rejected requested/actual pair.
+            if let Some(emit) = crate::observe::Emit::refusal("metal_buffer_copy_fallback", &status)
+            {
+                emit.fail_once((len as u64) ^ actual_len.rotate_left(32));
+            }
+        }
+    }
+    // The copying constructor can refuse too, and for the reason that matters
+    // most: it is the one that has to find `len` bytes. `None` reaches the
+    // caller as a refusal instead of a buffer that is not one.
+    unsafe {
+        crate::backend::metal::raw_metal::new_buffer_with_data(
+            device,
             data as *const _,
             len as u64,
             MTLResourceOptions::StorageModeShared,
-            None,
-        );
-        let actual_len = buf.length();
-        let status = no_copy_buffer_length_status(len, actual_len);
-        if status.is_ok() {
-            return Some(buf);
-        }
-        // A null Metal result behaves as a zero-length Objective-C receiver.
-        // Keep the correct copy fallback, but make the performance degradation
-        // visible once for each rejected requested/actual length pair.
-        if let Some(emit) = crate::observe::Emit::refusal("metal_buffer_copy_fallback", &status) {
-            emit.fail_once((len as u64) ^ actual_len.rotate_left(32));
-        }
+        )
     }
-    Some(device.new_buffer_with_data(
-        data as *const _,
-        len as u64,
-        MTLResourceOptions::StorageModeShared,
-    ))
 }
 
 pub fn cached_default_sampler(device: &Device) -> metal::SamplerState {

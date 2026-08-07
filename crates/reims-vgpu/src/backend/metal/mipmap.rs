@@ -77,7 +77,16 @@ pub fn generate_mipmaps_filtered(
     // ShaderRead is the documented usage for filterable sampled textures;
     // generateMipmapsForTexture operates on filterable color textures.
     descriptor.set_usage(MTLTextureUsage::ShaderRead);
-    let texture = device.new_texture(&descriptor);
+    // Before the level-count check, not after: an unchecked nil answers
+    // `mipmapLevelCount` with 0, so an exhausted device used to be reported as
+    // one that rejected the level count.
+    let Some(texture) = crate::backend::metal::raw_metal::new_texture(device, &descriptor) else {
+        return Err(MetalMipmapError::TextureAllocationFailed {
+            width,
+            height,
+            levels,
+        });
+    };
     if texture.mipmap_level_count() < levels as u64 {
         return Err(MetalMipmapError::LevelCountRejected {
             requested: levels,

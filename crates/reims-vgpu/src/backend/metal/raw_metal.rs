@@ -1,11 +1,37 @@
-//! Narrow raw `msg_send` for Metal APIs missing from metal-0.33.
+//! Narrow raw `msg_send` for Metal APIs missing from metal-0.33 — and for the
+//! ones it has that cannot report a failed allocation.
+//!
+//! # Why an allocator metal-0.33 already exposes is re-spelled here
+//!
+//! `Device::new_texture` is `msg_send![self, newTextureWithDescriptor: d]` with
+//! the return typed as `metal::Texture`, and `foreign_types` 0.5 declares that
+//! as `struct Texture(NonNull<MTLTexture>)`. `newTextureWithDescriptor:` returns
+//! **nil when the allocation fails**, which is what a Metal device does when its
+//! VRAM is full — so the failing case writes a null pointer into a `NonNull`
+//! field. That is an invalid value, and therefore undefined behaviour, rather
+//! than a `Texture` the caller could test. The same holds for every
+//! `new_buffer*`.
+//!
+//! It is the same class as [`super::mtl_enum`]'s: a value that has no legal
+//! representation in the Rust type must be checked *before* it becomes one, and
+//! the check cannot be moved after the conversion. So the pointer is taken raw,
+//! tested, and only then wrapped — exactly what [`new_texture_view_swizzled`]
+//! below has always done, because that one API is missing from metal-0.33 and so
+//! had to be hand-written. The allocators in this section exist to give the ones
+//! metal-0.33 *does* expose the same treatment; nothing about the swizzled view
+//! made it special except that writing it out forced the question.
+//!
+//! `None` is a real answer here, not a defensive one: it is the device saying it
+//! has no memory left, which every caller turns into a typed refusal. That is
+//! what a GPU does with an allocation it cannot serve.
 
 use foreign_types::ForeignType;
 use metal::{
-    BufferRef, ComputeCommandEncoderRef, ComputePipelineState, DeviceRef, FunctionRef,
+    Buffer, BufferRef, ComputeCommandEncoderRef, ComputePipelineState, DeviceRef, FunctionRef,
     IndirectCommandBufferRef, IndirectComputeCommandRef, IndirectRenderCommandRef, MTLIndexType,
-    MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLSize, MTLTextureType, NSInteger, NSRange,
-    NSUInteger, RenderPipelineDescriptorRef, Texture, TextureRef,
+    MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSize, MTLTextureType,
+    NSInteger, NSRange, NSUInteger, RenderPipelineDescriptorRef, Texture, TextureDescriptorRef,
+    TextureRef,
 };
 use objc::runtime::{Object, BOOL, NO, YES};
 use objc::{msg_send, sel, sel_impl};
@@ -289,6 +315,85 @@ pub fn texture_swizzle_channels(swizzle: [u8; 4]) -> Option<MtlTextureSwizzleCha
         blue: swizzle_selector(swizzle[2])?,
         alpha: swizzle_selector(swizzle[3])?,
     })
+}
+
+/// `newTextureWithDescriptor:`, with the nil an exhausted device returns.
+///
+/// The checked replacement for `metal::Device::new_texture`. See this module's
+/// own doc for why that one cannot be used: its return type cannot hold the
+/// failure.
+pub fn new_texture(device: &DeviceRef, descriptor: &TextureDescriptorRef) -> Option<Texture> {
+    unsafe {
+        let ptr: *mut Object = msg_send![device, newTextureWithDescriptor: descriptor];
+        (!ptr.is_null()).then(|| Texture::from_ptr(ptr as *mut _))
+    }
+}
+
+/// `newBufferWithLength:options:`, with the nil an exhausted device returns.
+pub fn new_buffer(
+    device: &DeviceRef,
+    length: NSUInteger,
+    options: MTLResourceOptions,
+) -> Option<Buffer> {
+    unsafe {
+        let ptr: *mut Object = msg_send![device, newBufferWithLength: length options: options];
+        (!ptr.is_null()).then(|| Buffer::from_ptr(ptr as *mut _))
+    }
+}
+
+/// `newBufferWithBytes:length:options:`, with the nil an exhausted device
+/// returns.
+///
+/// # Safety
+///
+/// `bytes` must point to at least `length` readable bytes for the duration of
+/// the call. Metal copies them before returning, so the caller owes nothing
+/// afterwards — this is the copying constructor, not the no-copy one.
+pub unsafe fn new_buffer_with_data(
+    device: &DeviceRef,
+    bytes: *const std::ffi::c_void,
+    length: NSUInteger,
+    options: MTLResourceOptions,
+) -> Option<Buffer> {
+    unsafe {
+        let ptr: *mut Object =
+            msg_send![device, newBufferWithBytes: bytes length: length options: options];
+        (!ptr.is_null()).then(|| Buffer::from_ptr(ptr as *mut _))
+    }
+}
+
+/// `newBufferWithBytesNoCopy:length:options:deallocator:`, with the nil an
+/// exhausted device returns.
+///
+/// The deallocator is always nil: this device keeps every no-copy buffer's bytes
+/// alive for the command buffer's lifetime itself, which is the contract
+/// [`super::runtime::new_buffer_from_host`] states for its caller.
+///
+/// # Safety
+///
+/// `bytes` must point to `length` readable bytes that stay alive, unmoved, for
+/// as long as the returned buffer is in use by the GPU. Metal does **not** copy
+/// them. `bytes` and `length` must both be page-aligned or Metal returns nil,
+/// which this reports as `None` rather than as a `Buffer` that is not one.
+///
+/// AGENTS.md forbids aliasing guest RAM this way; the one permitted caller
+/// passes bytes this process owns.
+pub unsafe fn new_buffer_no_copy(
+    device: &DeviceRef,
+    bytes: *mut std::ffi::c_void,
+    length: NSUInteger,
+    options: MTLResourceOptions,
+) -> Option<Buffer> {
+    unsafe {
+        let ptr: *mut Object = msg_send![
+            device,
+            newBufferWithBytesNoCopy: bytes
+            length: length
+            options: options
+            deallocator: std::ptr::null::<Object>()
+        ];
+        (!ptr.is_null()).then(|| Buffer::from_ptr(ptr as *mut _))
+    }
 }
 
 pub fn new_texture_view_swizzled(

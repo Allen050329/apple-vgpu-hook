@@ -1102,7 +1102,15 @@ fn bind_sampled_images(
         descriptor.set_height(image.height as u64);
         descriptor.set_storage_mode(MTLStorageMode::Shared);
         descriptor.set_usage(MTLTextureUsage::ShaderRead);
-        let texture = device.new_texture(&descriptor);
+        let Some(texture) = crate::backend::metal::raw_metal::new_texture(device, &descriptor)
+        else {
+            set_err(err, "failed to allocate sampled image texture");
+            return Status::execute("metal_render_sampled_texture_alloc_failed")
+                .field("fragment", fragment_stage)
+                .field("binding", image.binding)
+                .field("width", image.width)
+                .field("height", image.height);
+        };
         let region = MTLRegion {
             origin: MTLOrigin { x: 0, y: 0, z: 0 },
             size: MTLSize {
@@ -1418,7 +1426,13 @@ fn configure_depth_attachment(
     descriptor.set_height(height as u64);
     descriptor.set_storage_mode(MTLStorageMode::Shared);
     descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-    let texture = device.new_texture(&descriptor);
+    let Some(texture) = crate::backend::metal::raw_metal::new_texture(device, &descriptor) else {
+        return Err(
+            Status::execute("metal_render_depth_attachment_alloc_failed")
+                .field("width", width)
+                .field("height", height),
+        );
+    };
     if depth.load_action == REIMS_VGPU_MTL_LOAD_ACTION_LOAD {
         let region = MTLRegion {
             origin: MTLOrigin { x: 0, y: 0, z: 0 },
@@ -1473,7 +1487,13 @@ fn configure_stencil_attachment(
     descriptor.set_height(height as u64);
     descriptor.set_storage_mode(MTLStorageMode::Shared);
     descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-    let texture = device.new_texture(&descriptor);
+    let Some(texture) = crate::backend::metal::raw_metal::new_texture(device, &descriptor) else {
+        return Err(
+            Status::execute("metal_render_stencil_attachment_alloc_failed")
+                .field("width", width)
+                .field("height", height),
+        );
+    };
     if stencil.load_action == REIMS_VGPU_MTL_LOAD_ACTION_LOAD {
         let region = MTLRegion {
             origin: MTLOrigin { x: 0, y: 0, z: 0 },
@@ -1891,7 +1911,14 @@ pub fn render_core_mrt(
         target_descriptor.set_height(height as u64);
         target_descriptor.set_storage_mode(MTLStorageMode::Shared);
         target_descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-        let target = device.new_texture(&target_descriptor);
+        let Some(target) =
+            crate::backend::metal::raw_metal::new_texture(device, &target_descriptor)
+        else {
+            return Status::execute("metal_render_color_target_alloc_failed")
+                .field("slot", slot)
+                .field("width", width)
+                .field("height", height);
+        };
         // Archive reims_vgpu_backend_metal: upload target_rgba8 before Load
         // (fresh RT every job; NULL seed → Clear invent below).
         if let Some(seed) = c.seed_rgba8 {
@@ -2000,12 +2027,20 @@ pub fn render_core_mrt(
     // One `u64` at offset 0: this pass encodes one draw, so the buffer holds
     // exactly the one result the guest asked for. Shared so the CPU can read it
     // after the command buffer completes without a blit.
-    let visibility_buffer = visibility_mode.map(|_| {
-        device.new_buffer(
-            core::mem::size_of::<u64>() as u64,
-            MTLResourceOptions::StorageModeShared,
-        )
-    });
+    let visibility_buffer = match visibility_mode {
+        None => None,
+        Some(_) => {
+            let Some(buffer) = crate::backend::metal::raw_metal::new_buffer(
+                device,
+                core::mem::size_of::<u64>() as u64,
+                MTLResourceOptions::StorageModeShared,
+            ) else {
+                return Status::execute("metal_render_visibility_buffer_alloc_failed")
+                    .field("len", core::mem::size_of::<u64>());
+            };
+            Some(buffer)
+        }
+    };
     if let Some(buffer) = visibility_buffer.as_ref() {
         // Metal does not document the buffer as zeroed, and the count is an
         // accumulation the GPU adds into.
@@ -2097,11 +2132,19 @@ pub fn render_core_mrt(
                 .field("len", pi.arguments_len)
                 .field("required", need);
         }
-        let indirect = device.new_buffer_with_data(
-            pi.arguments as *const _,
-            pi.arguments_len as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let indirect = unsafe {
+            crate::backend::metal::raw_metal::new_buffer_with_data(
+                device,
+                pi.arguments as *const _,
+                pi.arguments_len as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let Some(indirect) = indirect else {
+            encoder.end_encoding();
+            return Status::execute("metal_render_indirect_buffer_alloc_failed")
+                .field("len", pi.arguments_len);
+        };
         retained_buf.push(indirect.clone());
         encoder.draw_primitives_indirect(prim, &indirect, 0);
     } else if let Some(ix) = indexed {
@@ -2201,19 +2244,35 @@ pub fn render_core_mrt(
                     .field("indices_len", ix.indices_len);
             }
         }
-        let index_buffer = device.new_buffer_with_data(
-            ix.indices as *const _,
-            ix.indices_len as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let index_buffer = unsafe {
+            crate::backend::metal::raw_metal::new_buffer_with_data(
+                device,
+                ix.indices as *const _,
+                ix.indices_len as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let Some(index_buffer) = index_buffer else {
+            encoder.end_encoding();
+            return Status::execute("metal_render_index_buffer_alloc_failed")
+                .field("len", ix.indices_len);
+        };
         retained_buf.push(index_buffer.clone());
         if indexed_indirect {
             let ind = unsafe { &*ix.indirect };
-            let indirect = device.new_buffer_with_data(
-                ind.arguments as *const _,
-                ind.arguments_len as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
+            let indirect = unsafe {
+                crate::backend::metal::raw_metal::new_buffer_with_data(
+                    device,
+                    ind.arguments as *const _,
+                    ind.arguments_len as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            };
+            let Some(indirect) = indirect else {
+                encoder.end_encoding();
+                return Status::execute("metal_render_indexed_indirect_buffer_alloc_failed")
+                    .field("len", ind.arguments_len);
+            };
             retained_buf.push(indirect.clone());
             encoder.draw_indexed_primitives_indirect(
                 prim,

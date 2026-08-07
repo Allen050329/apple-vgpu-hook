@@ -355,7 +355,14 @@ pub(crate) fn bind_storage_images(
         descriptor.set_height(image.height as u64);
         descriptor.set_storage_mode(MTLStorageMode::Shared);
         descriptor.set_usage(MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite);
-        let texture = device.new_texture(&descriptor);
+        let Some(texture) = crate::backend::metal::raw_metal::new_texture(device, &descriptor)
+        else {
+            set_err(err, "failed to allocate storage image texture");
+            return Status::execute("metal_compute_storage_texture_alloc_failed")
+                .field("binding", image.binding)
+                .field("width", image.width)
+                .field("height", image.height);
+        };
         let region = MTLRegion::new_2d(0, 0, image.width as u64, image.height as u64);
         texture.replace_region(
             region,
@@ -464,7 +471,14 @@ pub(crate) fn bind_compute_sampled_images(
             usage |= MTLTextureUsage::PixelFormatView;
         }
         descriptor.set_usage(usage);
-        let texture = device.new_texture(&descriptor);
+        let Some(texture) = crate::backend::metal::raw_metal::new_texture(device, &descriptor)
+        else {
+            set_err(err, "failed to allocate compute sampled image texture");
+            return Status::execute("metal_compute_sampled_texture_alloc_failed")
+                .field("binding", image.binding)
+                .field("width", image.width)
+                .field("height", image.height);
+        };
         let region = MTLRegion::new_2d(0, 0, image.width as u64, image.height as u64);
         texture.replace_region(
             region,
@@ -596,23 +610,34 @@ fn bind_stage_in_region(
     set_stage_in_region(encoder, metal_region);
 }
 
+/// `Status` rather than `()` because the allocation below can refuse, and a
+/// dispatch whose indirect stage-in region never reached the encoder reads its
+/// threads from whatever the encoder held before.
 fn bind_stage_in_region_indirect(
     device: &Device,
     encoder: &ComputeCommandEncoderRef,
     retained: &mut Vec<Buffer>,
     arguments: Option<&ReimsVgpuComputeStageInRegionIndirectArguments>,
-) {
+) -> Status {
     let Some(arguments) = arguments else {
-        return;
+        return Status::OK;
     };
     let bytes = bytes_of(arguments);
-    let indirect = device.new_buffer_with_data(
-        bytes.as_ptr() as *const _,
-        bytes.len() as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let indirect = unsafe {
+        crate::backend::metal::raw_metal::new_buffer_with_data(
+            device,
+            bytes.as_ptr() as *const _,
+            bytes.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    };
+    let Some(indirect) = indirect else {
+        return Status::execute("metal_compute_stage_in_indirect_buffer_alloc_failed")
+            .field("len", bytes.len());
+    };
     retained.push(indirect.clone());
     set_stage_in_region_indirect(encoder, &indirect, 0);
+    Status::OK
 }
 
 fn mtl_dispatch_type(raw: u32) -> Option<MTLDispatchType> {
@@ -766,12 +791,15 @@ pub fn compute_encode_on_encoder(
     }
     bind_stage_in_region(encoder, stage_in_region);
     let mut retained_indirect = Vec::new();
-    bind_stage_in_region_indirect(
+    let rc = bind_stage_in_region_indirect(
         device,
         encoder,
         &mut retained_indirect,
         stage_in_region_indirect,
     );
+    if !rc.is_ok() {
+        return Err(rc);
+    }
     if let Some(dims) = imageblock_dimensions {
         set_imageblock_width_height(encoder, dims.width as u64, dims.height as u64);
     }
