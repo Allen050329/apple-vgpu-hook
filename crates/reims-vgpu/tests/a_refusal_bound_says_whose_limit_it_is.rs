@@ -363,7 +363,7 @@ const ROWS: &[Row] = &[
               same basis `wire::ops::bind_limit::SAMPLER` carries.",
     },
     Row {
-        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:2701",
+        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:2745",
         bound: "MAX_COLOR_ATTACHMENTS",
         verdict: Verdict::WireField,
         why: "The declared colour-attachment count against the width of the slot \
@@ -371,7 +371,7 @@ const ROWS: &[Row] = &[
               itself stops at.",
     },
     Row {
-        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:2465",
+        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:2509",
         bound: "MAX_COLOR_ATTACHMENTS",
         verdict: Verdict::WireField,
         why: "The same eight, one entry down: the guard admits a declared slot \

@@ -1383,6 +1383,61 @@ fn an_unread_pipeline_descriptor_field_says_so_without_refusing_the_pipeline() {
     );
 }
 
+/// Tag `0x03` on a *classic* render pipeline is unread, and the shape line says
+/// so.
+///
+/// The decoder loads it into `tag03` and uses that variable only on the mesh
+/// branch, so a classic descriptor carrying it has the field read and thrown
+/// away. A driven boot sends exactly this shape, and the first draft of the
+/// shape line reported `unconsumed=0` for it — the consumed set was the union
+/// of what either branch reads, which is an instrument built to find unread
+/// fields hiding one behind a tag its *other* branch reads. Which tags count as
+/// consumed is a property of the branch taken.
+#[test]
+fn a_classic_pipelines_mesh_tag_is_unread_and_the_shape_line_says_so() {
+    use crate::contract::endian::st32;
+
+    // Classic: 0x08 present, 0x14 absent. Plus 0x03, which only the mesh branch
+    // reads. The colour section the offset names is present and empty, for the
+    // reason `compact_render_pipeline_object_mesh_funcs` below gives.
+    let mut b = vec![0u8; 16 + 19 + 8];
+    let blen = b.len() as u32;
+    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[4..], blen);
+    st32(&mut b[8..], 11);
+    b[16] = 3;
+    b[17] = PIPELINE_TAG_COLOR_ATTACH_OFFSET;
+    b[18] = 4;
+    st32(&mut b[19..], 19);
+    b[23] = PIPELINE_TAG_VERTEX_FUNC;
+    b[24] = 4;
+    st32(&mut b[25..], 2);
+    b[29] = PIPELINE_TAG_MESH_FRAGMENT_FUNC;
+    b[30] = 4;
+    st32(&mut b[31..], 6);
+
+    let cap = crate::observe::FailCapture::start();
+    let p = decode_render_pipeline_descriptor(&b).expect("a classic descriptor decodes");
+    assert_eq!(p.vertex_func_ref, 2);
+    assert_eq!(
+        p.fragment_func_ref, 0,
+        "0x03 is not the classic fragment function; the decoder discards it"
+    );
+    let lines = cap.lines();
+    let shape: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("type7_pipeline_shape"))
+        .collect();
+    assert_eq!(shape.len(), 1, "one shape line: {lines:?}");
+    assert!(
+        shape[0].contains("kind=render")
+            && shape[0].contains("tags=[08:4,01:4,03:4*]")
+            && shape[0].contains("unconsumed=1"),
+        "the tag the classic branch discards must be starred and counted: {}",
+        shape[0]
+    );
+}
+
 #[test]
 fn compact_render_pipeline_object_mesh_funcs() {
     use crate::contract::endian::st32;

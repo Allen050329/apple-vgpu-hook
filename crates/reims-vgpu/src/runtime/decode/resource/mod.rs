@@ -2006,19 +2006,33 @@ pub fn decode_sampler_descriptor(bytes: &[u8]) -> Result<SamplerDescriptor, Deco
     })
 }
 
-/// Tags [`decode_render_pipeline_descriptor`] reads out of a render pipeline's
-/// own compact-TLV block.
+/// Tags [`decode_render_pipeline_descriptor`] reads on the **classic** shape —
+/// the branch a descriptor without [`PIPELINE_TAG_MESH_SECTION_OFFSET`] takes.
 ///
-/// Five, against the twenty-odd properties `MTLRenderPipelineDescriptor`
-/// declares. The block carries the function refs and the two section offsets;
-/// every other property the guest set on the descriptor arrives here as a tag
-/// with no reader.
-const RENDER_PIPELINE_TAGS_CONSUMED: [u8; 5] = [
+/// Three, out of the function refs and the colour-attachment section offset.
+/// `0x03` is deliberately **not** here: the decoder reads it into `tag03` and
+/// then uses that variable only in the mesh branch, so on a classic descriptor
+/// the field is loaded and discarded. A first draft of this instrument listed
+/// every tag either branch reads and reported `unconsumed=0` for a driven
+/// boot's classic pipelines that carry `0x03` — an instrument built to find
+/// unread fields hiding one behind a tag its *other* branch reads. Which tags
+/// count as consumed is a property of the branch taken, so it is chosen there.
+const CLASSIC_PIPELINE_TAGS_CONSUMED: [u8; 3] = [
+    PIPELINE_TAG_VERTEX_FUNC,
+    PIPELINE_TAG_FRAGMENT_FUNC,
+    PIPELINE_TAG_COLOR_ATTACH_OFFSET,
+];
+
+/// Tags [`decode_render_pipeline_descriptor`] reads on the **mesh** shape.
+///
+/// Four: the section offset that selected this branch and the three function
+/// refs whose roles it re-maps. See [`CLASSIC_PIPELINE_TAGS_CONSUMED`] for why
+/// the two sets are listed apart.
+const MESH_PIPELINE_TAGS_CONSUMED: [u8; 4] = [
+    PIPELINE_TAG_MESH_SECTION_OFFSET,
     PIPELINE_TAG_VERTEX_FUNC,
     PIPELINE_TAG_FRAGMENT_FUNC,
     PIPELINE_TAG_MESH_FRAGMENT_FUNC,
-    PIPELINE_TAG_COLOR_ATTACH_OFFSET,
-    PIPELINE_TAG_MESH_SECTION_OFFSET,
 ];
 
 /// Tags [`decode_compute_pipeline_descriptor`] reads out of a compute
@@ -2039,25 +2053,54 @@ const COMPUTE_PIPELINE_TAGS_CONSUMED: [u8; 1] = [PIPELINE_TAG_KERNEL_FUNC];
 /// unimplemented, it was unmeasured: nothing said how many arrive, which ones,
 /// or how often.
 ///
-/// That matters more here than one tag usually does, because of what the
-/// descriptor carries. `rasterSampleCount` is a field of this block on every
-/// serialized render pipeline, and `rasterizationEnabled` is another —
-/// respectively how many fragments a pixel gets and whether the pipeline
-/// rasterizes at all. Reading the first is the only route this device has to a
-/// guest's requested sample count: the attachment record on the wire carries a
-/// `resolve_texture_ref` and no count, and the texture objects themselves are
-/// met through the kernel's object list, whose descriptor has no such field. So
-/// this line is what turns "the device advertises `supportsSampleCount:` up to
-/// 8 and rasterizes at one" from an argument into a reading.
+/// # The reading, x86/Vulkan, one driven boot (Safari window drag)
+///
+/// Six distinct shapes, and the block is **small** — three to five fields, not
+/// the twenty-odd `MTLRenderPipelineDescriptor` declares. So most of that
+/// descriptor is not serialized into this block at all, and looking for
+/// `rasterSampleCount` or `rasterizationEnabled` among these tags is looking in
+/// the wrong place. That is the first thing this instrument settled, and it
+/// settled it against the expectation that motivated writing it.
+///
+/// ```text
+/// kind=render      tags=[08:4,01:4,02:4]           unconsumed=0
+/// kind=render      tags=[03:4,08:4,01:4,02:4]      unconsumed=1  (0x03)
+/// kind=render      tags=[00:4,03:4,08:4,01:4,02:4] unconsumed=2  (0x00, 0x03)
+/// kind=render      tags=[00:4,08:4,01:4,02:4]      unconsumed=1  (0x00)
+/// kind=compute     tags=[02:4,01:4,00:4]           unconsumed=2  (0x01, 0x02)
+/// kind=compute     tags=[00:4]                     unconsumed=0
+/// ```
+///
+/// Three tags a live guest sends and no decoder reads, all four bytes wide:
+///
+/// * **`0x00` on a classic render pipeline.** This file names `0x00`
+///   [`PIPELINE_TAG_KERNEL_FUNC`] because that is its role on a *compute*
+///   pipeline; on a render one it is a fourth `u32` with no identification.
+/// * **`0x03` on a classic render pipeline.** The decoder loads it into `tag03`
+///   and uses that variable only on the mesh branch, so on this shape it is read
+///   and thrown away. Named `PIPELINE_TAG_MESH_FRAGMENT_FUNC` for its mesh role;
+///   its classic role is unidentified.
+/// * **`0x01` and `0x02` on a compute pipeline.** Named for their render roles.
+///   `MTLComputePipelineDescriptor`'s own scalar properties are
+///   `maxTotalThreadsPerThreadgroup` and
+///   `threadGroupSizeIsMultipleOfThreadExecutionWidth`, which is a plausible
+///   pair and **not** a decode: nothing here has read a value against a driven
+///   dispatch, and acting on the guess would be the magic-number failure this
+///   repository's ground rules name.
+///
+/// The compute pair is the more alarming of the two: if either is
+/// `maxTotalThreadsPerThreadgroup`, this device dispatches threadgroups the
+/// guest capped and the pipeline may exceed what its shader was compiled for.
 ///
 /// # Reported, not refused
 ///
 /// The sibling refuses an unconsumed colour-attachment tag, and this one does
 /// not, on that sibling's own stated licence: its zero was *measured* first —
 /// `type7_color_attach_shape` runs 4–13 times a boot with `unconsumed=0` — and
-/// only a measured zero makes refusing safe. Nothing has ever measured this
-/// block. Refusing it before the reading exists would decline pipelines a live
-/// guest sends, on a guess about which tags those are.
+/// only a measured zero makes refusing safe. This block's reading is **not**
+/// zero, as the table above shows, so refusing here would decline pipelines a
+/// live guest sends on every boot. Identify the four tags, then decide; do not
+/// promote this to a refusal on the strength of the shape line alone.
 ///
 /// Deduped per distinct `(tag, len)` rather than per value: what a reader needs
 /// first is which properties arrive, and a per-value latch on a field like a
@@ -2151,13 +2194,13 @@ pub fn decode_render_pipeline_descriptor(
         ..Default::default()
     };
     let (fields, consumed) = decode_compact_tlv_record(bytes, TYPE7_FIRST_TLVS)?;
-    note_pipeline_tlv_fields("render", &RENDER_PIPELINE_TAGS_CONSUMED, &fields);
     let tag01 = compact_tlv_u32(&fields, PIPELINE_TAG_VERTEX_FUNC).unwrap_or(0);
     let tag02 = compact_tlv_u32(&fields, PIPELINE_TAG_FRAGMENT_FUNC).unwrap_or(0);
     let tag03 = compact_tlv_u32(&fields, PIPELINE_TAG_MESH_FRAGMENT_FUNC).unwrap_or(0);
     // Mesh SPI shape: tag 0x14 section offset (host serializeMeshRenderPipelineDescriptor).
     // Classic type-7 uses tag 0x08. Roles for 0x01/0x02/0x03 differ by shape.
     if let Some(off) = compact_tlv_u32(&fields, PIPELINE_TAG_MESH_SECTION_OFFSET) {
+        note_pipeline_tlv_fields("render_mesh", &MESH_PIPELINE_TAGS_CONSUMED, &fields);
         out.object_func_ref = tag01;
         out.mesh_func_ref = tag02;
         out.fragment_func_ref = tag03;
@@ -2165,6 +2208,7 @@ pub fn decode_render_pipeline_descriptor(
         out.color_attachment_offset = off;
         out.has_color_attachment_offset = true;
     } else {
+        note_pipeline_tlv_fields("render", &CLASSIC_PIPELINE_TAGS_CONSUMED, &fields);
         out.vertex_func_ref = tag01;
         out.fragment_func_ref = tag02;
         out.object_func_ref = 0;
