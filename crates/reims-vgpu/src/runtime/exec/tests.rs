@@ -2221,6 +2221,111 @@ fn a_store_action_override_reaches_the_slot_it_names() {
     );
 }
 
+/// The depth and stencil overrides reach their own attachments, and name
+/// themselves when there is none.
+///
+/// The colour test above shares this arm's `u16` narrowing and its opcode
+/// match, but not the two branches here: these records carry **no index** —
+/// there is one depth and one stencil attachment — so they are a different
+/// lookup, and one of them landing on the other's attachment is the failure
+/// this fixture is shaped to catch. Both are set in one record pair and both
+/// are asserted, with the two starting from different actions so a rail writing
+/// the wrong one cannot pass.
+#[test]
+fn a_depth_or_stencil_store_action_override_reaches_its_own_attachment() {
+    use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
+    use crate::runtime::decode::render::StencilAttachment;
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+
+    let record = |opcode: u32, action: u64| {
+        let total = reims_vgpu_wire::OP_HEADER_LEN + 8;
+        let mut c = vec![0u8; total];
+        st32(&mut c[0..], opcode);
+        st32(&mut c[4..], total as u32);
+        crate::contract::endian::st64(&mut c[reims_vgpu_wire::OP_HEADER_LEN..], action);
+        c
+    };
+    let mut send = |acc: &mut StreamAccum, opcode: u32, action: u64| {
+        let c = record(opcode, action);
+        handle_render_record(&mut state, &host, 1, opcode, &c, &mut out, acc);
+    };
+
+    // No attachment declared: both must name themselves rather than return
+    // quietly, which is the branch nothing else in the suite reaches.
+    for (opcode, route) in [
+        (
+            wire_render::OPCODE_SET_DEPTH_STORE_ACTION,
+            "render_store_action_no_depth_attachment",
+        ),
+        (
+            wire_render::OPCODE_SET_STENCIL_STORE_ACTION,
+            "render_store_action_no_stencil_attachment",
+        ),
+    ] {
+        let before = store_route_count(route);
+        send(&mut acc, opcode, u64::from(MTL_STORE_ACTION_STORE));
+        assert_eq!(
+            store_route_count(route) - before,
+            1,
+            "an override with no attachment to override must name itself"
+        );
+    }
+
+    // Declared, and starting from different actions so neither branch can pass
+    // by writing the other's attachment.
+    acc.depth_attach = Some(DepthAttachment {
+        store_action: MTL_STORE_ACTION_DONT_CARE,
+        ..Default::default()
+    });
+    acc.stencil_attach = Some(StencilAttachment {
+        store_action: MTL_STORE_ACTION_STORE,
+        ..Default::default()
+    });
+    send(
+        &mut acc,
+        wire_render::OPCODE_SET_DEPTH_STORE_ACTION,
+        u64::from(MTL_STORE_ACTION_STORE),
+    );
+    send(
+        &mut acc,
+        wire_render::OPCODE_SET_STENCIL_STORE_ACTION,
+        u64::from(MTL_STORE_ACTION_DONT_CARE),
+    );
+    assert_eq!(
+        acc.depth_attach.unwrap().store_action,
+        MTL_STORE_ACTION_STORE,
+        "the depth override did not reach the depth attachment"
+    );
+    assert_eq!(
+        acc.stencil_attach.unwrap().store_action,
+        MTL_STORE_ACTION_DONT_CARE,
+        "the stencil override did not reach the stencil attachment"
+    );
+
+    // A mode past `u16` is left alone rather than narrowed into a different
+    // action — the one case where applying the record is worse than not.
+    let before = store_route_count("render_store_action_out_of_range");
+    send(
+        &mut acc,
+        wire_render::OPCODE_SET_DEPTH_STORE_ACTION,
+        u64::from(u32::MAX),
+    );
+    assert_eq!(
+        store_route_count("render_store_action_out_of_range") - before,
+        1
+    );
+    assert_eq!(
+        acc.depth_attach.unwrap().store_action,
+        MTL_STORE_ACTION_STORE,
+        "an out-of-range mode must not have been narrowed onto the attachment"
+    );
+}
+
 /// A plural scissor record reaches the accumulator whole.
 ///
 /// Before `0x83`/`0x76` were decoded the record reached no arm at all, so a
