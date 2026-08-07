@@ -16,22 +16,40 @@
 #
 # READ THE README BEFORE DELETING ANYTHING. A zero here is not a verdict.
 #
-# Usage: scripts/runtime-dead/runtime-dead.sh [--seconds N] [--app NAME]
+# Usage: scripts/runtime-dead/runtime-dead.sh [--seconds N] [--app NAME] [--import-off]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-OUT_DIR="${OUT_DIR:-/tmp/reims-vgpu-runtime-dead}"
 DRIVE_SECONDS=25
 DRIVE_APP=Safari
+IMPORT_OFF=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --seconds) DRIVE_SECONDS="$2"; shift 2 ;;
         --app) DRIVE_APP="$2"; shift 2 ;;
+        --import-off) IMPORT_OFF=1; shift ;;
         *) echo "runtime-dead: unknown argument '$1'" >&2; exit 2 ;;
     esac
 done
+
+# Where a host can import guest RAM, every guest window takes the import and the
+# copying rails run zero times — so the report above says nothing about them,
+# and on a host without the extension they are the only rails there are. Reason
+# 7 in the README is that whole class: a rail cold here because this host is too
+# capable to need it reads exactly like a dead one.
+#
+# `REIMS_VGPU_GUEST_IMPORT=off` is what AGENTS.md provides to exercise them, so
+# this run is the other half of the measurement rather than a variant of it.
+# Separate output directory on purpose: the two reports are meant to be diffed,
+# and a run that overwrote the other would destroy the comparison it exists for.
+if [ "$IMPORT_OFF" -eq 1 ]; then
+    OUT_DIR="${OUT_DIR:-/tmp/reims-vgpu-runtime-dead-import-off}"
+    export REIMS_VGPU_GUEST_IMPORT=off
+else
+    OUT_DIR="${OUT_DIR:-/tmp/reims-vgpu-runtime-dead}"
+fi
 
 # The profile runtime is compiler-rt's, not rustup's: rustup ships
 # profiler_builtins as an rlib for linking into Rust artifacts, and what QEMU
@@ -243,6 +261,31 @@ if [ "$drive_ok" -eq 0 ]; then
     echo "runtime-dead: zeros read exactly like a kill list. Refusing the run." >&2
     kill -TERM "$qemu_pid" 2>/dev/null || true
     exit 1
+fi
+
+# An override that did not take is the worst outcome this flag has, because the
+# run still succeeds: a full report, self-consistent counters, a directory named
+# `-import-off`, and coverage of the import rails it was supposed to exclude.
+# Diffed against the other run it then shows no copying rails at all, which
+# reads as "the copying rails are dead" — the exact conclusion the flag exists
+# to prevent. AGENTS.md gives the confirmation, so require it: `vk_caps` must
+# report the env rung by name.
+#
+# The device appends to the fail log and the script truncated it before this
+# boot, so a match here is this boot's.
+if [ "$IMPORT_OFF" -eq 1 ]; then
+    if grep -q 'host_pointer_import=disabled_by_env' /tmp/reims-vgpu-fail.log 2>/dev/null; then
+        echo "runtime-dead: confirmed host_pointer_import=disabled_by_env"
+    else
+        echo "runtime-dead: --import-off was asked for and the device did not take it." >&2
+        echo "runtime-dead: vk_caps never reported host_pointer_import=disabled_by_env, so" >&2
+        echo "runtime-dead: this boot used the import and its coverage is the ordinary run's." >&2
+        echo "runtime-dead: Reporting it as the copying rails' would say they are dead." >&2
+        grep -o 'host_pointer_import=[a-z_]*' /tmp/reims-vgpu-fail.log 2>/dev/null |
+            sort -u | sed 's/^/runtime-dead:   saw /' >&2 || true
+        kill -TERM "$qemu_pid" 2>/dev/null || true
+        exit 1
+    fi
 fi
 
 # QMP `quit` first, signal only as a fallback.
