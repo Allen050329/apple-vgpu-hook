@@ -2006,6 +2006,131 @@ pub fn decode_sampler_descriptor(bytes: &[u8]) -> Result<SamplerDescriptor, Deco
     })
 }
 
+/// Tags [`decode_render_pipeline_descriptor`] reads out of a render pipeline's
+/// own compact-TLV block.
+///
+/// Five, against the twenty-odd properties `MTLRenderPipelineDescriptor`
+/// declares. The block carries the function refs and the two section offsets;
+/// every other property the guest set on the descriptor arrives here as a tag
+/// with no reader.
+const RENDER_PIPELINE_TAGS_CONSUMED: [u8; 5] = [
+    PIPELINE_TAG_VERTEX_FUNC,
+    PIPELINE_TAG_FRAGMENT_FUNC,
+    PIPELINE_TAG_MESH_FRAGMENT_FUNC,
+    PIPELINE_TAG_COLOR_ATTACH_OFFSET,
+    PIPELINE_TAG_MESH_SECTION_OFFSET,
+];
+
+/// Tags [`decode_compute_pipeline_descriptor`] reads out of a compute
+/// pipeline's own compact-TLV block.
+///
+/// One. Listed apart from its render sibling rather than merged into a union,
+/// because a union would report a render tag as *consumed* on a compute
+/// pipeline that has no reader for it — an instrument built to find unread
+/// fields must not hide one behind a tag its other caller reads.
+const COMPUTE_PIPELINE_TAGS_CONSUMED: [u8; 1] = [PIPELINE_TAG_KERNEL_FUNC];
+
+/// A pipeline-descriptor field this decoder does not read.
+///
+/// The colour-attachment walk beside this one has had both halves of this
+/// instrument — a shape line and a per-tag decline — for as long as it has
+/// refused an unknown tag. The pipeline's *own* block had neither, so a property
+/// the guest set on the descriptor and this device never read was not merely
+/// unimplemented, it was unmeasured: nothing said how many arrive, which ones,
+/// or how often.
+///
+/// That matters more here than one tag usually does, because of what the
+/// descriptor carries. `rasterSampleCount` is a field of this block on every
+/// serialized render pipeline, and `rasterizationEnabled` is another —
+/// respectively how many fragments a pixel gets and whether the pipeline
+/// rasterizes at all. Reading the first is the only route this device has to a
+/// guest's requested sample count: the attachment record on the wire carries a
+/// `resolve_texture_ref` and no count, and the texture objects themselves are
+/// met through the kernel's object list, whose descriptor has no such field. So
+/// this line is what turns "the device advertises `supportsSampleCount:` up to
+/// 8 and rasterizes at one" from an argument into a reading.
+///
+/// # Reported, not refused
+///
+/// The sibling refuses an unconsumed colour-attachment tag, and this one does
+/// not, on that sibling's own stated licence: its zero was *measured* first —
+/// `type7_color_attach_shape` runs 4–13 times a boot with `unconsumed=0` — and
+/// only a measured zero makes refusing safe. Nothing has ever measured this
+/// block. Refusing it before the reading exists would decline pipelines a live
+/// guest sends, on a guess about which tags those are.
+///
+/// Deduped per distinct `(tag, len)` rather than per value: what a reader needs
+/// first is which properties arrive, and a per-value latch on a field like a
+/// sample count would emit once per distinct count for no extra information.
+struct PipelineFieldDropped {
+    kind: &'static str,
+    tag: u8,
+    len: u8,
+}
+
+impl crate::observe::Decline for PipelineFieldDropped {
+    fn slug(&self) -> &'static str {
+        "pipeline_descriptor_field_dropped"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("kind", self.kind.to_string()),
+            ("tag", format!("0x{:02x}", self.tag)),
+            ("len", self.len.to_string()),
+        ]
+    }
+}
+
+/// Report the shape of a type-7 pipeline's own compact-TLV block and every
+/// field in it this decoder does not consume.
+///
+/// Two lines with the two jobs [`note_color_entry_fields`] splits for the same
+/// reason: a silent census cannot tell "the guest sends only the tags we read"
+/// from "this walk never ran on a live guest".
+///
+/// * `type7_pipeline_shape` is the *branch*, on the off channel, deduped per
+///   distinct `(kind, tag, len)` sequence and starring the unread tags. A boot
+///   with pipeline shapes and no drop line is a positive reading.
+/// * `pipeline_descriptor_field_dropped` is the *loss*, one typed decline per
+///   distinct dropped `(tag, len)`. See [`PipelineFieldDropped`].
+///
+/// Pipeline descriptors are decoded once per distinct pipeline and cached, so
+/// neither line is on a per-draw path.
+fn note_pipeline_tlv_fields(kind: &'static str, consumed_tags: &[u8], fields: &[CompactTlv]) {
+    let mut shape = String::new();
+    let mut shape_key: u64 = u64::from(kind.as_bytes()[0]);
+    let mut dropped: Vec<(u8, u8)> = Vec::new();
+    for f in fields {
+        let consumed = consumed_tags.contains(&f.tag);
+        let sep = if shape.is_empty() { "" } else { "," };
+        let star = if consumed { "" } else { "*" };
+        let _ = std::fmt::Write::write_fmt(
+            &mut shape,
+            format_args!("{sep}{:02x}:{}{star}", f.tag, f.length),
+        );
+        // Order-sensitive, so a reordered block reads as a different shape. The
+        // tag and the length are what a reader of this block depends on; the
+        // value is not, and mixing it in would make every distinct sample count
+        // a distinct shape.
+        shape_key = shape_key.rotate_left(9) ^ (u64::from(f.tag) << 8) ^ u64::from(f.length);
+        if !consumed {
+            dropped.push((f.tag, f.length));
+        }
+    }
+    if crate::observe::first_sight("type7_pipeline_shape", shape_key) {
+        crate::observe::off(format!(
+            "type7_pipeline_shape kind={kind} nfields={} tags=[{shape}] unconsumed={}",
+            fields.len(),
+            dropped.len()
+        ));
+    }
+    for (tag, len) in dropped {
+        crate::observe::Emit::decline("type7_pipeline", &PipelineFieldDropped { kind, tag, len })
+            .fail_once(u64::from(kind.as_bytes()[0]) << 16 | u64::from(tag) << 8 | u64::from(len));
+    }
+}
+
 pub fn decode_render_pipeline_descriptor(
     bytes: &[u8],
 ) -> Result<RenderPipelineDescriptor, DecodeStatus> {
@@ -2026,6 +2151,7 @@ pub fn decode_render_pipeline_descriptor(
         ..Default::default()
     };
     let (fields, consumed) = decode_compact_tlv_record(bytes, TYPE7_FIRST_TLVS)?;
+    note_pipeline_tlv_fields("render", &RENDER_PIPELINE_TAGS_CONSUMED, &fields);
     let tag01 = compact_tlv_u32(&fields, PIPELINE_TAG_VERTEX_FUNC).unwrap_or(0);
     let tag02 = compact_tlv_u32(&fields, PIPELINE_TAG_FRAGMENT_FUNC).unwrap_or(0);
     let tag03 = compact_tlv_u32(&fields, PIPELINE_TAG_MESH_FRAGMENT_FUNC).unwrap_or(0);
@@ -3086,6 +3212,7 @@ pub fn decode_compute_pipeline_descriptor(
         return Err(DecodeStatus::ErrShort("res_compute_pipeline_declared_len"));
     }
     let (fields, consumed) = decode_compact_tlv_record(bytes, TYPE7_FIRST_TLVS)?;
+    note_pipeline_tlv_fields("compute", &COMPUTE_PIPELINE_TAGS_CONSUMED, &fields);
     let first_tlv_end = TYPE7_FIRST_TLVS + consumed;
     let stage_input = parse_compute_stage_input_block(bytes, first_tlv_end)?;
     Ok(ComputePipelineDescriptor {

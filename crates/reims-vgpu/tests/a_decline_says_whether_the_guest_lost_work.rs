@@ -98,7 +98,16 @@ struct Row {
 /// How many types may answer [`Loss::ExecutedModified`].
 ///
 /// Not a budget. A ratchet: see [`the_executed_modified_census_only_shrinks`].
-const EXECUTED_MODIFIED_CEILING: usize = 8;
+///
+/// It has been raised exactly once, for `PipelineFieldDropped`, and that entry
+/// is the worked example of the one thing that legitimately raises it: a defect
+/// that was already happening and had **no decline type at all**, so the census
+/// could not see it. Naming it moved the number up while the device did not get
+/// worse. A ratchet that forbade this would be paying for its own blind spots —
+/// the cheapest way to keep this number low is to leave a loss unnamed, which is
+/// the opposite of what it is for. Raising it for a *new* modification is the
+/// thing it forbids.
+const EXECUTED_MODIFIED_CEILING: usize = 9;
 
 /// Every `impl Decline`/`impl Refusal` in the crate, and what its worst arm
 /// costs the guest.
@@ -537,6 +546,26 @@ const ROWS: &[Row] = &[
               in the record, each `unconsumed=0`, so this zero is measured and \
               not unreached. The line stays `first_sight`-latched and the \
               refusal does not",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/decode/resource/mod.rs",
+        ty: "PipelineFieldDropped",
+        loss: Loss::ExecutedModified,
+        why: "a tag in a type-7 pipeline's *own* compact-TLV block that neither \
+              pipeline decoder reads. The pipeline is built from the tags they \
+              do read, so every other property the guest set on the descriptor \
+              gets Metal's default: `rasterizationEnabled` becomes yes, \
+              `alphaToCoverageEnabled` becomes no, `rasterSampleCount` becomes \
+              one. This raised the ceiling by one, and the defect it counts is \
+              not new — the block simply had no instrument, so the loss was \
+              real and uncounted rather than absent. Reported and not refused \
+              on `ColorAttachDropped`'s own licence: that sibling refuses \
+              because `type7_color_attach_shape` measured its zero first, and \
+              nothing has yet measured this block. Retired by refusing once \
+              `type7_pipeline_shape` reads `unconsumed=0` on a driven boot, or \
+              by reading the tags it names — which is also the only route this \
+              device has to a guest's requested sample count, the attachment \
+              record carrying a resolve ref and no count",
     },
     Row {
         file: "crates/reims-vgpu/src/runtime/decode/resource/mod.rs",
@@ -1036,6 +1065,13 @@ fn every_decline_says_whether_the_guest_lost_work() {
 ///
 /// **Lower this when you retire one.** It is the only counter in the tree that
 /// measures the standing goal directly.
+///
+/// One thing it does *not* measure, and a reader ranking commits by it will get
+/// this backwards: a loss with no decline type is invisible here. Naming one
+/// raises the number without the device having changed, which is what
+/// [`EXECUTED_MODIFIED_CEILING`]'s own doc records having happened once. A
+/// commit that lowers this by deleting a decline has moved the number the wrong
+/// way.
 #[test]
 fn the_executed_modified_census_only_shrinks() {
     let census: Vec<&Row> = ROWS

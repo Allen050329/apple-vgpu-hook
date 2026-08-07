@@ -1296,6 +1296,93 @@ fn compact_render_pipeline_funcs() {
     assert_eq!(p.object_id, 9);
 }
 
+/// A property the guest set on a pipeline descriptor and this decoder does not
+/// read says so, and the shape line beside it is what makes a boot with *no*
+/// drops readable as a measurement rather than as silence.
+///
+/// The colour-attachment walk has had both halves of this instrument for as
+/// long as it has refused an unknown tag. The pipeline's own block had neither,
+/// which is what left `rasterSampleCount` — the only route this device has to a
+/// guest's requested sample count — not merely unread but uncounted.
+///
+/// Reported and not refused, on the colour walk's own licence: it refuses
+/// because its zero was measured first, and nothing has measured this block.
+#[test]
+fn an_unread_pipeline_descriptor_field_says_so_without_refusing_the_pipeline() {
+    use crate::contract::endian::st32;
+    // Tags no other test in this process uses, so `first_sight` cannot have
+    // latched either shape or either drop already.
+    const UNKNOWN_TAG_A: u8 = 0x6d;
+    const UNKNOWN_TAG_B: u8 = 0x6e;
+
+    let mut b = vec![0u8; 16 + 1 + 6 + 6 + 6];
+    let blen = b.len() as u32;
+    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[4..], blen);
+    st32(&mut b[8..], 9);
+    b[16] = 3;
+    b[17] = PIPELINE_TAG_VERTEX_FUNC;
+    b[18] = 4;
+    st32(&mut b[19..], 2);
+    b[23] = UNKNOWN_TAG_A;
+    b[24] = 4;
+    st32(&mut b[25..], 4);
+    b[29] = UNKNOWN_TAG_B;
+    b[30] = 4;
+    st32(&mut b[31..], 1);
+
+    let cap = crate::observe::FailCapture::start();
+    let p = decode_render_pipeline_descriptor(&b)
+        .expect("an unread property is reported, not refused: the pipeline still builds");
+    assert_eq!(p.vertex_func_ref, 2, "the tags it does read are unaffected");
+    let lines = cap.lines();
+
+    let shape: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("type7_pipeline_shape"))
+        .collect();
+    assert_eq!(
+        shape.len(),
+        1,
+        "one shape line per distinct block: {lines:?}"
+    );
+    assert!(
+        shape[0].contains("kind=render")
+            && shape[0].contains("tags=[01:4,6d:4*,6e:4*]")
+            && shape[0].contains("unconsumed=2"),
+        "the shape line names every tag and stars the unread ones: {}",
+        shape[0]
+    );
+
+    let drops: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("reason=pipeline_descriptor_field_dropped"))
+        .collect();
+    assert_eq!(drops.len(), 2, "one decline per dropped field: {lines:?}");
+    assert!(
+        drops.iter().any(|l| l.contains("tag=0x6d"))
+            && drops.iter().any(|l| l.contains("tag=0x6e")),
+        "each decline names its own tag: {drops:?}"
+    );
+    assert!(
+        drops[0].contains("kind=render"),
+        "and which pipeline kind dropped it, because the two decoders read \
+         different tag sets: {}",
+        drops[0]
+    );
+
+    // Both lines are latched. `resume`, not `start`: the claim above is what is
+    // under test, and `start` would clear the latch and see them a second time.
+    let cap2 = crate::observe::FailCapture::resume();
+    decode_render_pipeline_descriptor(&b).expect("still decodes");
+    assert!(
+        cap2.lines().is_empty(),
+        "a pipeline decoded once per distinct pipeline must not re-report its \
+         shape: {:?}",
+        cap2.lines()
+    );
+}
+
 #[test]
 fn compact_render_pipeline_object_mesh_funcs() {
     use crate::contract::endian::st32;
@@ -1660,7 +1747,11 @@ fn a_colour_attachment_entry_shorter_than_its_field_count_is_refused() {
         parse_color_attachments(&buf, buf.len(), off),
         Err(DecodeStatus::ErrShort("res_color_entry_fields_short"))
     );
-    assert!(cap2.lines().is_empty(), "the line is deduped: {:?}", cap2.lines());
+    assert!(
+        cap2.lines().is_empty(),
+        "the line is deduped: {:?}",
+        cap2.lines()
+    );
 }
 
 /// A colour-attachment field this decoder does not read refuses the pipeline,
@@ -1832,7 +1923,8 @@ fn a_colour_attachment_write_mask_decodes_and_defaults_to_all() {
     buf[entry + 7] = COLOR_ATTACHMENT_TAG_WRITE_MASK;
     buf[entry + 8] = 4;
     st32(&mut buf[entry + 9..], MTL_COLOR_WRITE_MASK_ALPHA);
-    let masked = parse_color_attachments(&buf, buf.len(), off).expect("a well-formed table decodes");
+    let masked =
+        parse_color_attachments(&buf, buf.len(), off).expect("a well-formed table decodes");
     assert_eq!(
         masked.first().map(|c| c.write_mask),
         Some(ColorWriteMask::new(MTL_COLOR_WRITE_MASK_ALPHA).unwrap())
@@ -1879,7 +1971,10 @@ fn a_write_mask_outside_the_four_bits_refuses_the_pipeline() {
     let cap = crate::observe::FailCapture::start();
     let status = parse_color_attachments(&buf, buf.len(), off)
         .expect_err("a mask outside the four bits is not a table this device can build");
-    assert_eq!(status, DecodeStatus::ErrUnsupported("res_color_write_mask_over"));
+    assert_eq!(
+        status,
+        DecodeStatus::ErrUnsupported("res_color_write_mask_over")
+    );
     let lines = cap.lines();
     assert!(
         lines

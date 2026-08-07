@@ -174,14 +174,18 @@ const ROWS: &[(&str, usize, Guarded, &str)] = &[
     ),
     (
         "reims-vgpu/src/runtime/decode/resource/mod.rs",
-        10,
+        11,
         Guarded::EmitsOnly,
-        "the type-7 colour-attachment and vertex-descriptor reporters. Four sites \
+        "the type-7 colour-attachment, pipeline-block and vertex-descriptor \
+         reporters. Four sites \
          sit directly above a `return Err(..)` — res_color_slot_over, \
          res_color_write_mask_over, res_color_field_unread, \
          res_color_entry_fields_short — and in all four the return is outside \
          the block at the enclosing indent. These are the worked examples the \
-         module doc names",
+         module doc names. The eleventh is `type7_pipeline_shape`, which guards \
+         one `observe::off` and has no return anywhere near it; the per-tag \
+         decline beside it latches through `fail_once` rather than through this \
+         scan's helpers, and it too decides only whether a line is written",
     ),
     (
         "reims-vgpu/src/runtime/drain/mod.rs",

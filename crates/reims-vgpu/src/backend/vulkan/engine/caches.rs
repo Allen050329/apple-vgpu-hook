@@ -1127,12 +1127,25 @@ impl ObjectCaches {
             .cull_mode(translate::raster::vk_cull_mode(key.cull_mode))
             .front_face(translate::raster::vk_front_face(key.front_face_ccw))
             .line_width(1.0);
-        // Likewise pinned rather than known: the pipeline sample count is not
-        // on the wire, and every render target this backend allocates is
-        // single-sampled, so decoding it would also need the attachment path to
-        // carry it. `translate::coverage` records `rasterSampleCount`, and a
-        // test there forbids that field from ever claiming to be honoured while
-        // this line stays a constant.
+        // Likewise pinned rather than known, and every render target this
+        // backend allocates is single-sampled, so honouring a count would need
+        // the attachment path to carry one too.
+        //
+        // `rasterSampleCount` is a property of `MTLRenderPipelineDescriptor`,
+        // so it reaches this device inside the type-7 pipeline's own
+        // compact-TLV block — which `decode_render_pipeline_descriptor` reads
+        // five tags out of and drops the rest. That block is the *only* route
+        // to a guest's requested sample count: the render-pass attachment
+        // record on the wire carries a resolve ref and no count, and the
+        // texture objects are met through the kernel's object list, whose
+        // descriptor has no such field either. `type7_pipeline_shape` and
+        // `pipeline_descriptor_field_dropped` are what make that block's unread
+        // tags a reading rather than an argument, and the reading is the
+        // prerequisite for changing this line.
+        //
+        // A pass that states a sample count *without* an attachment carrying
+        // one — `defaultRasterSampleCount` — is refused rather than rasterized
+        // here, as `StreamDrawDrop::PassRasterSampleCountUnsupported`.
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         // One blend attachment state per color attachment; Vulkan requires the
