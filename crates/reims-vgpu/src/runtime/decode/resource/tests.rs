@@ -1024,6 +1024,57 @@ fn icb_create_body_max_count_matrix() {
     );
 }
 
+/// A bit a guest sets in a packed stage-input word that this decoder has no
+/// field for says so.
+///
+/// The layout entry's word names 10 of its 32 bits and the attribute entry's
+/// names 16, so 22 and 16 respectively arrive with no reader. A field is
+/// `(word >> shift) & mask` at its own site and no site is in a position to
+/// notice that some bits are named by nothing — the same hole the tag
+/// instruments above close for the TLV form, one level down and harder to read.
+///
+/// Its two headers are excluded because they tile their word exactly; that is
+/// pinned by `const` assertion beside the masks, not here.
+#[test]
+fn a_packed_stage_input_bit_with_no_field_says_so() {
+    use crate::contract::endian::st32;
+    use crate::runtime::decode::resource::{
+        COMPUTE_STAGE_INPUT_ATTR_BITS_FORMAT_MASK, COMPUTE_STAGE_INPUT_ATTR_BITS_FORMAT_SHIFT,
+    };
+
+    // The top bit of the attribute word, which is 16 above the highest bit any
+    // field names. A value no other test in this process sets, so `first_sight`
+    // cannot have latched it.
+    const UNREAD_BIT: u32 = 1 << 31;
+    // Every bit a field does name, so the line must report the unread one alone
+    // rather than the whole word.
+    let read: u32 =
+        COMPUTE_STAGE_INPUT_ATTR_BITS_FORMAT_MASK << COMPUTE_STAGE_INPUT_ATTR_BITS_FORMAT_SHIFT;
+
+    let mut b = [0u8; 4];
+    st32(&mut b, read | UNREAD_BIT);
+
+    let cap = crate::observe::FailCapture::start();
+    super::note_unread_bits("compute_stage_input_attr", ld32(&b), read);
+    let lines = cap.lines();
+    assert!(
+        lines.iter().any(|l| l.contains("packed_word_unread_bits")
+            && l.contains("kind=compute_stage_input_attr")
+            && l.contains("unread=0x80000000")),
+        "the line must carry the unread bits alone, not the whole word: {lines:?}"
+    );
+
+    // A word inside the named bits is silent, which is what makes the line above
+    // a reading rather than noise on every entry.
+    let cap2 = crate::observe::FailCapture::resume();
+    super::note_unread_bits("compute_stage_input_attr", read, read);
+    assert!(
+        cap2.lines().is_empty(),
+        "a word whose every set bit has a field must stay quiet: {:?}",
+        cap2.lines()
+    );
+}
+
 #[test]
 fn compute_pipeline_stage_input_fixture() {
     // Local MetalSerializer fixture: dynamic Float4 stage-input layout.

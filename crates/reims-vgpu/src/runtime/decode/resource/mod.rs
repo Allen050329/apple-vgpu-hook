@@ -814,6 +814,66 @@ pub const COMPUTE_STAGE_INPUT_ATTR_BITS_FORMAT_SHIFT: u32 = 10;
 pub const COMPUTE_STAGE_INPUT_ATTR_BITS_FORMAT_MASK: u32 = 0x3f;
 pub const COMPUTE_STAGE_INPUT_ATTR_OFFSET: usize = 4;
 
+/// Which bits of each packed word above a reader consumes.
+///
+/// A bit-packed word is the same blind spot as a TLV entry read one named tag at
+/// a time, one level down and harder to see: a field is `(word >> shift) & mask`
+/// at its own site, and no site is in a position to notice that some bits are
+/// named by no field at all. `note_pipeline_tlv_fields` exists because the tag
+/// form had that hole; these exist because this form has it too.
+///
+/// The two headers **tile their word exactly** — no gap, no overlap — and that
+/// is pinned below by `const` assertion rather than by a runtime line, because
+/// it is a property of the constants and a field that leaves a hole should fail
+/// the build rather than a boot. `const` and not a `#[test]` for the reason
+/// `MAX_COMPUTE_STAGE_INPUT_ATTRS` gives above: this file compiles on the Metal
+/// arm, where its tests do not run.
+///
+/// The two *entry* words do **not** tile. The layout entry names 10 of 32 bits
+/// and the attribute entry 16, so 22 and 16 bits respectively reach this decoder
+/// with no reader. That is a runtime question rather than a build one, because
+/// what matters is whether a guest ever *sets* one — see [`note_unread_bits`].
+const COMPUTE_STAGE_INPUT_HEADER0_READ: u32 = COMPUTE_STAGE_INPUT_HEADER0_LEN_MASK
+    | (COMPUTE_STAGE_INPUT_HEADER0_INDEX_TYPE_MASK << COMPUTE_STAGE_INPUT_HEADER0_INDEX_TYPE_SHIFT)
+    | (COMPUTE_STAGE_INPUT_HEADER0_INDEX_BUFFER_MASK
+        << COMPUTE_STAGE_INPUT_HEADER0_INDEX_BUFFER_SHIFT)
+    | (COMPUTE_STAGE_INPUT_HEADER0_COUNT_MASK << COMPUTE_STAGE_INPUT_HEADER0_ATTR_COUNT_SHIFT)
+    | (COMPUTE_STAGE_INPUT_HEADER0_COUNT_MASK << COMPUTE_STAGE_INPUT_HEADER0_LAYOUT_COUNT_SHIFT);
+const _: () = assert!(COMPUTE_STAGE_INPUT_HEADER0_READ == u32::MAX);
+// Not covered by the line above on its own: five fields that *overlap* can still
+// OR to all-ones. Summing them proves each bit is claimed by exactly one field,
+// which is the half that breaks if a shift moves.
+const _: () = assert!(
+    (COMPUTE_STAGE_INPUT_HEADER0_LEN_MASK as u64)
+        + ((COMPUTE_STAGE_INPUT_HEADER0_INDEX_TYPE_MASK
+            << COMPUTE_STAGE_INPUT_HEADER0_INDEX_TYPE_SHIFT) as u64)
+        + ((COMPUTE_STAGE_INPUT_HEADER0_INDEX_BUFFER_MASK
+            << COMPUTE_STAGE_INPUT_HEADER0_INDEX_BUFFER_SHIFT) as u64)
+        + ((COMPUTE_STAGE_INPUT_HEADER0_COUNT_MASK << COMPUTE_STAGE_INPUT_HEADER0_ATTR_COUNT_SHIFT)
+            as u64)
+        + ((COMPUTE_STAGE_INPUT_HEADER0_COUNT_MASK
+            << COMPUTE_STAGE_INPUT_HEADER0_LAYOUT_COUNT_SHIFT) as u64)
+        == u32::MAX as u64
+);
+// `header1` is two halves and the upper one is taken by a bare shift with no
+// mask, so it claims everything above the shift by construction.
+const _: () = assert!(
+    COMPUTE_STAGE_INPUT_HEADER1_LAYOUT_OFFSET_MASK
+        == (1u32 << COMPUTE_STAGE_INPUT_HEADER1_ATTR_OFFSET_SHIFT) - 1
+);
+
+/// Bits of a compute stage-input **layout** entry's packed word with a reader:
+/// the buffer index and the step function. Twenty-two above them have none.
+const COMPUTE_STAGE_INPUT_LAYOUT_BITS_READ: u32 = COMPUTE_STAGE_INPUT_LAYOUT_BITS_BUFFER_MASK
+    | (COMPUTE_STAGE_INPUT_LAYOUT_BITS_STEP_MASK << COMPUTE_STAGE_INPUT_LAYOUT_BITS_STEP_SHIFT);
+
+/// Bits of a compute stage-input **attribute** entry's packed word with a
+/// reader: the location, the buffer index and the format. Sixteen above them
+/// have none.
+const COMPUTE_STAGE_INPUT_ATTR_BITS_READ: u32 = COMPUTE_STAGE_INPUT_ATTR_BITS_LOCATION_MASK
+    | (COMPUTE_STAGE_INPUT_ATTR_BITS_BUFFER_MASK << COMPUTE_STAGE_INPUT_ATTR_BITS_BUFFER_SHIFT)
+    | (COMPUTE_STAGE_INPUT_ATTR_BITS_FORMAT_MASK << COMPUTE_STAGE_INPUT_ATTR_BITS_FORMAT_SHIFT);
+
 /// Type-8 texture view (base texture + optional format/level/slice/swizzle).
 ///
 /// Which fields the wire carried is a property of `view_opcode` and nothing
@@ -2481,6 +2541,43 @@ fn note_type7_payload_len(kind: &'static str, payload: u32, declared: usize) {
     }
 }
 
+/// A bit in a packed decoded word that no field of this decoder names, set by
+/// the guest.
+///
+/// The tag instruments above answer "which properties arrived that nobody
+/// reads"; this answers the same question for a word where the properties are
+/// bit ranges. It is the harder of the two to see by reading: a tag with no arm
+/// is at least a token somebody could grep for, while a bit with no field is an
+/// absence in a set of shifts spread across a struct literal.
+///
+/// Zero is the expected reading and the only comfortable one. A set bit here is
+/// guest state this device drops with no name for what it was — the loss class
+/// with the least to go on, because unlike a tag it cannot even be reported by
+/// number in a way that identifies the property.
+///
+/// Latched per `(kind, unread bits)` rather than per word, so a field that
+/// varies within the read bits does not re-report, and a *new* unread bit does.
+fn note_unread_bits(kind: &'static str, word: u32, read_mask: u32) {
+    let unread = word & !read_mask;
+    if unread == 0 {
+        return;
+    }
+    let kind_key = kind
+        .bytes()
+        .fold(0u64, |acc, b| acc.rotate_left(7) ^ u64::from(b));
+    if crate::observe::first_sight(
+        "packed_word_unread_bits",
+        kind_key.rotate_left(32) ^ u64::from(unread),
+    ) {
+        crate::observe::fail(format!(
+            "packed_word_unread_bits reason=packed_word_unread_bits kind={kind} \
+             word={word:#010x} read={read_mask:#010x} unread={unread:#010x} \
+             (the guest set bits this decoder has no field for; the state they \
+              carry is dropped and there is no name for what it was)"
+        ));
+    }
+}
+
 /// A vertex descriptor found without the wire having said where it starts.
 ///
 /// The classic shape carries [`PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET`]; the mesh
@@ -3492,6 +3589,11 @@ pub fn parse_compute_stage_input_block(
         let entry = layout_section + (i as u64) * (COMPUTE_STAGE_INPUT_LAYOUT_ENTRY_SIZE as u64);
         let entry = entry as usize;
         let raw_bits = ld32(&bytes[entry..]);
+        note_unread_bits(
+            "compute_stage_input_layout",
+            raw_bits,
+            COMPUTE_STAGE_INPUT_LAYOUT_BITS_READ,
+        );
         if out.layouts.len() < MAX_COMPUTE_STAGE_INPUT_LAYOUTS {
             out.layouts.push(ComputeStageInputLayout {
                 raw_bits,
@@ -3509,6 +3611,11 @@ pub fn parse_compute_stage_input_block(
         let entry = attr_section + (i as u64) * (COMPUTE_STAGE_INPUT_ATTR_ENTRY_SIZE as u64);
         let entry = entry as usize;
         let raw_bits = ld32(&bytes[entry..]);
+        note_unread_bits(
+            "compute_stage_input_attr",
+            raw_bits,
+            COMPUTE_STAGE_INPUT_ATTR_BITS_READ,
+        );
         if out.attributes.len() < MAX_COMPUTE_STAGE_INPUT_ATTRS {
             out.attributes.push(ComputeStageInputAttribute {
                 raw_bits,
@@ -3522,6 +3629,24 @@ pub fn parse_compute_stage_input_block(
         } else {
             out.dropped_attributes += 1;
         }
+    }
+    // The denominator for `packed_word_unread_bits` over the two entry words
+    // above. Without it, a boot where no compute pipeline carries a stage-input
+    // block and a boot where every entry's bits are all named read identically
+    // at zero — and only the second is a measurement. This is the split
+    // `note_color_entry_fields` states for the tag form; the bit form needs it
+    // more, because a stage-input block is optional and this walk answers `None`
+    // from six earlier returns.
+    if crate::observe::first_sight(
+        "compute_stage_input_decoded",
+        (u64::from(layout_count) << 32) | u64::from(attr_count),
+    ) {
+        crate::observe::off(format!(
+            "compute_stage_input_decoded layouts={layout_count} attrs={attr_count} \
+             index_type={index_type} index_buffer={index_buffer_index} \
+             (the denominator for packed_word_unread_bits: this many entry words \
+              were read and had every set bit named)"
+        ));
     }
     Ok(Some(out))
 }

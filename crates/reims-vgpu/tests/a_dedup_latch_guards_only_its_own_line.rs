@@ -174,7 +174,7 @@ const ROWS: &[(&str, usize, Guarded, &str)] = &[
     ),
     (
         "reims-vgpu/src/runtime/decode/resource/mod.rs",
-        13,
+        15,
         Guarded::EmitsOnly,
         "the type-7 colour-attachment, pipeline-block and vertex-descriptor \
          reporters. Four sites \
@@ -191,7 +191,12 @@ const ROWS: &[(&str, usize, Guarded, &str)] = &[
          block comes from before calling it, and calls it only to say so. The \
          thirteenth is `type7_payload_len_disagrees`, the same shape: the \
          function returns early when the two header lengths agree and the latch \
-         guards only the line for when they do not",
+         guards only the line for when they do not. The \
+         fourteenth is `packed_word_unread_bits`, the same again: the function \
+         returns early when every set bit has a field. The \
+         fifteenth is `compute_stage_input_decoded`, that instrument's \
+         denominator, guarding one `observe::off` at the tail of a walk that has \
+         already finished",
     ),
     (
         "reims-vgpu/src/runtime/drain/mod.rs",
