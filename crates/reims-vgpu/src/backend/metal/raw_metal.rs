@@ -731,9 +731,19 @@ pub fn reflection_bindings(reflection: *mut Object) -> Vec<BindingInfo> {
     }
 }
 
-pub fn render_reflection_sampler_mask(reflection: *mut Object, vertex: bool) -> u32 {
+/// Which sampler slots one stage of a built PSO actually samples, as a bit per
+/// slot, from Metal's own pipeline reflection.
+///
+/// `Ok(0)` where there is no reflection to read — no argument info was
+/// requested, or the stage has no bindings — which is a stage that samples
+/// nothing and not a failure. `Err` only where the reflection names a slot
+/// outside the argument table, which is the alarm described at the check.
+pub fn render_reflection_sampler_mask(
+    reflection: *mut Object,
+    vertex: bool,
+) -> Result<u32, MetalSamplerMaskOverflow> {
     if reflection.is_null() {
-        return 0;
+        return Ok(0);
     }
     unsafe {
         let bindings: *mut Object = if vertex {
@@ -742,7 +752,7 @@ pub fn render_reflection_sampler_mask(reflection: *mut Object, vertex: bool) -> 
             msg_send![reflection, fragmentBindings]
         };
         if bindings.is_null() {
-            return 0;
+            return Ok(0);
         }
         let count: NSUInteger = msg_send![bindings, count];
         let mut mask = 0u32;
@@ -765,22 +775,25 @@ pub fn render_reflection_sampler_mask(reflection: *mut Object, vertex: bool) -> 
                 // A healthy zero: Metal's sampler argument table is what this
                 // bound *is*, so its own reflection should never name a slot
                 // outside it. A firing means this backend's idea of the table
-                // has parted from the driver's, and the bit would otherwise be
-                // dropped with nothing said — the shader then samples a slot
-                // that never receives its default sampler.
+                // has parted from the driver's.
+                //
+                // Refused rather than skipped. Dropping the bit built a mask
+                // that says the shader does not sample that slot, so the slot
+                // never receives its default sampler and the shader reads an
+                // undefined one — a wrong frame with nothing to explain it. The
+                // sibling `bind_compute_samplers` has always refused on this
+                // same bound, one file away, and there is no reason the two
+                // stages should answer differently.
                 crate::observe::Emit::decline(
                     "metal_render_reflection",
-                    &MetalSamplerMaskOverflow {
-                        index,
-                        vertex,
-                    },
+                    &MetalSamplerMaskOverflow { index, vertex },
                 )
                 .fail_once(index as u64);
-                continue;
+                return Err(MetalSamplerMaskOverflow { index, vertex });
             }
             mask |= 1u32 << index;
         }
-        mask
+        Ok(mask)
     }
 }
 

@@ -766,8 +766,26 @@ fn get_render_pipeline_state(
         })?;
 
     let reflection_ptr = reflection.as_ptr() as *mut objc::runtime::Object;
-    let vert_mask = render_reflection_sampler_mask(reflection_ptr, true);
-    let frag_mask = render_reflection_sampler_mask(reflection_ptr, false);
+    // A reflection naming a sampler slot the argument table does not have
+    // refuses the PSO. Building it anyway would cache a mask claiming the shader
+    // does not sample that slot, and every later draw through this PSO would
+    // sample an undefined sampler with nothing to say why.
+    let sampler_mask = |vertex: bool| {
+        render_reflection_sampler_mask(reflection_ptr, vertex).map_err(|overflow| {
+            set_err(
+                err,
+                format!(
+                    "render reflection sampler slot {} past table",
+                    overflow.index
+                ),
+            );
+            Status::execute("metal_render_reflection_sampler_past_table")
+                .field("index", overflow.index)
+                .field("vertex", vertex)
+        })
+    };
+    let vert_mask = sampler_mask(true)?;
+    let frag_mask = sampler_mask(false)?;
 
     Ok(render_pso_insert(lookup, pso, vert_mask, frag_mask))
 }

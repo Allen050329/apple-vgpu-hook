@@ -108,11 +108,17 @@ struct Row {
 /// which is the opposite of what it is for. Raising it for a *new* modification
 /// is the thing it forbids.
 ///
-/// It has been **lowered** four times — 9, 8, 7, 6, 5, one per entry below —
-/// and all four have the shape a lowering is supposed to have: the modification
+/// It has been **lowered** five times — 9, 8, 7, 6, 5, 4, one per entry below —
+/// and all five have the shape a lowering is supposed to have: the modification
 /// was not reclassified, it was made impossible. The count is spelled out
 /// against the sequence because it had already drifted once: it read "twice"
 /// with three entries listed, the third having been added without it.
+///
+/// Two of the five were found the same way, which is worth saying because it is
+/// a method and not a coincidence: **the other arm already answered.** Where two
+/// arms consume one wire form or one bound, the one that silently modifies is
+/// usually the one with no channel to refuse through, and the fix is to give it
+/// one rather than to reason from scratch about what it ought to do.
 ///
 /// * `VertexFormatWidenDecline` — the substitution now runs only where the
 ///   shader's own declared read width proves it unobservable, and the two cases
@@ -130,6 +136,10 @@ struct Row {
 ///   settled it was **the other arm** — Vulkan already refused on the same two
 ///   wire words — so the divergence was the finding and the fix was to make the
 ///   two agree rather than to reason about what Metal ought to do.
+/// * `MetalSamplerMaskOverflow` — `render_reflection_sampler_mask` returns a
+///   `Result` and the PSO is refused, instead of the bit being dropped from a
+///   mask that then claimed the shader never sampled that slot. The sibling
+///   `bind_compute_samplers` had refused on the identical bound all along.
 /// * `WrapperUpperHalf` — the type is **gone**, and so is the arm it guarded.
 ///   Its `why` named the retirement as "learning what the upper half selects";
 ///   what static RE established instead is that the word is not an opcode at
@@ -138,7 +148,7 @@ struct Row {
 ///   normally the wrong way to move this number — the doc above says so — and
 ///   this is the exception the rule needs stated: the entry is removed because
 ///   the *code path* is, not because the verdict was inconvenient.
-const EXECUTED_MODIFIED_CEILING: usize = 5;
+const EXECUTED_MODIFIED_CEILING: usize = 4;
 
 /// Every `impl Decline`/`impl Refusal` in the crate, and what its worst arm
 /// costs the guest.
@@ -164,13 +174,18 @@ const ROWS: &[Row] = &[
     Row {
         file: "crates/reims-vgpu/src/backend/metal/raw_metal.rs",
         ty: "MetalSamplerMaskOverflow",
-        loss: Loss::ExecutedModified,
-        why: "the emitter `continue`s past the sampler slot and finishes \
-              building the mask, so the shader samples a slot that never \
-              receives its default sampler. A healthy zero — the table this \
-              exceeds is Metal's own, so a firing means this backend's idea of \
-              it has parted from the driver's. Retired by deriving the bound \
-              from the driver rather than from a constant",
+        loss: Loss::Refused,
+        why: "Metal's own pipeline reflection named a sampler slot outside the \
+              argument table. `render_reflection_sampler_mask` used to \
+              `continue` past it and finish building the mask, so the cached \
+              mask claimed the shader did not sample that slot, the slot never \
+              received its default sampler, and every later draw through that \
+              PSO read an undefined one. It now returns `Err` and the PSO is \
+              refused. A healthy zero either way — the bound is Apple's own \
+              measured serializer limit, pinned equal to \
+              `bind_limit::SAMPLER` — and the sibling `bind_compute_samplers` \
+              had always refused on the same bound, so this was two stages \
+              answering differently rather than a bound that needed deriving",
     },
     Row {
         file: "crates/reims-vgpu/src/backend/vulkan/engine/caches.rs",
