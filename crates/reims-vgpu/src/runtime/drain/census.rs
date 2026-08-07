@@ -1423,13 +1423,22 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
 /// The denominator comes from [`crate::runtime::guest_ram_map::span_census`],
 /// which is the shim's answer, so the pair reads `imported/reported`.
 ///
-/// This is not hypothetical on the x86 pathway: `vm/boot-x86.sh` boots `-m 16G`
-/// and q35 splits it around the PCI hole, so the shim reports 2 GiB below 4 GiB
-/// and 14 GiB above it. A driven Safari boot imports only the 14 GiB span, and
-/// the numerator alone would read as 2 GiB of guest RAM having gone missing.
+/// This is not hypothetical on the x86 pathway. `vm/boot-x86.sh` boots `-m 16G`
+/// and a driven Safari boot measures `ramblocks=1/4 mib=14336/16399`: the shim
+/// reports four writable spans and the workload imports one, the 14 GiB half of
+/// `-m` above the PCI hole. The numerator alone reads as 2 GiB of guest RAM
+/// having gone missing against `-m 16G`, which is how it was first misread.
+///
+/// The reported set is larger than `-m` — 16399 MiB against 16384 — because the
+/// shim walks the flat view rather than `-m`, and a board exposes smaller
+/// writable RAM regions besides the two halves of main memory. It is not
+/// over-reporting device memory: `reims_vgpu_shim_guest_ram_regions` excludes
+/// ROM, ROMD, `ram_device` and readonly regions by name, so everything counted
+/// here is memory the guest can store into. `guest_ram_span` names each one at
+/// build time, which is where to look when this denominator surprises you.
 ///
 /// `mib` is the same level and is not a rate: it is guest RAM the device can
-/// currently reach, against what the machine has.
+/// currently reach, against what the machine reported.
 #[cfg(feature = "backend-vulkan")]
 fn emit_guest_import_levels() {
     let (bytes, count) = crate::backend::vulkan::engine::guest_import_census();

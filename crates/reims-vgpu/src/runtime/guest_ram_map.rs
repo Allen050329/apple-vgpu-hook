@@ -457,6 +457,25 @@ fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
     let refusal = imports
         .is_empty()
         .then_some(MapRefusal::NoUsableRegion { spans: count });
+    // Once per boot, because this is what makes `guest_import_levels`'s
+    // denominator interpretable. That line reports `imported/reported` and a
+    // reader seeing `1/4` cannot tell which three went untouched, or whether the
+    // untouched ones are guest RAM at all — on q35 the reported set is the two
+    // halves of `-m` either side of the PCI hole plus whatever smaller writable
+    // RAM regions the board exposes. Naming each span's base and length answers
+    // that from the log instead of from a comment that would go stale when a
+    // board changes.
+    //
+    // `resolve` runs once per boot (and again only after a device teardown), so
+    // this is a handful of lines, not a cadence.
+    for (n, import) in imports.iter().enumerate() {
+        crate::observe::off(format!(
+            "guest_ram_span n={n}/{count} gpa={:#x} len={} mib={}",
+            import.gpa_base(),
+            import.len(),
+            import.len() / (1024 * 1024),
+        ));
+    }
     Resolved { imports, refusal }
 }
 
