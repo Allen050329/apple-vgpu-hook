@@ -2645,6 +2645,33 @@ fn note_readback_memory(
 /// because a count-capped cache at three orders of magnitude under its byte cap
 /// is the shape the sampled rail was measured in and the one that would make
 /// raising `SAMPLED_CACHE_CAP` worth anything.
+///
+/// # That shape is what a driven boot reports, and it is what defeats the gather
+///
+/// Driven x86/PCI Safari drag, quiesced, one `vk_caps`, whole boot:
+///
+/// ```text
+/// sampled_evict_count_cap  5949
+/// sampled_evict_byte_cap      0
+/// ```
+///
+/// Every eviction on the boot was the count cap and the byte cap never bound
+/// once. Read that against the gather rail's own split in the same log —
+/// `sampled_gather_unretained` 6296, `sampled_gather_unvouched` 0 (see
+/// [`EngineCounters::sampled_gather_unvouched`]) — and the two are near 1:1: the
+/// guest-write witness vouches for the window, this cache drops the image before
+/// the next bind asks for it, and the bind gathers ~2.3 MB again.
+///
+/// **Do not read that as a licence to raise `SAMPLED_CACHE_CAP`.** What is
+/// banded here is the eviction *route*, not the requested reach: nothing yet
+/// counts how many distinct `(key, identity)` windows the workload wants live at
+/// once, and that is the number `AGENTS.md` requires before a bound moves. The
+/// arithmetic is a warning rather than a green light — a retained gather charges
+/// `content_len`, so at the ~2.29 MB a window this workload gathers, 64 entries
+/// is already ~146 MB against a 128 MB [`SAMPLED_CACHE_BYTE_CAP`]. A count cap
+/// raised without the byte cap would hand the evictions straight to the other
+/// route and buy nothing, which is precisely the outcome this function's
+/// preference order exists to make visible.
 fn sampled_evict_route(len: usize, bytes: usize) -> Option<&'static str> {
     if len > SAMPLED_CACHE_CAP {
         Some("sampled_evict_count_cap")
