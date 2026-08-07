@@ -341,12 +341,31 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// of the link. So:
 ///
 /// - **Batching the fences** (one command buffer for the N windows landing at
-///   one drain fence, one wait) recovers the submit-to-signal gap per flush.
-///   Priced at ~80 µs here, which is about a tenth of a flush — but that was
-///   measured before the draw side got cheap. Re-read "The fourth line,
-///   divided" above before sizing it: on the current build the same quantity is
-///   **212 µs a flush and 20% of the worker second**, which makes this the
-///   best-priced remaining lever rather than the small one.
+///   one drain fence, one wait) recovers the submit-to-signal gap per flush,
+///   which on the current build is **212 µs a flush and 195 ms/s — 20% of the
+///   worker's second**, not the ~80 µs this section used to price it at.
+///
+///   **And it still cannot be built, because N is 1.** See
+///   `flush_mapping_windows_before_fence`, which measured that already: a
+///   driven second reads `mapw_fence_pass` and `mapw_fence_flush` *equal*, so
+///   every fence pass lands exactly one window. Confirmed again on the boot
+///   above — 8 466 passes against 8 467 window flushes over the whole boot, and
+///   `gvaw_fence_flush 12 445 + mapw_fence_flush 8 467 = 20 912` against
+///   `readback_split fence` 20 918. One fence per window, both rails.
+///
+///   The trap is the *tranche* framing, and it is worth naming because it
+///   survives reading the refutation. `drain_duty` reports **17 flushes per
+///   drain tranche**, which reads like 17 batchable units — and it is not. Those
+///   17 are 17 sequential completion stamps, and a stamp is this device's
+///   statement that the guest may read the pages *now*. Deferring window 1's
+///   landing until window 17 is recorded puts a landing after the stamp that
+///   claims it already happened, which is the single thing this whole module
+///   exists to prevent. The concurrency available to a batch is per fence, and
+///   per fence it is one.
+///
+///   So the 195 ms/s is not recoverable by batching. It is 920 unavoidable
+///   round trips, and the only levers on it are **fewer stamps** or a **shorter
+///   round trip** — not fewer waits per stamp.
 /// - **Bounding what each flush copies** attacks the 354 µs, and was the lever
 ///   the "moving whole frames that nobody asked for" paragraph below argued for
 ///   across three sessions. **It has been built and it saves nothing.** Read the
