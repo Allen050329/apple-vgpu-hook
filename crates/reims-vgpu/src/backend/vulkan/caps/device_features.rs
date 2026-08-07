@@ -189,6 +189,17 @@ pub struct DeviceFeatures {
     /// assumed from the feature: the guarantee is a floor, and a guest may ask
     /// for more than the floor.
     pub max_viewports: u32,
+    /// `VkPhysicalDeviceFeatures::occlusionQueryPrecise` — whether an occlusion
+    /// query may be recorded with `VK_QUERY_CONTROL_PRECISE_BIT`.
+    ///
+    /// This is what `MTLVisibilityResultModeCounting` asks for. Without the bit
+    /// a Vulkan occlusion query promises only "non-zero if any sample passed",
+    /// which is `MTLVisibilityResultModeBoolean` exactly — so the query *type*
+    /// needs no feature and no limit, and this gates only the counting arm.
+    /// `engine::exec` refuses a counting draw where it is unset rather than
+    /// recording without the bit: an imprecise count is a plausible wrong
+    /// number, which is worse than a named refusal.
+    pub occlusion_query_precise: bool,
 }
 
 impl DeviceFeatures {
@@ -205,6 +216,10 @@ impl DeviceFeatures {
     /// `multi_viewport` is bound where supported: `engine::exec` builds a
     /// pipeline whose `viewportCount` is the guest's, and a count above one is
     /// invalid without it.
+    ///
+    /// `occlusion_query_precise` likewise: `engine::exec` records
+    /// `vkCmdBeginQuery` with `PRECISE` for a counting draw, and passing that
+    /// bit is invalid without the feature enabled.
     pub fn enabled_features(&self) -> vk::PhysicalDeviceFeatures {
         vk::PhysicalDeviceFeatures::default()
             .robust_buffer_access(self.robust_buffer_access)
@@ -216,6 +231,7 @@ impl DeviceFeatures {
             .fill_mode_non_solid(self.fill_mode_non_solid)
             .depth_clamp(self.depth_clamp)
             .multi_viewport(self.multi_viewport)
+            .occlusion_query_precise(self.occlusion_query_precise)
     }
 
     /// The Vulkan 1.2 features to enable.
@@ -352,6 +368,7 @@ pub unsafe fn query(
         fill_mode_non_solid: supported.fill_mode_non_solid == vk::TRUE,
         depth_clamp: supported.depth_clamp == vk::TRUE,
         multi_viewport: supported.multi_viewport == vk::TRUE,
+        occlusion_query_precise: supported.occlusion_query_precise == vk::TRUE,
         // `max(1)` because a pipeline always declares at least one slot, and a
         // device reporting 0 here would otherwise make every draw undrawable.
         max_viewports: props.limits.max_viewports.max(1),
@@ -392,6 +409,7 @@ mod tests {
 
     fn all_supported() -> DeviceFeatures {
         DeviceFeatures {
+            occlusion_query_precise: true,
             robust_buffer_access: true,
             sampler_anisotropy: true,
             max_sampler_anisotropy: 16.0,

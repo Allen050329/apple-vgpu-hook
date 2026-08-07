@@ -18,7 +18,7 @@ use super::pools::{BatchTarget, BufferSlot, ResourcePools, SampledKey, SampledSl
 use super::stage_phase;
 use super::types::{
     BufferContent, ColorWriteMask, DrawError, DrawOutput, DrawRequest, SampledSource,
-    ScissorResource, SeedOrder, VertexStepFunction, ViewportResource,
+    ScissorResource, SeedOrder, VertexStepFunction, ViewportResource, VisibilityResultMode,
 };
 use super::vk_call::{VkCall, VkOp};
 
@@ -1124,11 +1124,16 @@ pub(crate) unsafe fn execute_draw_inner(
     // small enough window; `write_stamp` now quiesces every recorded guest read
     // before the guest is told anything finished, which makes it a rule and
     // costs the exclusion nothing to drop.
+    // A queried draw is never batched. Deferring the submit defers the fence,
+    // and the query result is not readable until the command buffer has
+    // completed — so a batched queried draw would return `None` for a count the
+    // guest is about to read. The cost lands only on passes that arm a query.
     let batch_eligible = !force_loss
         && !ctx.caps.quirks.no_deferred_draw_batching
         && !is_mrt
         && req.depth.is_none()
         && req.skip_readback
+        && req.occlusion_query.is_none()
         && req.target_identity.is_some();
     let samples_own_target = req.sampled_images.iter().any(|s| {
         matches!(
@@ -1302,6 +1307,23 @@ pub(crate) unsafe fn execute_draw_inner(
             },
         ));
     }
+    // Resolve the occlusion query before anything is recorded, so a host that
+    // cannot count refuses the draw rather than recording one it must throw
+    // away. `Boolean` needs nothing: an imprecise Vulkan occlusion query is
+    // that mode exactly.
+    let occlusion_flags = match req.occlusion_query {
+        None => None,
+        Some(VisibilityResultMode::Counting) if !ctx.features.occlusion_query_precise => {
+            return Err(DrawError::Unsupported(
+                super::reason::DrawReason::VisibilityCountingUnsupported {
+                    occlusion_query_precise: ctx.features.occlusion_query_precise,
+                },
+            ));
+        }
+        Some(mode) => Some(crate::backend::vulkan::translate::raster::vk_query_control_flags(
+            mode,
+        )),
+    };
     let pipeline_key = PipelineKey {
         vert: vert_digest,
         frag: frag_digest,
@@ -2491,10 +2513,39 @@ pub(crate) unsafe fn execute_draw_inner(
             },
         })
         .clear_values(&clear);
+    // The pool is created per queried draw and destroyed once this draw's fence
+    // has been waited on, a few lines below — at which point the command buffer
+    // that names it has completed, which is the whole of Vulkan's valid-usage
+    // requirement for destroying it. That is deliberately simpler than the
+    // `TimestampProbe` shape (one pool for the device's life): this pool cannot
+    // be shared with a concurrent submission because there is no concurrent
+    // submission to share it with, a queried draw having just been excluded
+    // from batching. If `note_create` ever shows these in volume, pooling them
+    // per ring slot is the next step — it is not one worth taking before a
+    // guest has armed a single query.
+    //
+    // `vkCmdResetQueryPool` must be recorded outside a render pass instance,
+    // which is why it sits here rather than beside the `vkCmdBeginQuery`.
+    let occlusion = match occlusion_flags {
+        None => None,
+        Some(flags) => {
+            let ci = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::OCCLUSION)
+                .query_count(1);
+            let pool = ctx.device.create_query_pool(&ci, None).map_err(|e| {
+                DrawError::VkCall(VkCall::new(VkOp::ExecCreateQueryPool, e))
+            })?;
+            ctx.device.cmd_reset_query_pool(cb, pool, 0, 1);
+            Some((pool, flags))
+        }
+    };
     ctx.device
         .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
     ctx.device
         .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
+    if let Some((pool, flags)) = occlusion {
+        ctx.device.cmd_begin_query(cb, pool, 0, flags);
+    }
 
     // Dynamic viewport/scissor. Metal NDC is Y-up and Vulkan's is Y-down, so
     // every viewport is emitted flipped: origin at the bottom edge, negative
@@ -2597,6 +2648,9 @@ pub(crate) unsafe fn execute_draw_inner(
                 req.base_instance,
             );
         }
+    }
+    if let Some((pool, _)) = occlusion {
+        ctx.device.cmd_end_query(cb, pool, 0);
     }
     ctx.device.cmd_end_render_pass(cb);
 
@@ -2796,6 +2850,12 @@ pub(crate) unsafe fn execute_draw_inner(
         return Ok(DrawOutput {
             pixels: Vec::new(),
             pixels_bgra: output_bgra,
+            // Unreachable with a query armed: `batch_eligible` excludes one, so
+            // `defer_submit` is false for every queried draw. Stated as `None`
+            // rather than asserted because `None` is also the honest answer if
+            // that exclusion is ever relaxed — a deferred draw genuinely has no
+            // count yet.
+            occlusion_samples: None,
         });
     }
 
@@ -2852,12 +2912,28 @@ pub(crate) unsafe fn execute_draw_inner(
     // Store loses its frame silently, which is the one outcome the ground rules
     // forbid outright. What the equality licenses is not re-measuring it.
     let Some(ref rb) = readback else {
+        // A queried draw has no pixels to read back and still cannot take this
+        // return: the sample count *is* its result, and it is not readable
+        // until the command buffer completes. So the wait the comment above
+        // says this path exists to skip is exactly what a query reinstates —
+        // for queried draws only, which on every workload measured so far is
+        // none of them.
+        if occlusion.is_some() {
+            phase.enter(super::draw_phase::Phase::Wait);
+            pools.wait_entry_fence(ctx, counters, fence)?;
+            return Ok(DrawOutput {
+                pixels: Vec::new(),
+                pixels_bgra: output_bgra,
+                occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
+            });
+        }
         counters
             .render_post_wait_skips
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(DrawOutput {
             pixels: Vec::new(),
             pixels_bgra: output_bgra,
+            occlusion_samples: None,
         });
     };
 
@@ -2885,7 +2961,44 @@ pub(crate) unsafe fn execute_draw_inner(
     Ok(DrawOutput {
         pixels: out,
         pixels_bgra: output_bgra,
+        occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
     })
+}
+
+/// Read the sample count a queried draw produced, and destroy its pool.
+///
+/// **Only call this after the draw's fence has been waited on.** Both halves
+/// depend on it: `WAIT` would otherwise be the only thing keeping the read
+/// honest, and `vkDestroyQueryPool` requires every submitted command naming the
+/// pool to have completed. Waiting is the caller's job because the two callers
+/// reach it differently — one waits because it has pixels to read back, the
+/// other waits *because* of the query.
+///
+/// `WAIT` is passed anyway rather than relied on: the fence says the command
+/// buffer finished, which is the same guarantee, and asking for both costs
+/// nothing while removing the question of which one is load-bearing. Without
+/// either, `vkGetQueryPoolResults` may return `VK_NOT_READY` and leave the
+/// destination untouched — a zero that reads exactly like a fully occluded
+/// draw.
+fn read_occlusion_samples(
+    ctx: &super::context::DeviceContext,
+    occlusion: Option<(vk::QueryPool, vk::QueryControlFlags)>,
+) -> Result<Option<u64>, DrawError> {
+    let Some((pool, _)) = occlusion else {
+        return Ok(None);
+    };
+    let mut samples = [0u64; 1];
+    let read = unsafe {
+        ctx.device.get_query_pool_results(
+            pool,
+            0,
+            &mut samples,
+            vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+        )
+    };
+    unsafe { ctx.device.destroy_query_pool(pool, None) };
+    read.map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecGetQueryPoolResults, e)))?;
+    Ok(Some(samples[0]))
 }
 
 /// First synchronization scope for a write to *this draw's own colour target*

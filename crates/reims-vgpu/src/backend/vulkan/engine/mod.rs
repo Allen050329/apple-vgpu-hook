@@ -53,7 +53,8 @@ pub use types::{
     SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
     SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
     StorageBufferResource, StorageImageFormat, TargetIdentity, VertexAttributeFormat,
-    VertexAttributeResource, VertexStepFunction, ViewportResource, WindowPresentSource,
+    VertexAttributeResource, VertexStepFunction, ViewportResource, VisibilityResultMode,
+    WindowPresentSource,
     COLOR_INPUT_BINDING,
 };
 pub use types::viewport_slot_count;

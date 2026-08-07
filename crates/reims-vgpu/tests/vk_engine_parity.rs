@@ -15,7 +15,7 @@ use reims_vgpu::backend::vulkan::engine::{
     SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
     StencilFaceOps, StencilOp, StencilState, StorageBufferResource, TargetIdentity,
     VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
-    MAX_DEVICE_RECREATES,
+    VisibilityResultMode, MAX_DEVICE_RECREATES,
 };
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -170,6 +170,123 @@ fn plain_triangle_known_color() {
     let req = engine_req(&v, &f, 16, 16);
     if let Some(px) = draw_or_skip("plain_triangle", &req) {
         assert_fullscreen_fragment_color("plain_triangle", &px, 16, 16);
+    }
+}
+
+/// The whole `DrawOutput`, for a case whose answer is not pixels.
+///
+/// [`draw_or_skip`] returns only the normalized colour bytes, which is right
+/// for every case that asserts what was drawn. An occlusion count is a second
+/// thing the same draw produced, so these ask for the record rather than for
+/// the picture.
+fn draw_out_or_skip(label: &str, req: &DrawRequest) -> Option<engine::DrawOutput> {
+    match engine::execute_draw_request(req) {
+        Ok(o) => Some(o),
+        Err(e) => {
+            let s = e.to_string();
+            if skip_if_no_gpu(&s) {
+                eprintln!("SKIP {label}: no GPU ({s})");
+                None
+            } else if s.contains("visibility_counting_unsupported") {
+                // The refusal under test elsewhere. A host without
+                // `occlusionQueryPrecise` is a supported host, not a broken
+                // one, and it cannot answer a counting query — so these two
+                // skip rather than fail, exactly as a host with no ICD does.
+                eprintln!("SKIP {label}: host offers no precise occlusion ({s})");
+                None
+            } else {
+                panic!("{label}: {s}");
+            }
+        }
+    }
+}
+
+/// A counting occlusion query reports the sample count the scissor admits, on
+/// real hardware.
+///
+/// The number is what makes this a proof rather than a smoke test. The fixture
+/// triangle covers the whole clip volume — `assert_fullscreen_fragment_color`
+/// asserts exactly that elsewhere — and this engine rasterizes at one sample
+/// per pixel, so the samples that pass are precisely the scissor's area. Every
+/// plausible wrong implementation lands somewhere else: a query never begun
+/// reads `None` or `Some(0)`, a query that ignored the scissor reads the target
+/// area 1024, and a pool used without `vkCmdResetQueryPool` reads whatever the
+/// driver left there.
+#[test]
+fn an_occlusion_query_counts_the_samples_the_scissor_admits() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let mut req = engine_req(&v, &f, 32, 32);
+    req.scissors = vec![ScissorResource {
+        x: 8,
+        y: 8,
+        width: 8,
+        height: 8,
+    }];
+    req.occlusion_query = Some(VisibilityResultMode::Counting);
+    if let Some(out) = draw_out_or_skip("occlusion_counting", &req) {
+        assert_eq!(
+            out.occlusion_samples,
+            Some(8 * 8),
+            "a counting query over an 8x8 scissor passes 64 samples"
+        );
+    }
+}
+
+/// A second query in the same process reports its own scissor's area.
+///
+/// The pair is what pins the reset. One case alone cannot tell a pool that is
+/// reset per draw from one that is never reset and happens to read the right
+/// number once; a second query whose answer differs is only correct if the
+/// first one's result was cleared. It also fixes the count as a function of the
+/// scissor rather than a constant that matched by luck.
+#[test]
+fn a_second_occlusion_query_counts_its_own_scissor() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let mut req = engine_req(&v, &f, 32, 32);
+    req.scissors = vec![ScissorResource {
+        x: 0,
+        y: 0,
+        width: 16,
+        height: 16,
+    }];
+    req.occlusion_query = Some(VisibilityResultMode::Counting);
+    if let Some(out) = draw_out_or_skip("occlusion_counting_16", &req) {
+        assert_eq!(out.occlusion_samples, Some(16 * 16));
+    }
+}
+
+/// A draw that arms no query says so, rather than reporting a count of zero.
+///
+/// `None` and `Some(0)` are different answers — the second is a draw that was
+/// asked and passed nothing, which is what an occlusion test exists to find —
+/// and a reader that cannot tell them apart cannot use either.
+#[test]
+fn a_draw_with_no_query_reports_no_count() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let req = engine_req(&v, &f, 16, 16);
+    if let Some(out) = draw_out_or_skip("occlusion_unarmed", &req) {
+        assert_eq!(out.occlusion_samples, None);
+    }
+}
+
+/// A boolean query needs no device feature, and still reports what passed.
+///
+/// Vulkan's occlusion query is imprecise unless `VK_QUERY_CONTROL_PRECISE_BIT`
+/// is set, and imprecise is `MTLVisibilityResultModeBoolean` exactly — so this
+/// arm is servable on every host and is asserted as non-zero rather than as an
+/// exact count, which is all an imprecise query promises.
+#[test]
+fn a_boolean_occlusion_query_needs_no_precise_feature() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let mut req = engine_req(&v, &f, 32, 32);
+    req.occlusion_query = Some(VisibilityResultMode::Boolean);
+    if let Some(out) = draw_out_or_skip("occlusion_boolean", &req) {
+        let n = out.occlusion_samples.expect("boolean query reports a result");
+        assert!(n > 0, "a fullscreen triangle passes something; got {n}");
     }
 }
 

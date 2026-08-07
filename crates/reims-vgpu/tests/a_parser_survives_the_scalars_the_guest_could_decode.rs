@@ -642,6 +642,16 @@ fn targets() -> Vec<ScalarTarget> {
         },
         #[cfg(feature = "backend-vulkan")]
         ScalarTarget {
+            name: "raster::visibility_result_mode",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::backend::vulkan::translate::raster::visibility_result_mode(
+                    v[0] as u32,
+                );
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
             name: "raster::depth_clip_mode",
             arity: 1,
             run: &|v| {

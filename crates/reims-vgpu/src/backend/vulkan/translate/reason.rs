@@ -134,6 +134,10 @@ pub enum TranslateReason {
     /// buffer format, and no portable substitute exists for it.
     /// Payload is the `VkFormat` raw value.
     FormatNotVertexBuffer(i32),
+    /// `MTLVisibilityResultMode` value outside the SDK enum. Note that `0`
+    /// (`Disabled`) is **not** one of these: it is the guest disarming the
+    /// query, which translates to "no query" rather than to a refusal.
+    UnknownVisibilityResultMode(u32),
 }
 
 impl crate::observe::Decline for TranslateReason {
@@ -174,6 +178,7 @@ impl crate::observe::Decline for TranslateReason {
             Self::UnknownSamplerBorderColor(_) => "unknown_sampler_border_color",
             Self::UnknownSwizzleSelector(_) => "unknown_swizzle_selector",
             Self::FormatNotVertexBuffer(_) => "format_not_vertex_buffer",
+            Self::UnknownVisibilityResultMode(_) => "unknown_visibility_result_mode",
         }
     }
 
@@ -209,7 +214,8 @@ impl TranslateReason {
             | Self::UnknownSamplerFilter(v)
             | Self::UnknownSamplerMipFilter(v)
             | Self::UnknownSamplerAddressMode(v)
-            | Self::UnknownSamplerBorderColor(v) => v,
+            | Self::UnknownSamplerBorderColor(v)
+            | Self::UnknownVisibilityResultMode(v) => v,
             Self::UnknownSwizzleSelector(v) => u32::from(v),
             Self::FormatNotVertexBuffer(v) => v as u32,
         }
@@ -261,6 +267,7 @@ mod tests {
         TranslateReason::UnknownSamplerBorderColor(0),
         TranslateReason::UnknownSwizzleSelector(0),
         TranslateReason::FormatNotVertexBuffer(0),
+        TranslateReason::UnknownVisibilityResultMode(0),
     ];
 
     /// [`ALL`] really does hold every variant, exactly once.
@@ -302,6 +309,7 @@ mod tests {
                 TranslateReason::UnknownSamplerBorderColor(_) => 21,
                 TranslateReason::UnknownSwizzleSelector(_) => 22,
                 TranslateReason::FormatNotVertexBuffer(_) => 23,
+                TranslateReason::UnknownVisibilityResultMode(_) => 24,
             }
         }
         let mut seen: Vec<usize> = ALL.iter().map(|r| index(*r)).collect();

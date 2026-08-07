@@ -130,6 +130,11 @@ pub enum VkOp {
     /// whenever `MemoryClass::Readback` landed on a host-cached type that is
     /// not also coherent.
     ExecInvalidateReadback,
+    /// `vkCreateQueryPool` for a draw that armed an occlusion query.
+    ExecCreateQueryPool,
+    /// `vkGetQueryPoolResults` reading that draw's sample count, after its
+    /// fence signalled.
+    ExecGetQueryPoolResults,
 
     // ---- exec_compute.rs — the compute command-buffer record/submit/readback
     //      rail (a distinct queue submission from the draw rail above) ----
@@ -381,6 +386,8 @@ impl Decline for VkCall {
             VkOp::ExecSubmit => "vk_exec_submit",
             VkOp::ExecMapReadback => "vk_exec_map_readback",
             VkOp::ExecInvalidateReadback => "vk_exec_invalidate_readback",
+            VkOp::ExecCreateQueryPool => "vk_exec_create_query_pool",
+            VkOp::ExecGetQueryPoolResults => "vk_exec_get_query_pool_results",
 
             VkOp::ComputeExecResetCb => "vk_compute_exec_reset_cb",
             VkOp::ComputeExecBeginCb => "vk_compute_exec_begin_cb",
@@ -546,6 +553,8 @@ mod tests {
         VkOp::ExecSubmit,
         VkOp::ExecMapReadback,
         VkOp::ExecInvalidateReadback,
+        VkOp::ExecCreateQueryPool,
+        VkOp::ExecGetQueryPoolResults,
         VkOp::ComputeExecResetCb,
         VkOp::ComputeExecBeginCb,
         VkOp::ComputeExecEndCb,

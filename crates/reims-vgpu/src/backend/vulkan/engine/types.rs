@@ -165,6 +165,29 @@ impl From<DrawError> for String {
     }
 }
 
+/// What an armed occlusion query counts (Metal `MTLVisibilityResultMode`).
+///
+/// `MTLVisibilityResultModeDisabled` is deliberately **not** a variant. It means
+/// "no query", which is what the `Option` in [`DrawRequest::occlusion_query`]
+/// already says, and a second spelling of the same fact is a state two readers
+/// can disagree about. [`crate::backend::vulkan::translate::raster::visibility_result_mode`]
+/// is where the guest's `0` becomes that `None`.
+///
+/// The two arms are not equally cheap. Vulkan's occlusion query is imprecise by
+/// default — it promises only "non-zero if any sample passed", which is exactly
+/// [`Self::Boolean`] — and an exact count needs `VK_QUERY_CONTROL_PRECISE_BIT`,
+/// which is gated on the `occlusionQueryPrecise` device feature. So a host that
+/// lacks the feature can still serve `Boolean` and must **refuse** `Counting`:
+/// an imprecise query answering a counting guest is a plausible wrong number,
+/// which is the one outcome worse than a named refusal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum VisibilityResultMode {
+    /// `MTLVisibilityResultModeBoolean` — did anything pass.
+    Boolean,
+    /// `MTLVisibilityResultModeCounting` — how many samples passed.
+    Counting,
+}
+
 /// Face-culling mode (Metal `MTLCullMode`). The macOS 2D compositor issues no
 /// draw that binds a cull mode, so `None` (the default) keeps the whole UI path
 /// byte-identical to the pre-cull engine — the raster state stays `CULL_NONE`.
@@ -314,6 +337,19 @@ pub struct DrawRequest {
     pub scissors: Vec<ScissorResource>,
     // `viewport_slot_count` below is the one reader that turns the two lists
     // above into the single number Vulkan wants.
+    /// The occlusion query this draw is armed with, or `None` for a draw the
+    /// guest left unarmed — either because the pass bound no visibility result
+    /// buffer or because the encoder state is `MTLVisibilityResultModeDisabled`.
+    ///
+    /// Where the guest's *offset* into that buffer went is deliberately not
+    /// here. This engine begins and ends one render pass per request and Vulkan
+    /// requires a query to begin and end inside one subpass, so a Metal pass
+    /// whose counter spans several draws becomes several queries whose results
+    /// the caller sums into one offset. The engine answers "how many samples
+    /// did *this* draw pass"; which guest word that accumulates into is the
+    /// caller's question, and splitting it that way is what keeps the sum in
+    /// one place instead of once per backend.
+    pub occlusion_query: Option<VisibilityResultMode>,
     pub indexed: Option<IndexedDrawResource>,
     pub vertex_attributes: Vec<VertexAttributeResource>,
     pub storage_buffers: Vec<StorageBufferResource>,
@@ -490,6 +526,20 @@ pub struct DrawOutput {
     /// is the same rule the typed-decline work applies to a `reason=`: the side
     /// that performed the operation says what it did.
     pub pixels_bgra: bool,
+    /// Samples this draw passed, for a draw that armed an occlusion query.
+    ///
+    /// `None` where no query was armed, and never `Some(0)` standing in for it:
+    /// a draw that armed a query and passed nothing is a real, useful answer —
+    /// it is the whole point of an occlusion test — and folding it into the
+    /// unarmed case would make "fully occluded" indistinguishable from "never
+    /// asked". Same rule as [`Self::pixels_bgra`] above: the side that performed
+    /// the operation says what it did.
+    ///
+    /// For `Boolean` this is still a count rather than a 0/1, because Vulkan
+    /// reports one either way and narrowing it here would throw away
+    /// information the caller may want; the guest sees whatever its own mode
+    /// asked for once the caller writes it back.
+    pub occlusion_samples: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug)]

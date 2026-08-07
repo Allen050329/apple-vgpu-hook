@@ -12,7 +12,7 @@ use ash::vk;
 use super::reason::TranslateReason;
 use crate::backend::vulkan::engine::{
     CullMode, DepthClipMode, FillMode, IndexType, PrimitiveTopology, SamplerCompareFunction,
-    StencilOp,
+    StencilOp, VisibilityResultMode,
 };
 
 /// `MTLPrimitiveType` (SDK numeric values).
@@ -148,6 +148,38 @@ pub fn vk_index_type(index: IndexType) -> vk::IndexType {
     match index {
         IndexType::U16 => vk::IndexType::UINT16,
         IndexType::U32 => vk::IndexType::UINT32,
+    }
+}
+
+/// `MTLVisibilityResultMode` (SDK numeric values) → whether a draw arms an
+/// occlusion query, and what it counts.
+///
+/// `Ok(None)` is `MTLVisibilityResultModeDisabled`, the Metal default: the guest
+/// disarmed the query, so the draw runs without one. That is why this returns
+/// an `Option` inside the `Result` rather than folding `0` into the error arm —
+/// disarming is a thing the guest is entitled to ask for, and an unknown
+/// ordinal is not.
+pub fn visibility_result_mode(mtl: u32) -> Result<Option<VisibilityResultMode>, TranslateReason> {
+    Ok(match mtl {
+        0 => None,
+        1 => Some(VisibilityResultMode::Boolean),
+        2 => Some(VisibilityResultMode::Counting),
+        other => return Err(TranslateReason::UnknownVisibilityResultMode(other)),
+    })
+}
+
+/// The query-control flags an armed mode records with.
+///
+/// `PRECISE` is what makes the result an exact sample count rather than a
+/// non-zero-if-any. It requires `VkPhysicalDeviceFeatures::occlusionQueryPrecise`;
+/// the caller gates on it, because the alternative — quietly recording without
+/// the bit — hands a counting guest a number that is neither the count nor
+/// recognisably wrong, which is the same failure `vk_polygon_mode` above
+/// refuses to make for wireframe.
+pub fn vk_query_control_flags(mode: VisibilityResultMode) -> vk::QueryControlFlags {
+    match mode {
+        VisibilityResultMode::Boolean => vk::QueryControlFlags::empty(),
+        VisibilityResultMode::Counting => vk::QueryControlFlags::PRECISE,
     }
 }
 

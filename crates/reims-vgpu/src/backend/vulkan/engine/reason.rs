@@ -43,6 +43,21 @@ pub enum DrawReason {
         limit: u32,
         multi_viewport: bool,
     },
+    /// The draw arms `MTLVisibilityResultModeCounting` and the host cannot
+    /// record an exact occlusion count.
+    ///
+    /// Only the counting arm reaches here. `VK_QUERY_TYPE_OCCLUSION` itself
+    /// needs no feature, and an imprecise query is `Boolean` exactly — so
+    /// `Boolean` is served on every device and this refusal names the one thing
+    /// that is genuinely missing. It carries the feature bit as well as the ask
+    /// for the reason `ViewportSlotsUnsupported` above carries
+    /// `multi_viewport`: "refused a counting query" and "refused it because
+    /// this host offers no precise occlusion at all" are different findings.
+    ///
+    /// Refusing rather than degrading is the point. Recording without
+    /// `PRECISE` would answer a counting guest with a number that is neither
+    /// the count nor recognisably wrong.
+    VisibilityCountingUnsupported { occlusion_query_precise: bool },
     /// Same for a zero-copy guest-run sampled bind.
     GuestRunSampledNot2d { binding: u32 },
     /// More MRT secondary attachments than the render pass can carry.
@@ -150,6 +165,7 @@ impl crate::observe::Decline for DrawReason {
             Self::GuestRunSampledNot2d { .. } => "guest_run_sampled_not_2d",
             Self::SecondaryAttachmentCap { .. } => "secondary_attachment_cap",
             Self::ViewportSlotsUnsupported { .. } => "viewport_slots_unsupported",
+            Self::VisibilityCountingUnsupported { .. } => "visibility_counting_unsupported",
             Self::DepthWithSecondaryAttachments => "depth_with_secondary_attachments",
             Self::SamplerAnisotropyUnsupported => "sampler_anisotropy_unsupported",
             Self::SamplerMirrorClampToEdgeUnsupported => "sampler_mirror_clamp_to_edge_unsupported",
@@ -205,6 +221,13 @@ impl std::fmt::Display for DrawReason {
                 f,
                 " requested={requested} limit={limit} multi_viewport={}",
                 u8::from(*multi_viewport)
+            ),
+            Self::VisibilityCountingUnsupported {
+                occlusion_query_precise,
+            } => write!(
+                f,
+                " occlusion_query_precise={}",
+                u8::from(*occlusion_query_precise)
             ),
             Self::VertexFormat(reason) => write!(f, " value={}", reason.value()),
             Self::InstanceRateDivisorUnsupported { step_rate } => write!(f, " rate={step_rate}"),
@@ -281,6 +304,9 @@ mod tests {
             requested: 0,
             limit: 0,
             multi_viewport: false,
+        },
+        DrawReason::VisibilityCountingUnsupported {
+            occlusion_query_precise: false,
         },
         DrawReason::DepthWithSecondaryAttachments,
         DrawReason::SamplerAnisotropyUnsupported,

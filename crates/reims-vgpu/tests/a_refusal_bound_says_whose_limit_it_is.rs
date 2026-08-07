@@ -297,7 +297,7 @@ const ROWS: &[Row] = &[
               and correct.",
     },
     Row {
-        at: "reims-vgpu/src/backend/vulkan/engine/exec.rs:1233",
+        at: "reims-vgpu/src/backend/vulkan/engine/exec.rs:1238",
         bound: "MAX_SECONDARY_ATTACH",
         verdict: Verdict::WireField,
         why: "Colour attachments past the primary, pinned by a const assertion to \
