@@ -872,12 +872,12 @@ fn flush_render_one<M: HostMemory + HostOps>(
             // frame before the guest is told anything about the submission that
             // produced it.
             //
-            // The wait is not taken here, per window, and that is the point.
-            // Doing it inline made this rail one blocking GPU round trip per
-            // landed window — 369 a second, 1 360 us each, of which the device's
-            // own timestamps priced 636 us as the copy and the rest as
-            // submit-to-start plus signal-to-wake. Submitting them all and
-            // settling once lets the queue run them back to back.
+            // The wait is not taken here, per window. It was moved to settle at
+            // the stamp so a pass could submit every window before blocking —
+            // and no boot has yet armed more than one window per stamp, so that
+            // half has never engaged. What the move measured is in
+            // `super::fence`; read it before quoting `flush_us`, which fell 91%
+            // across the change while the total writeback cost moved −0.7%.
             match crate::runtime::mapping_write::write_bgra8_from_resident_gpu(
                 state,
                 host,

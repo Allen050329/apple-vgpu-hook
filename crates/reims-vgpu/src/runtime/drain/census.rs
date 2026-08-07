@@ -232,16 +232,27 @@ pub enum ReadbackPhase {
     /// Block on the readback fence: pure GPU round-trip latency, and the part
     /// no smaller copy can reduce.
     ///
-    /// **Its count is no longer one per copy.** The GPU-direct writeback rail
-    /// submits without waiting and settles every copy at once
-    /// (`engine::quiesce_guest_writes`), so on that rail `fence` counts settles
-    /// while `submit` counts windows, and `fence_us / fence` is the mean cost of
-    /// a *pass* rather than of a frame. Dividing it by `submit` is reading the
-    /// shape this rail had when each window blocked on its own fence: 369 of
-    /// them a second at 1 360 us, against 636 us of `gpu_us` — the difference
-    /// being submit-to-start plus signal-to-wake, paid once per window and
-    /// 267 ms of every second. The copying rail below still reports one `Fence`
-    /// per readback, so a window in which both ran mixes the two counts.
+    /// **It is no longer inside `flush_us`, and that is the trap.** The
+    /// GPU-direct writeback rail submits without waiting and settles at the
+    /// completion stamp (`engine::quiesce_guest_writes`), which is outside
+    /// `DrainPhase::Flush`. So `flush_us` fell 1370 → 123 us per flush across
+    /// that change while the total moved −0.7%: the wait relocated. **Never
+    /// compare `flush_us` across it** — add `fence_us` back first, and see
+    /// `storage_flush::fence` for the A/B.
+    ///
+    /// `fence` counts settles rather than windows in principle, but no boot has
+    /// yet made those differ: it equals `submit` on both sides of the change,
+    /// because this workload arms one window per stamp. When they do diverge,
+    /// `fence_us / fence` is the mean cost of a pass and `fence_us / submit` is
+    /// the mean per frame.
+    ///
+    /// What the split is for is `fence_us` minus `gpu_us` — submit-to-start plus
+    /// signal-to-wake, the part no smaller copy reduces. It measured 734 us
+    /// before that change and 740 us after, on ~410 settles a second. That is
+    /// the largest single cost left on this rail and nothing has touched it.
+    ///
+    /// The copying rail below still reports one `Fence` per readback, so a
+    /// window in which both ran mixes the two counts.
     Fence,
     /// Make the staging buffer readable. On the leased arm that is the
     /// invalidate alone, because the mapping already exists for the slot's

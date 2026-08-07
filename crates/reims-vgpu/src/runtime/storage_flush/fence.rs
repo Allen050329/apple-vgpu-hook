@@ -517,20 +517,70 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// 45 us. Nothing else wanted the lock, so releasing it buys nothing. The worker
 /// itself was the bottleneck.
 ///
-/// What paid was deleting the wait's *repetition*. Each landed window blocked on
-/// its own fence, and the device's own timestamps say what that cost: 369 fences
-/// a second at 1 360 us each, of which `gpu_us` accounts for 636 us. The
-/// remaining 724 us per window is submit-to-start plus signal-to-wake — 267 ms
-/// of every second spent not copying anything. `copy_target_to_guest_pages` now
-/// returns once the copy is on the queue and the obligation is settled at the
-/// completion stamp instead (`engine::quiesce_guest_writes`), so a pass submits
-/// every window back to back and blocks once at the end. Each window's own CPU
-/// work — vouch, resolve, the identity ladder — then runs while the previous
-/// window's copy executes, which is where the rest of the round trip goes.
+/// `copy_target_to_guest_pages` now returns once the copy is on the queue and the
+/// obligation is settled at the completion stamp instead
+/// (`engine::quiesce_guest_writes`). **That change was aimed at a repetition the
+/// workload does not have, it measurably paid anyway, and the two facts have to
+/// be kept apart** — the aim is the part that is refuted.
 ///
-/// The copy itself is untouched and is now the floor: ~235 ms/s of GPU time
-/// moving whole surfaces across the bus, which only the third route above
-/// reduces.
+/// # What the A/B measured
+///
+/// Two boots on one quiesced x86/PCI/Vulkan host, back to back, same guest, same
+/// animating page (testufo at 960 px/s), 30 census windows each and ranges
+/// inside ±4% on every figure:
+///
+/// ```text
+///                          before      after
+/// flush_us / flush         1370 us     123 us
+/// fence_us / fence         1255 us    1368 us
+/// gpu_us   / copy           521 us     628 us
+/// flushes/s                 448.5      409.5
+/// draws/s                  2600.5     3237.5
+/// draw_us  / draw          89.07 us   80.61 us
+/// max_tranche_us            41653      31840
+/// busy_us/s                886951     913092
+/// presents/s                  ~37       45.0
+/// ```
+///
+/// **The 91% off `flush_us` is a bracket, not a saving.** The wait left
+/// `DrainPhase::Flush` and reappeared at the stamp, and the two halves sum to
+/// what one half used to be: 448.5 x 1370 = 615 ms/s before, 409.5 x 123 plus
+/// 409.5 x 1368 = 610 ms/s after. Reading `flush_us` across this change compares
+/// brackets. Total writeback cost moved by −0.7%, which is nothing.
+///
+/// **The round trip this was aimed at is entirely intact.** `fence_us` minus
+/// `gpu_us` is 734 us before and 740 us after. Not one microsecond of
+/// submit-to-start or signal-to-wake was removed.
+///
+/// **And the batching never engaged.** `fence` equals `flushes` in *both* builds
+/// — 448.5/448.5 and 409.5/409.5 — so every settle covered exactly one copy.
+/// This workload arms one window per completion stamp, so the pass has nothing
+/// to batch and "submits every window back to back and blocks once at the end"
+/// describes a shape no boot has produced. The machinery is correct and inert.
+///
+/// # So what did pay
+///
+/// The device is genuinely faster and it is not marginal: **+24.5% draws/s and
+/// presents ~37 → 45**, at +2.9% worker occupancy, with each draw 9.5% cheaper
+/// and the worst tranche 23.6% shorter. That is not accounting — `draws` and
+/// `presents` are counts.
+///
+/// **The cause is not established.** The candidate is that
+/// `quiesce_guest_writes` settles through `retire_all`, which retires every ring
+/// slot and runs its `drain_cleanup` — staging, gather and readback recycling
+/// plus sampled-cache admission. The old per-window `wait_entry_fence`
+/// deliberately waited *without* retiring, so that cleanup fell to
+/// `begin_entry`'s lazy reap, which is inside the draw path. Moving it to the
+/// stamp would take it off every draw, and `draw_us / draw` falling 9.5% is
+/// consistent with that. Consistent is not measured: nothing here separates it
+/// from the guest simply asking for more work once it renders faster, which is
+/// the same feedback loop in the other direction. Do not quote the candidate as
+/// the finding.
+///
+/// The copy itself is untouched and remains the floor — ~257 ms/s of GPU time
+/// (409.5 x 628 us) moving whole surfaces across the bus, which only the third
+/// route above reduces — and the ~740 us of per-settle round trip beside it,
+/// which needs the stamp word written by the GPU rather than by this thread.
 ///
 /// # What witnessing the undeclared read would take
 ///
