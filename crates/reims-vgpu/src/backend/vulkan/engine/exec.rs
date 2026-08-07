@@ -2079,6 +2079,11 @@ pub(crate) unsafe fn execute_draw_inner(
                     });
                     continue;
                 }
+                // The elision did not fire, and the two reasons it can fail want
+                // opposite fixes: no vouch to spend, or a vouch with nothing
+                // left to spend it on. Taken here because this is the only point
+                // holding both the witness's answer and the cache's.
+                counters.note_sampled_gather_unskipped(resource.identity.is_some());
                 let img = pools.acquire_sampled(ctx, SampledKey::of(resource), counters)?;
                 // Everything from here to the end of this arm moves bytes;
                 // everything above it in `AcquireSampled` decides which image

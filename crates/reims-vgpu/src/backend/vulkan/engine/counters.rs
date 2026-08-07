@@ -239,6 +239,38 @@ engine_counters! {
         /// what the copy names, which is what the CPU no longer moves.
         sampled_guest_imports,
         sampled_guest_import_bytes,
+        /// Why a `SampledSource::GuestRuns` bind moved bytes instead of binding
+        /// a retained image, split at the only two things that can go wrong.
+        ///
+        /// `sampled_gather_skips` says how often the elision worked; on a driven
+        /// boot it says 0 for twenty-three consecutive windows while the rail
+        /// moves 424 MB/s, and neither the engine nor the witness could say
+        /// which half was at fault. The witness's own `gw_vouched` is a
+        /// *runtime*-side per-window tally over every rail, so it cannot be
+        /// subtracted from an engine-side per-bind one — that is the "a counter
+        /// and a fail line count different things" trap with two counters.
+        ///
+        /// These two are engine-side and per-bind, so they divide the same
+        /// population `sampled_gather_skips` is drawn from and the split adds
+        /// up:
+        ///
+        /// ```text
+        /// unvouched + unretained + skips == gathers + imports + skips
+        /// ```
+        ///
+        /// which is the identity `the_gather_dispositions_account_for_every_bind`
+        /// checks. The fixes are opposite, which is why one bar could not serve:
+        /// `unvouched` is the witness refusing (and `gw_refused_host_write`
+        /// against `gw_refused_guest_store` says whose write refuted it), while
+        /// `unretained` is a vouch this device could not spend because no image
+        /// answered to it — a capped cache dropping a window it was about to be
+        /// asked for again.
+        sampled_gather_unvouched,
+        /// Vouched by the witness, but the sampled cache held no image under
+        /// `(key, identity)`. See [`sampled_gather_unvouched`].
+        ///
+        /// [`sampled_gather_unvouched`]: EngineCounters::sampled_gather_unvouched
+        sampled_gather_unretained,
         /// How much of its target each draw could have written, split three
         /// ways. See [`DrawCoverage`] and [`EngineCounters::note_draw_coverage`].
         draw_cover_full,
@@ -553,6 +585,22 @@ impl EngineCounters {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Record why a guest-run sampled bind is about to move bytes, taken at the
+    /// one site that already knows both halves: the elision lookup returned
+    /// nothing, and `vouched` says whether it was even given something to look
+    /// up. Call exactly once per bind that falls through the skip, before the
+    /// import/gather disposition is decided — the two questions are independent
+    /// and the identity in [`EngineCounters::sampled_gather_unvouched`] holds
+    /// only if this is not also called on the skip path.
+    pub fn note_sampled_gather_unskipped(&self, vouched: bool) {
+        let field = if vouched {
+            &self.sampled_gather_unretained
+        } else {
+            &self.sampled_gather_unvouched
+        };
+        field.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn note_compute_sampled_upload(&self, bytes: u64) {
         self.compute_sampled_uploads.fetch_add(1, Ordering::Relaxed);
         self.compute_sampled_upload_bytes
@@ -626,6 +674,39 @@ mod tests {
             ),
             (1, 512)
         );
+    }
+
+    /// The split of "the elision did not fire" has to be exhaustive and
+    /// exclusive, or it stops being a division of the gathers and becomes two
+    /// unrelated tallies that happen to sit next to each other.
+    ///
+    /// The two counts are deliberately different, and asserted by name rather
+    /// than only through their sum: a sum-only assertion passes with the arms
+    /// swapped, and swapping them inverts the verdict this instrument exists to
+    /// give — "the witness refused" and "the cache dropped it" want opposite
+    /// fixes.
+    #[test]
+    fn the_unskipped_reason_is_exactly_one_counter_per_bind() {
+        let counters = EngineCounters::default();
+        for _ in 0..3 {
+            counters.note_sampled_gather_unskipped(true);
+        }
+        for _ in 0..5 {
+            counters.note_sampled_gather_unskipped(false);
+        }
+
+        let s = counters.snapshot();
+        assert_eq!(s.sampled_gather_unretained, 3, "vouched, nothing retained");
+        assert_eq!(s.sampled_gather_unvouched, 5, "the witness gave no vouch");
+        // Exhaustive and exclusive: eight calls, eight increments in total.
+        assert_eq!(
+            s.sampled_gather_unretained + s.sampled_gather_unvouched,
+            8,
+            "a bind that fell through the skip must land in exactly one arm: {s:?}"
+        );
+        // And neither is the skip, which counts the population these two divide
+        // the complement of. Nothing above took the skip path.
+        assert_eq!(s.sampled_gather_skips, 0);
     }
 
     #[test]

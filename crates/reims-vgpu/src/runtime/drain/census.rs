@@ -1528,6 +1528,7 @@ fn emit_engine_delta() {
          sampled_reupload_bytes={} sampled_gathers={} sampled_gather_bytes={} \
          sampled_gather_skips={} sampled_gather_skip_bytes={} \
          sampled_guest_imports={} sampled_guest_import_bytes={} \
+         sampled_gather_unvouched={} sampled_gather_unretained={} \
          draw_cover_full={} draw_cover_loaded_full_scissor={} \
          draw_cover_loaded_partial_scissor={} \
          buffer_guest_imports={} buffer_guest_import_bytes={} \
@@ -1566,6 +1567,8 @@ fn emit_engine_delta() {
         d.sampled_gather_skip_bytes,
         d.sampled_guest_imports,
         d.sampled_guest_import_bytes,
+        d.sampled_gather_unvouched,
+        d.sampled_gather_unretained,
         d.draw_cover_full,
         d.draw_cover_loaded_full_scissor,
         d.draw_cover_loaded_partial_scissor,
