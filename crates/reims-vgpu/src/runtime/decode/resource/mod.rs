@@ -1126,6 +1126,64 @@ pub const VERTEX_LAYOUT_TAG_BUFFER_INDEX: u8 = 0x00;
 pub const VERTEX_LAYOUT_TAG_STEP_FUNCTION: u8 = 0x01;
 pub const VERTEX_LAYOUT_TAG_STEP_RATE: u8 = 0x02;
 pub const VERTEX_LAYOUT_TAG_STRIDE: u8 = 0x03;
+
+/// The three consumed-tag sets for the vertex-descriptor walks, each listing
+/// exactly what its own reader names.
+///
+/// Each of these entries is read by `entry_tag_u32`, which walks the entry once
+/// per tag the caller asks for. A reader written that way never forms a list of
+/// what the entry actually held, so it structurally cannot notice a tag it does
+/// not ask for — which is why the sets are written out here and handed to
+/// [`note_entry_tlv_fields`] rather than left implicit at the call sites.
+///
+/// All three look complete against the Metal types they mirror:
+/// `MTLVertexDescriptor` has `attributes` and `layouts`;
+/// `MTLVertexAttributeDescriptor` has `format`, `offset` and `bufferIndex` past
+/// its subscript; `MTLVertexBufferLayoutDescriptor` has `stride`,
+/// `stepFunction` and `stepRate` past its own. "Looks complete" is exactly the
+/// claim this instrument exists to replace — the pipeline block one level up
+/// looked complete too, and a driven boot found four tags in it with no reader.
+///
+/// # The reading, x86/Vulkan, one driven boot (Safari window drag)
+///
+/// Six distinct entry shapes, **every one `unconsumed=0`**:
+///
+/// ```text
+/// kind=vertex_desc    tags=[00:4,01:4]
+/// kind=vertex_layout  tags=[00:4,03:4]
+/// kind=vertex_attr    tags=[00:4,01:4]
+/// kind=vertex_attr    tags=[00:4,01:4,02:4]
+/// kind=vertex_attr    tags=[00:4,01:4,03:4]
+/// kind=vertex_attr    tags=[00:4,01:4,02:4,03:4]
+/// ```
+///
+/// So these three walks read what this guest sends, and that is now a
+/// measurement rather than an inference from the Metal headers. It is the
+/// answer the pipeline block did *not* give, which is the point of asking both
+/// with one instrument.
+///
+/// Two things the shapes say past the zero. Attribute entries **omit** a tag
+/// whose value is the Metal default rather than sending a zero, so
+/// `entry_tag_u32`'s defaults are load-bearing on a live guest rather than a
+/// fallback for malformed records. And the layout entry never carries `0x01` or
+/// `0x02` at all on this workload — this guest states no step function and no
+/// step rate — which is why `declared_step_function` and `declared_step_rate`
+/// are `Option` and why a declared zero had to stay distinguishable from an
+/// absent tag.
+const VERTEX_DESC_TAGS_CONSUMED: [u8; 2] = [VERTEX_DESC_TAG_ATTRIBUTES, VERTEX_DESC_TAG_LAYOUTS];
+const VERTEX_ATTR_TAGS_CONSUMED: [u8; 4] = [
+    VERTEX_ATTR_TAG_LOCATION,
+    VERTEX_ATTR_TAG_FORMAT,
+    VERTEX_ATTR_TAG_OFFSET,
+    VERTEX_ATTR_TAG_BUFFER_INDEX,
+];
+const VERTEX_LAYOUT_TAGS_CONSUMED: [u8; 4] = [
+    VERTEX_LAYOUT_TAG_BUFFER_INDEX,
+    VERTEX_LAYOUT_TAG_STEP_FUNCTION,
+    VERTEX_LAYOUT_TAG_STEP_RATE,
+    VERTEX_LAYOUT_TAG_STRIDE,
+];
+
 /// `MTLVertexDescriptor.attributes` is a 31-slot array, so a descriptor naming
 /// more is malformed rather than something we chose not to read. The same
 /// number is [`crate::backend::metal::constants::REIMS_VGPU_METAL_MAX_ATTRS`],
@@ -1814,6 +1872,7 @@ pub fn parse_vertex_block(
     if bo >= bytes.len() {
         return Ok(Vec::new());
     }
+    note_entry_tlv_fields("vertex_desc", bytes, bo, &VERTEX_DESC_TAGS_CONSUMED);
     let attr_off = entry_tag_u32(bytes, bo, VERTEX_DESC_TAG_ATTRIBUTES, u32::MAX);
     let layout_off = entry_tag_u32(bytes, bo, VERTEX_DESC_TAG_LAYOUTS, u32::MAX);
     if attr_off == u32::MAX || layout_off == u32::MAX {
@@ -1840,6 +1899,7 @@ pub fn parse_vertex_block(
         if entry >= bytes.len() {
             return Err(DecodeStatus::ErrShort("res_vertex_layout_entry_oob"));
         }
+        note_entry_tlv_fields("vertex_layout", bytes, entry, &VERTEX_LAYOUT_TAGS_CONSUMED);
         let buffer_index = entry_tag_u32(bytes, entry, VERTEX_LAYOUT_TAG_BUFFER_INDEX, 0);
         let stride = entry_tag_u32(bytes, entry, VERTEX_LAYOUT_TAG_STRIDE, 0);
         let declared_step_function =
@@ -1890,6 +1950,7 @@ pub fn parse_vertex_block(
         if entry >= bytes.len() {
             return Err(DecodeStatus::ErrShort("res_vertex_attr_entry_oob"));
         }
+        note_entry_tlv_fields("vertex_attr", bytes, entry, &VERTEX_ATTR_TAGS_CONSUMED);
         let location = entry_tag_u32(bytes, entry, VERTEX_ATTR_TAG_LOCATION, i as u32);
         let format = entry_tag_u32(bytes, entry, VERTEX_ATTR_TAG_FORMAT, 0);
         let offset = entry_tag_u32(bytes, entry, VERTEX_ATTR_TAG_OFFSET, 0);
@@ -2141,36 +2202,90 @@ impl crate::observe::Decline for PipelineFieldDropped {
 /// Pipeline descriptors are decoded once per distinct pipeline and cached, so
 /// neither line is on a per-draw path.
 fn note_pipeline_tlv_fields(kind: &'static str, consumed_tags: &[u8], fields: &[CompactTlv]) {
+    report_tlv_shape(
+        kind,
+        fields.len(),
+        fields.iter().map(|f| (f.tag, f.length)),
+        consumed_tags,
+    );
+}
+
+/// [`note_pipeline_tlv_fields`] for an entry that is walked **in place** rather
+/// than enumerated first.
+///
+/// `entry_tag_u32` and its sibling walk a `[fieldCount][tag][len][value…]*`
+/// entry once per tag the caller names, so a caller reading four tags never
+/// forms a list of what the entry held and structurally cannot see a fifth. The
+/// vertex descriptor, its layout entries and its attribute entries are all read
+/// that way. This walks the same bytes once and reports the whole shape.
+///
+/// Silent on a malformed entry rather than reporting a truncated shape as if it
+/// were the guest's: the callers have their own out-of-bounds refusals over
+/// these bytes (`res_vertex_layout_entry_oob` and its siblings), and a second
+/// opinion from an instrument would be a second answer to a question already
+/// answered by a refusal.
+fn note_entry_tlv_fields(kind: &'static str, bytes: &[u8], entry: usize, consumed_tags: &[u8]) {
+    let Some(&field_count) = bytes.get(entry) else {
+        return;
+    };
+    let mut seen: Vec<(u8, u8)> = Vec::with_capacity(field_count as usize);
+    let mut p = entry + 1;
+    for _ in 0..field_count {
+        if p + 2 > bytes.len() {
+            return;
+        }
+        let (tag, len) = (bytes[p], bytes[p + 1]);
+        if p + 2 + len as usize > bytes.len() {
+            return;
+        }
+        seen.push((tag, len));
+        p += 2 + len as usize;
+    }
+    report_tlv_shape(kind, field_count as usize, seen.into_iter(), consumed_tags);
+}
+
+/// The half [`note_pipeline_tlv_fields`] and [`note_entry_tlv_fields`] share:
+/// the shape line, the star, and one decline per unread tag.
+///
+/// `kind` is folded into both latches over its whole length rather than its
+/// first byte. `render` and `render_mesh` share a first byte, so a first-byte
+/// key would have let the two branches' drops silence each other — the same
+/// class of collision `decline_slugs_are_unique` exists to stop one level up.
+fn report_tlv_shape(
+    kind: &'static str,
+    field_count: usize,
+    fields: impl Iterator<Item = (u8, u8)>,
+    consumed_tags: &[u8],
+) {
+    let kind_key = kind
+        .bytes()
+        .fold(0u64, |acc, b| acc.rotate_left(7) ^ u64::from(b));
     let mut shape = String::new();
-    let mut shape_key: u64 = u64::from(kind.as_bytes()[0]);
+    let mut shape_key = kind_key;
     let mut dropped: Vec<(u8, u8)> = Vec::new();
-    for f in fields {
-        let consumed = consumed_tags.contains(&f.tag);
+    for (tag, len) in fields {
+        let consumed = consumed_tags.contains(&tag);
         let sep = if shape.is_empty() { "" } else { "," };
         let star = if consumed { "" } else { "*" };
-        let _ = std::fmt::Write::write_fmt(
-            &mut shape,
-            format_args!("{sep}{:02x}:{}{star}", f.tag, f.length),
-        );
+        let _ = std::fmt::Write::write_fmt(&mut shape, format_args!("{sep}{tag:02x}:{len}{star}"));
         // Order-sensitive, so a reordered block reads as a different shape. The
         // tag and the length are what a reader of this block depends on; the
         // value is not, and mixing it in would make every distinct sample count
         // a distinct shape.
-        shape_key = shape_key.rotate_left(9) ^ (u64::from(f.tag) << 8) ^ u64::from(f.length);
+        shape_key = shape_key.rotate_left(9) ^ (u64::from(tag) << 8) ^ u64::from(len);
         if !consumed {
-            dropped.push((f.tag, f.length));
+            dropped.push((tag, len));
         }
     }
     if crate::observe::first_sight("type7_pipeline_shape", shape_key) {
         crate::observe::off(format!(
-            "type7_pipeline_shape kind={kind} nfields={} tags=[{shape}] unconsumed={}",
-            fields.len(),
+            "type7_pipeline_shape kind={kind} nfields={field_count} tags=[{shape}] unconsumed={}",
             dropped.len()
         ));
     }
     for (tag, len) in dropped {
         crate::observe::Emit::decline("type7_pipeline", &PipelineFieldDropped { kind, tag, len })
-            .fail_once(u64::from(kind.as_bytes()[0]) << 16 | u64::from(tag) << 8 | u64::from(len));
+            .fail_once(kind_key.rotate_left(16) ^ (u64::from(tag) << 8) ^ u64::from(len));
     }
 }
 

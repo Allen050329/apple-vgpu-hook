@@ -321,14 +321,14 @@ const ROWS: &[Row] = &[
               the vocabulary's PER_ entry matches inside MAPPER_.",
     },
     Row {
-        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:1848",
+        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:1908",
         bound: "MAX_VERTEX_LAYOUTS",
         verdict: Verdict::ContractLimit,
         why: "MTLVertexDescriptor.layouts is a 31-slot array, so a layout naming a \
               buffer index at or above it cannot be built by any Metal caller.",
     },
     Row {
-        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:1876",
+        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:1936",
         bound: "MAX_VERTEX_ATTRS",
         verdict: Verdict::ContractLimit,
         why: "MTLVertexDescriptor.attributes is a 31-slot array, so a descriptor \
@@ -363,7 +363,7 @@ const ROWS: &[Row] = &[
               same basis `wire::ops::bind_limit::SAMPLER` carries.",
     },
     Row {
-        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:2745",
+        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:2860",
         bound: "MAX_COLOR_ATTACHMENTS",
         verdict: Verdict::WireField,
         why: "The declared colour-attachment count against the width of the slot \
@@ -371,7 +371,7 @@ const ROWS: &[Row] = &[
               itself stops at.",
     },
     Row {
-        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:2509",
+        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:2624",
         bound: "MAX_COLOR_ATTACHMENTS",
         verdict: Verdict::WireField,
         why: "The same eight, one entry down: the guard admits a declared slot \

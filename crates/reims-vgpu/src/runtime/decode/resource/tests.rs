@@ -115,6 +115,69 @@ fn vertex_block_on_buffer(step_tags: &[(u8, u32)], buffer_index: u32) -> Vec<u8>
     b
 }
 
+/// A tag in a vertex-descriptor entry that no reader names is reported, and the
+/// entries a guest actually sends report as complete.
+///
+/// The three vertex walks read through `entry_tag_u32`, which re-walks the entry
+/// once per tag the caller asks for. A reader written that way never forms a
+/// list of what the entry held, so it cannot notice a tag it does not ask for —
+/// the same structural blind spot the pipeline block one level up had, where a
+/// driven boot then found four unread tags.
+#[test]
+fn a_vertex_entry_tag_with_no_reader_is_reported() {
+    // A tag no other test in this process uses, so `first_sight` cannot have
+    // latched its shape already.
+    const UNKNOWN_TAG: u8 = 0x5b;
+
+    let cap = crate::observe::FailCapture::start();
+    let plain = vertex_block(&[]);
+    parse_vertex_block(&plain, 0, plain.len()).expect("a plain block decodes");
+    let clean = cap.lines();
+    assert!(
+        clean
+            .iter()
+            .filter(|l| l.contains("type7_pipeline_shape"))
+            .all(|l| l.contains("unconsumed=0")),
+        "the entries a guest sends are read whole; that is the reading this \
+         instrument exists to make, and it must not be an absence: {clean:?}"
+    );
+    assert!(
+        clean
+            .iter()
+            .any(|l| l.contains("kind=vertex_layout") || l.contains("kind=vertex_attr")),
+        "and the walk must have run, or `unconsumed=0` above is vacuous: \
+         {clean:?}"
+    );
+
+    let cap2 = crate::observe::FailCapture::resume();
+    let odd = vertex_block(&[(UNKNOWN_TAG, 9)]);
+    parse_vertex_block(&odd, 0, odd.len()).expect("an unread tag is reported, not refused");
+    let lines = cap2.lines();
+    let shape: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("type7_pipeline_shape") && l.contains("kind=vertex_layout"))
+        .collect();
+    assert_eq!(
+        shape.len(),
+        1,
+        "one shape line for the layout entry: {lines:?}"
+    );
+    assert!(
+        shape[0].contains("5b:4*") && shape[0].contains("unconsumed=1"),
+        "the unread tag must be starred and counted: {}",
+        shape[0]
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("reason=pipeline_descriptor_field_dropped")
+                && l.contains("kind=vertex_layout")
+                && l.contains("tag=0x5b")),
+        "and the loss must reach the fail channel naming the entry kind: \
+         {lines:?}"
+    );
+}
+
 /// A layout that declared `stepRate` 0 means 0, and one that declared none
 /// means 1.
 ///
