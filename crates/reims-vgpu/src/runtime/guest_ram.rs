@@ -50,7 +50,7 @@
 //!
 //! Page recycling is unchanged and still load-bearing: the guest reassigning a
 //! GPA to a different allocation while we hold a reference over it is the
-//! PTE-corruption class [`crate::runtime::storage_flush`]'s guards exist for.
+//! PTE-corruption class the surface page-ownership guards exist for.
 //! It applied to the dma-buf and it applies here.
 //!
 //! # One import per RAMBlock, for the lifetime of the VM

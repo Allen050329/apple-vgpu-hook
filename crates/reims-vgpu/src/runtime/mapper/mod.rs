@@ -331,10 +331,8 @@ pub fn apply_capture(state: &mut DeviceState, cap: &MapperCapture, mapping_id: u
     // Neither branch below releases a deferred writeback window. A type-11
     // render Store writes guest pages on its own path, so an UNMAP (or a MAP
     // that re-backs the slot with a different MappingInternal, orphaning the
-    // old identity) leaves no mapping-keyed render obligation behind. Compute
-    // storage windows are the surviving mapping-keyed rail and they are torn
-    // down by `storage_flush::drop_windows` from the lifecycle sites that know
-    // whether the pages can still be written.
+    // old identity) leaves no mapping-keyed render obligation behind, because a
+    // render Store lands its frame in guest pages before it returns.
     if cap.request_type == MAPPER_REQUEST_UNMAP {
         return state.unmap_surface(mapping_id);
     }
@@ -687,39 +685,28 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         // surface: drop the prior incarnation's deferred windows before any
         // access could flush old content through the new pages.
     } else if reprieved {
-        // Stale trailing delete on a live incarnation — the exact black-band
-        // trigger. Only note when content was actually at stake (an armed
-        // deferred window survived); plain reprieves are steady id-recycle
-        // control flow.
-        let windows = state
-            .compute_deferred_flush
-            .keys()
-            .filter(|k| k.mapping_id == mapping_id)
-            .count();
-        if windows > 0 {
-            // Condemn dropped the raw-GVA alias index; the pages just
-            // re-adopted are the same ones the windows defer-armed on.
-            state.index_deferred_alias_pages(mapping_id);
-            crate::observe::off(format!(
-                "delete_backing_reprieve mapping={mapping_id} windows={windows}"
-            ));
-            // Wrong-PFN guard on the REPRIEVE path — the blind spot the rewire
-            // guard above cannot cover. A reprieve keeps armed deferred windows
-            // WITHOUT bumping map_generation (the delete looked stale: the plan
-            // still fingerprints the condemned pages). But a guest that FREED the
-            // backing and handed the SAME physical pages to another surface — yet
-            // has not yet rewired this mapping's GPU page table away from them —
-            // fingerprints identical here, so `pages_changed` is false and the
-            // rewire guard never runs. The still-armed flush would then DMA into
-            // pages another live surface now owns (or recycled userspace heap =
-            // the WindowServer malloc free-list corruption class). A detected
-            // cross-surface alias is a proven ownership violation, so fail
-            // closed: name it, drop deferred writes, and invalidate the page
-            // plan. Runs only on reprieve-with-armed-windows (rare), on the drain
-            // worker.
-            if !surface_pages_are_exclusively_owned(state, mapping_id, "reprieve") {
-                return false;
-            }
+        // Wrong-PFN guard on the REPRIEVE path — the blind spot the rewire guard
+        // above cannot cover. A reprieve keeps this mapping's page plan WITHOUT
+        // bumping `map_generation` (the delete looked stale: the plan still
+        // fingerprints the condemned pages). But a guest that FREED the backing
+        // and handed the SAME physical pages to another surface — yet has not
+        // rewired this mapping's GPU page table away from them — fingerprints
+        // identical here, so `pages_changed` is false and the rewire guard never
+        // runs. A render Store landing through the kept plan would then write
+        // pages another live surface owns, or recycled userspace heap, which is
+        // the WindowServer malloc free-list corruption class.
+        //
+        // This used to run only when the reprieve found an armed deferred
+        // window, on the reasoning that a still-armed flush was the thing that
+        // would DMA through the stale plan. Stores land at the Store now, so
+        // there is no armed set to qualify on and the hazard belongs to the page
+        // plan rather than to any pending write — so the check runs on every
+        // reprieve. Reprieves are rare; this is not a hot path.
+        //
+        // A detected cross-surface alias is a proven ownership violation, so
+        // fail closed: name it, invalidate the plan, and make this resolve fail.
+        if !surface_pages_are_exclusively_owned(state, mapping_id, "reprieve") {
+            return false;
         }
     }
     if width > 0 && height > 0 {
@@ -1183,10 +1170,8 @@ pub enum Type4Witness {
 /// the return type is an enum rather than a bool: it is not evidence, and a
 /// caller must not read it as "these pages were verified".
 ///
-/// The peer for the raw-GVA rails is
-/// [`crate::runtime::storage_flush::guards::deferred_pages_still_ours`], which asks the
-/// same question about a window's armed page set. This one asks it about a
-/// mapping's list, which is what the mapping-keyed rails write through.
+/// This asks the question about a mapping's page list, which is what the
+/// mapping-keyed rails write through.
 ///
 /// Re-walks the cached page list and reports which exit it took.
 pub fn type4_pages_witness<H: HostMemory>(
@@ -1338,8 +1323,8 @@ pub fn type4_pages_witness<H: HostMemory>(
 ///
 /// # Why a token and not a call
 ///
-/// [`type4_pages_witness`] existed for a release with exactly one caller —
-/// [`crate::runtime::storage_flush::land::flush_render_one`] — while every other write
+/// [`type4_pages_witness`] existed for a release with exactly one caller — the
+/// render writeback — while every other write
 /// through `MappingEntry::page_entries` went unchecked. That is not an oversight
 /// that a second call site fixes: the check has to be *reachable only through*
 /// the write, or the next rail added to this crate arrives unguarded too, and

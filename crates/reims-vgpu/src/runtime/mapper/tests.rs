@@ -216,7 +216,6 @@ fn a_mapping_with_nothing_to_check_is_not_counted_as_verified() {
 
     // Policy is unchanged: the verdict still hands back a token, so the
     // writers this gates still write. Only the counter differs.
-    let mut state = state;
     let verdict = super::mapping_pages_verdict(&mut state, &host, 6);
     assert!(
         matches!(verdict, super::PagesVerdict::Unwitnessed(_)),

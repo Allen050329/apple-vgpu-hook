@@ -1674,7 +1674,7 @@ mod tests {
     ///
     /// Everything else must *not* be, and that is the half a future edit is
     /// likely to get wrong. `Gva` residents are read by
-    /// `storage_flush::flush_gva_one` into `write_gva_rgba8`, and `Anonymous`
+    /// the GVA Store path into `write_gva_rgba8`, and `Anonymous`
     /// covers the pooled path the parity suite uses as its semantic control —
     /// flipping either silently exchanges R and B on a whole rail.
     #[test]

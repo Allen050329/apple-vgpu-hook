@@ -1,7 +1,7 @@
 //! What the drain measured, and the vocabulary it measured it in.
 //!
-//! Same membership rule as `runtime::exec::report` and
-//! `runtime::storage_flush::report`: **nothing here decides anything.** Every
+//! Same membership rule as `runtime::exec::report`: **nothing here decides
+//! anything.** Every
 //! item is either a reading (`DoorbellCensus`, `VcpuLockCensus`,
 //! `DrainDutyCensus`), the phase vocabulary a reading is filed under
 //! (`ReadbackPhase`, `SurfaceWritePhase`, `WindowPublish`, `FlushRail`), or the
@@ -237,8 +237,7 @@ pub enum ReadbackPhase {
     /// completion stamp (`engine::quiesce_guest_writes`), which is outside
     /// `DrainPhase::Flush`. So `flush_us` fell 1370 → 123 us per flush across
     /// that change while the total moved −0.7%: the wait relocated. **Never
-    /// compare `flush_us` across it** — add `fence_us` back first, and see
-    /// `storage_flush::fence` for the A/B.
+    /// compare `flush_us` across it** — add `fence_us` back first.
     ///
     /// `fence` counts settles rather than windows in principle, but no boot has
     /// yet made those differ: it equals `submit` on both sides of the change,
@@ -643,10 +642,9 @@ impl SurfaceWriteCensus {
 /// both are the opposite of what the old wording argued:
 ///
 /// - **Removing bytes is worth ~1:1 against 90% of the largest cost in the
-///   device.** The four levers the deferred-flush ledger in
-///   [`crate::runtime::storage_flush::fence::flush_mapping_windows_before_fence`] prices
-///   in bytes are the ones that would pay, and they were not being weighed
-///   against the right number.
+///   device.** The four levers the deferred-flush ledger priced in bytes are the
+///   ones that would pay, and they were not being weighed against the right
+///   number.
 /// - **Removing the second submission is worth the other ~11%** — a stable
 ///   0.18-0.26 ms per readback, and no more. That prices a step left queued as a
 ///   top item on the grounds that "round trips *are* the cost". They are not.

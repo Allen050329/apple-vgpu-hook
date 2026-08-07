@@ -5,7 +5,7 @@
 //! for rather than motion.
 
 use super::*;
-use crate::model::{DeviceId, GvaDeferredEntry, PAGE_SHIFT_X86};
+use crate::model::{DeviceId, PAGE_SHIFT_X86};
 
 /// One 16x16 BGRA frame — 1 024 bytes, so a cap in the tens of KiB holds a
 /// countable number of them.
@@ -23,21 +23,6 @@ fn store_frame(state: &mut DeviceState, gva: u64, fill: u8) {
     store_gva_owned(state, gva, W, H, vec![fill; FRAME_BYTES], 0, None, true);
 }
 
-fn deferred_entry() -> GvaDeferredEntry {
-    GvaDeferredEntry {
-        task_id: 0,
-        texture_ref: 0,
-        producer_object_type: 0,
-        width: W,
-        height: H,
-        row_stride: W * 4,
-        format: 0,
-        armed_seq: 1,
-        armed_stamp_seq: 0,
-        pages: std::collections::HashSet::new(),
-        alloc_gen: 1,
-    }
-}
 
 /// The leak, and the bound.
 ///
@@ -147,31 +132,6 @@ fn the_same_entry_is_evicted_when_nothing_reports_reading_it() {
     );
 }
 
-/// A memory bound must never become a pixel loss.
-///
-/// A window in `gva_deferred_flush` names this address and its flush reads
-/// this entry, so evicting it would drop guest pixels that were promised —
-/// the Goal 3 loss class. The exclusion is on a recorded obligation, not on
-/// a guess about what the guest still wants.
-#[test]
-fn an_address_that_still_owes_a_deferred_writeback_is_never_evicted() {
-    let cap = 8 * FRAME_BYTES;
-    let mut state = state_capped(cap);
-    let owed = 0x7_0000u64;
-    store_frame(&mut state, owed, 0xCD);
-    state.arm_gva_deferred_window(owed, deferred_entry());
-
-    // Never touched again, so recency alone would have evicted it long ago.
-    for i in 0..400u64 {
-        store_frame(&mut state, 0x200_0000 + i * 0x1000, i as u8);
-    }
-    assert!(
-        state.host_gva_surfaces.contains_key(&owed),
-        "the obligation outranks the bound"
-    );
-    let served = get_gva(&state, owed, W, H).expect("still servable");
-    assert!(served.iter().all(|&b| b == 0xCD));
-}
 
 /// The harm witness must charge the cap for its own misses and nothing
 /// else, or the number cannot be read.
@@ -406,17 +366,17 @@ fn the_running_byte_total_equals_the_map_after_every_transition() {
 use std::sync::atomic::Ordering::Relaxed;
 
 /// Store a frame whose bytes the guest's own pages do **not** hold — the shape
-/// `storage_flush::land` produces on each of its four non-`written` outcomes.
+/// a render writeback produces on every outcome that did not reach guest RAM.
 fn store_unlanded_frame(state: &mut DeviceState, gva: u64, fill: u8) {
     store_gva_owned(state, gva, W, H, vec![fill; FRAME_BYTES], 0, None, false);
 }
 
 /// The cap must not evict an entry whose bytes never reached guest RAM.
 ///
-/// `storage_flush::guards::window_pages_still_ours` refuses a guest write when
-/// the address has been re-pointed, and argues the refusal is safe because "the
-/// caller keeps the content either way … so nothing renderable is lost by
-/// refusing". That is a claim about this map. Before
+/// A writeback refuses a guest write when the address has been re-pointed, on
+/// the argument that the refusal is safe because the caller keeps the content
+/// either way, so nothing renderable is lost by refusing. That is a claim about
+/// this map. Before
 /// `HostSurface::guest_holds_bytes` the cap was free to falsify it: the window
 /// exclusion only covers an address whose flush has not run, and a refused flush
 /// leaves no window behind.

@@ -123,10 +123,8 @@ pub fn store_shared(
 ///
 /// Reuse is conditional on [`std::sync::Arc::get_mut`], so it happens only when
 /// the strong count is exactly one and no window, sampled binding or present
-/// capture can observe the mutation. When something does hold the frame — a
-/// [`crate::model::DeferredOwner::Render`] window armed on this allocation, the
-/// case the `Arc` exists for — this allocates as before and the old bytes stay
-/// intact for their holder.
+/// capture can observe the mutation. When something does hold the frame, this
+/// allocates as before and the old bytes stay intact for their holder.
 pub fn store_rows(
     state: &mut DeviceState,
     surface_id: u32,
@@ -904,18 +902,13 @@ impl GvaCapDecline {
 ///   occasional batches with headroom instead of one-for-one at the boundary,
 ///   and a cap crossing never dumps the hot set — the re-encode cliff that
 ///   pattern exists to avoid.
-/// - **It never evicts a GVA that still owes a deferred writeback.** A window in
-///   `gva_deferred_flush` names this address and its flush reads this entry;
-///   dropping it would turn a memory bound into lost guest pixels, which is the
-///   Goal 3 loss class. That is a correctness exclusion, not a heuristic — the
-///   obligation is recorded, not guessed.
 /// - **It never evicts an entry the guest's pages do not also hold.** See
-///   [`crate::model::HostSurface::guest_holds_bytes`]. The window exclusion above
-///   only covers an address whose flush has not run yet; once the flush runs and
-///   *refuses* — which `storage_flush::guards` permits precisely because this
-///   cache keeps the content — the window is gone and the entry would otherwise
-///   become an ordinary candidate while still being the only copy. Same
-///   exclusion, one step later in the same lifetime.
+///   [`crate::model::HostSurface::guest_holds_bytes`]. That exclusion
+///   only covers an address whose writeback has not run yet; once it runs and
+///   *refuses* — which the page-ownership guard permits precisely because this
+///   cache keeps the content — the entry would otherwise become an ordinary
+///   candidate while still being the only copy. Same exclusion, one step later
+///   in the same lifetime.
 ///
 /// When those exclusions leave nothing to take, the map stays over its cap and
 /// says so rather than evicting into them. That is the intended shape: a GPU
@@ -948,7 +941,7 @@ fn enforce_gva_cache_cap(state: &mut DeviceState, protect: u64) {
         .host_gva_surfaces
         .iter()
         .filter(|(gva, e)| {
-            **gva != protect && !state.gva_deferred_flush.contains_key(gva) && e.guest_holds_bytes
+            **gva != protect && e.guest_holds_bytes
         })
         .map(|(&gva, e)| (e.last_touch, gva))
         .collect();
@@ -1140,8 +1133,8 @@ impl CacheLevel {
 ///
 /// - `note_cache_levels` runs in `lib.rs` at the tail of a drain tranche, after
 ///   `Device::drain` has returned.
-/// - Inside that drain, `storage_flush::flush_all_windows_before_fence` lands
-///   every armed render window before the guest is told the work is done.
+/// - Inside that drain, every render Store lands its frame in guest pages
+///   before the guest is told the work is done.
 /// - Every one of those landings takes the leased frame — `render_flush_copied`
 ///   has never fired, `render_flush_leased` fires on every census line — so each
 ///   one writes through `mapping_write::write_bgra8_uncached`, whose

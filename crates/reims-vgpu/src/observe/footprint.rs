@@ -99,7 +99,7 @@
 //!
 //! The class it watched for — a write through a page list the guest tore down —
 //! is refused rather than merely observed, by guards that already fail loudly:
-//! `mapping_write`'s `vouch_stale`, `storage_flush`'s `backing_condemned` hold,
+//! `mapping_write`'s `vouch_stale`, the `backing_condemned` hold,
 //! and the drain unmap / ReplacePhysical sites that drop-with-fail instead of
 //! writing through recycled pages. Those are product behaviour; this module is
 //! not, and a second opinion that could not read its own answer is not worth a

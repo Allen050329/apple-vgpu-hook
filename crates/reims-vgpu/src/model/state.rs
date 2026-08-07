@@ -758,9 +758,8 @@ pub struct RenderFlushWitness {
     /// one frame. The worker fell behind and caught up. At `duty` 0.85 it has
     /// almost no headroom to absorb anything, so a hitch is the flush rail's
     /// cost showing up as latency rather than a separate defect — and the only
-    /// remaining route to that cost is the one
-    /// [`crate::runtime::storage_flush::fence::flush_mapping_windows_before_fence`]
-    /// names: making the undeclared guest read observable.
+    /// remaining route to that cost is making the undeclared guest read
+    /// observable.
     pub landed_us: u64,
 }
 
@@ -803,8 +802,7 @@ pub struct MappingEntry {
     /// draw — only whether a known-equal upload can be elided.
     pub surface_content_epoch: u32,
     /// Who has read what the last landed render flush of this mapping wrote.
-    /// See [`RenderFlushWitness`]; reported by
-    /// [`crate::runtime::storage_flush::report::note_render_flush_landed`].
+    /// See [`RenderFlushWitness`].
     pub render_flush: RenderFlushWitness,
     /// Bumped whenever the guest page list / map lifetime changes (MAP, UNMAP,
     /// ReplacePhysical, MappingInternal reattach, page-table refresh that
@@ -1058,201 +1056,6 @@ impl crate::observe::Decline for PresentBacking {
     }
 }
 
-/// Which rail holds the authoritative pixels of a mapping-keyed deferred
-/// window, and therefore how a flush must read them.
-///
-/// Both kinds live in one map — [`DeviceState::compute_deferred_flush`] — and
-/// that is the point. The dangerous half of any deferred rail is the set of
-/// guest-page readers that must drain it first; a reader that misses one window
-/// makes the guest read stale pixels with nothing logged. Sharing the key type
-/// means both kinds share the range scan
-/// ([`DeviceState::take_deferred_flush_windows`]), the raw-GVA alias index
-/// ([`DeviceState::deferred_alias_pages`]), the teardown drop and every
-/// existing trigger, so a rail cannot be covered for one kind and missed for
-/// the other. A second map keyed the same way would have had to re-derive
-/// "does any window still name this mapping" in
-/// [`DeviceState::prune_alias_index`], and getting that wrong drops the alias
-/// index out from under a live window.
-///
-/// What genuinely differs is only where the pixels are. Everything else the
-/// flush needs — mapping id, geometry, format, guest byte range — is already in
-/// the key, which is why neither variant carries geometry of its own.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DeferredOwner {
-    /// Compute rail: a *storage* resident keyed by this same
-    /// `ComputeStorageResidencyKey`, read with
-    /// `engine::read_resident_storage(key, generation)`. The generation is the
-    /// resident's **content** generation, unrelated to `key.map_generation`.
-    Storage {
-        generation: u32,
-        armed_stamp_seq: u64,
-    },
-    /// Type-11 render Store rail: the window **owns the frame it deferred**,
-    /// tight BGRA8 at `key.width x key.height`, shared with the
-    /// [`crate::runtime::surface_cache`] entry that was stored from the same
-    /// readback.
-    ///
-    /// Owning it is what makes the obligation landable. The flush used to source
-    /// its pixels from `surface_cache::get(mapping_id, key.width, key.height)`,
-    /// and that cache holds exactly **one** entry per mapping: a later Store at a
-    /// different geometry replaces it, and every window still armed at the old
-    /// geometry then misses and reports `deferred_flush_lost reason=cache_miss`.
-    /// One boot lost 15 whole layers that way — a 1920x1080 desktop surface, a
-    /// 1920x24 menu bar, several window-sized rects — which is a compositing
-    /// layer rendering solid black with the loss reported only after the fact.
-    /// An `Arc` clone costs nothing at arm time and cannot be orphaned.
-    ///
-    /// `source` is the one thing that varies, and it varies for a reason the
-    /// paragraph above states in the other direction: owning the bytes is free
-    /// *when the Store already read them back*. A Store that skips its readback
-    /// has no bytes to own, and the whole point of skipping it is that ~98 % of
-    /// these windows are never flushed at all — so that rail names the resident
-    /// and pays the readback only if someone asks. Everything else about the
-    /// window is identical, which is why this is a field and not a variant:
-    /// `matches!(owner, Render { .. })` still selects the rail for the population
-    /// cap, the alias index, the teardown drop and `owner_slug`, and only the
-    /// pixel read dispatches.
-    Render {
-        armed_seq: u64,
-        armed_stamp_seq: u64,
-        source: RenderWindowSource,
-    },
-}
-
-impl DeferredOwner {
-    /// [`DeviceState::completion_stamp_seq`] when this window was armed.
-    ///
-    /// Both rails carry it for the same reason [`GvaDeferredEntry::
-    /// armed_stamp_seq`] does: a window that lands after the guest was fenced
-    /// writes memory the guest was already entitled to reclaim, and no check
-    /// taken after the fence can tell that memory apart from the target it used
-    /// to be. Unlike the GVA rail, these windows are keyed by a
-    /// `ComputeStorageResidencyKey` that carries `map_generation`, so the flush
-    /// can already refuse a mapping incarnation the guest replaced — which is
-    /// why this rail is measured before it is changed rather than assumed to
-    /// share the GVA rail's verdict.
-    pub fn armed_stamp_seq(&self) -> u64 {
-        match self {
-            Self::Storage {
-                armed_stamp_seq, ..
-            }
-            | Self::Render {
-                armed_stamp_seq, ..
-            } => *armed_stamp_seq,
-        }
-    }
-}
-
-/// Where a [`DeferredOwner::Render`] window's frame lives.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RenderWindowSource {
-    /// The window owns the frame, tight BGRA8 at `key.width x key.height`,
-    /// shared with the [`crate::runtime::surface_cache`] entry stored from the
-    /// same readback. Cannot be orphaned; see the variant's own note.
-    Owned(std::sync::Arc<Vec<u8>>),
-    /// The engine's `TargetIdentity::Surface` resident holds the frame and the
-    /// window holds a pin on it. `epoch` is the
-    /// [`MappingEntry::surface_content_epoch`] this window's pixels were
-    /// published at; the flush compares it against the resident's stamp
-    /// (`engine::resident_content_epoch`) and declines rather than writing a
-    /// frame it cannot vouch for.
-    ///
-    /// The identity is **reconstructed** at flush time from the key rather than
-    /// stored, exactly as `flush_gva_one` does: `key` already carries the mapping
-    /// id, the geometry and the `map_generation` that `surface_identity` keys on,
-    /// and the flush refuses on generation drift before it reads anything. Storing
-    /// it would put a backend type in the model and give the two spellings a way
-    /// to disagree.
-    Resident { epoch: u32 },
-}
-
-/// Everything a later flush needs to land a deferred **GVA render Store**
-/// (type-2/3 color0 with `target_gva != 0`): the engine resident
-/// `TargetIdentity::Gva { gva, width, height, generation: alloc_gen }` holds the
-/// authoritative pixels; guest pages + `host_gva_surfaces` are stale until a
-/// flush lands them. One window per `gva` — a newer Store at the same GVA
-/// supersedes (same geometry) or flushes (different geometry) the older one.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GvaDeferredEntry {
-    pub task_id: u32,
-    pub texture_ref: u32,
-    /// Producer object type captured at defer time (the task/object list may
-    /// be gone by flush time) — `host_gva_surfaces` owner-gating input.
-    pub producer_object_type: u8,
-    pub width: u32,
-    pub height: u32,
-    /// Guest row stride the sync Store would have written with.
-    pub row_stride: u32,
-    pub format: u16,
-    /// Arm order for oldest-first flush when the window cap is hit.
-    pub armed_seq: u64,
-    /// [`DeviceState::completion_stamp_seq`] when this window was armed.
-    ///
-    /// The window's `pages` guard asks whether the GVA still resolves to the
-    /// pages it was armed on. That question is blind to the hazard this field
-    /// names: a guest that frees the render target and lets its own allocator
-    /// hand the same pages to something else keeps the translation identical, so
-    /// the guard passes and the flush writes pixels over whatever moved in. The
-    /// guest is entitled to do that from the moment it is stamped, so a landing
-    /// whose stamp counter has moved is a write the guest never agreed to.
-    pub armed_stamp_seq: u64,
-    /// Defer-time physical page GPAs of the guest window — raw task-GVA reads
-    /// aliasing these flush first (`storage_flush::flush_intersecting_task_gva`).
-    pub pages: std::collections::HashSet<u64>,
-    /// `generation` of the engine resident this window pinned — the page-set
-    /// hash the arming draw resolved (`DrawEncodeRequest::gva_alloc_gen`).
-    ///
-    /// Stored rather than recomputed. The window exists precisely because the
-    /// address may be handed to another allocation before the flush runs, and a
-    /// walk taken then would name *that* allocation: the registry lookup would
-    /// miss the slot this window is holding pinned, and the frame would be lost
-    /// to a `deferred_flush_lost` instead of landing. Every consumer that
-    /// rebuilds the identity from a window reads this field.
-    pub alloc_gen: u64,
-}
-
-/// Everything a later flush needs to land a deferred **linear compute-storage
-/// Store** (`ComputeStorageResidencyKey::linear` — a raw task GVA, `mapping_id`
-/// 0). The engine resident holds the authoritative pixels;
-/// `storage_flush::flush_linear_one` lands them into guest pages and
-/// `host_linear_textures`.
-///
-/// This window names an *address under a task*, exactly like
-/// [`GvaDeferredEntry`], and for the same reason: a type-2/3 linear texture has
-/// no mapping incarnation to name and the wire format carries no lifecycle
-/// notify for one. The mapping-keyed rails
-/// (`storage_flush::land::flush_render_one`/`flush_storage_one`) can refuse on
-/// `map_generation` drift because the guest must MAP/UNMAP/ReplacePhysical to
-/// reclaim an IOSurface's storage; nothing of the sort exists here, which is why
-/// this entry carries the same fence stamp the GVA rail carries.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LinearDeferredEntry {
-    /// Engine resident generation the window pinned — `read_resident_storage`'s
-    /// second argument, and the only thing that distinguishes two residents at
-    /// one key.
-    pub generation: u32,
-    /// [`DeviceState::completion_stamp_seq`] when this window was armed.
-    ///
-    /// Same hazard, same reading as [`GvaDeferredEntry::armed_stamp_seq`]: after
-    /// the stamp the guest may free this texture's memory and its own allocator
-    /// may hand those pages to anything without touching a page table, so
-    /// `storage_flush::guards::deferred_pages_still_ours` still passes and the flush
-    /// writes a compute-storage image over whatever moved in.
-    pub armed_stamp_seq: u64,
-    /// Defer-time physical page GPAs of the guest window — raw task-GVA reads
-    /// aliasing these flush first
-    /// (`storage_flush::flush_intersecting_task_gva`), and the writer's own walk
-    /// is bounded to them.
-    pub pages: std::collections::HashSet<u64>,
-}
-
-impl GvaDeferredEntry {
-    /// Guest byte span the flush writes: `row_stride * height`.
-    pub fn span(&self) -> u64 {
-        (self.row_stride as u64).saturating_mul(self.height as u64)
-    }
-}
-
 /// HostOps view over a **task GVA range** (MapMemory2 / UnmapMemory lifecycle).
 ///
 /// Distinct from [`MappingEntry::contig_ptr`] (iosfc `mapping_id` page list).
@@ -1322,10 +1125,9 @@ pub struct HostSurface {
     pub height: u32,
     /// Tight BGRA8, stride = width * 4.
     ///
-    /// Shared rather than owned so a [`DeferredOwner::Render`] window can hold
-    /// the exact frame it deferred without copying it: the window and this entry
-    /// point at one allocation, and replacing the entry leaves the window's
-    /// pixels intact instead of orphaning them.
+    /// Shared rather than owned so a holder that took the frame keeps it across
+    /// a replacement of this entry: the two point at one allocation, and storing
+    /// a new frame leaves the holder's pixels intact instead of orphaning them.
     pub bgra: std::sync::Arc<Vec<u8>>,
     /// Generation of the store that produced these bytes, issued by
     /// [`DeviceState::next_sampled_content_generation`] (independent of guest
@@ -1370,21 +1172,18 @@ pub struct HostSurface {
     /// and it exists because two rules in this device were relying on each other
     /// without either saying so.
     ///
-    /// `storage_flush::land` stores into this cache on **all five** of its
-    /// outcomes, and its own comment says why: "on the four that did not reach
-    /// guest RAM it is what holds the authoritative bytes". `storage_flush`'s
-    /// `window_pages_still_ours` then argues that *refusing* a guest write is
+    /// The render writeback stores into this cache on every outcome, because on
+    /// the ones that did not reach guest RAM it is what holds the authoritative
+    /// bytes. The page-ownership guard then argues that *refusing* a guest write is
     /// safe — permitting one would land pixels in whatever now owns those pages,
     /// which has been observed as guest heap corruption — and closes with "the
     /// caller keeps the content either way … so nothing renderable is lost by
     /// refusing".
     ///
     /// That closing clause is a claim about this map, and
-    /// `surface_cache::enforce_gva_cache_cap` was free to falsify it. The cap
-    /// excludes an address with a live `gva_deferred_flush` window, but once the
-    /// flush has run and refused, the window is gone and the entry becomes an
-    /// ordinary eviction candidate — while still being the only copy of pixels
-    /// the guest never received.
+    /// `surface_cache::enforce_gva_cache_cap` was free to falsify it: an entry
+    /// that is the only copy of pixels the guest never received is an ordinary
+    /// eviction candidate to a cap that only counts bytes.
     ///
     /// So `false` marks an entry the cap must not take: evicting it is the loss
     /// the refusal was allowed on the promise that it would not happen. `true`
@@ -1805,41 +1604,6 @@ pub struct GuestLinearMemo {
     pub generation: u64,
 }
 
-/// A map of deferred writeback windows — pixels this device still owes guest
-/// RAM, keyed by the rail that armed them.
-///
-/// Read-only outside this module: [`Deref`](std::ops::Deref) exposes the whole
-/// `BTreeMap` read API, and there is deliberately **no** `DerefMut`, so the
-/// inner map can only be mutated through the arm/disarm methods below. Arming
-/// stamps a window with the fence generation it was armed under and disarming
-/// hands the page set back to the caller that is about to write those pages;
-/// a site that inserted or removed a window directly would skip both, so the
-/// type refuses to let it compile.
-#[derive(Debug)]
-pub struct DeferredWindows<K, V>(BTreeMap<K, V>);
-
-impl<K, V> DeferredWindows<K, V> {
-    fn new() -> Self {
-        Self(BTreeMap::new())
-    }
-}
-
-impl<K, V> std::ops::Deref for DeferredWindows<K, V> {
-    type Target = BTreeMap<K, V>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-/// `for (k, v) in &windows`, which auto-deref does not reach on its own.
-impl<'a, K, V> IntoIterator for &'a DeferredWindows<K, V> {
-    type Item = (&'a K, &'a V);
-    type IntoIter = std::collections::btree_map::Iter<'a, K, V>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
-    }
-}
-
 /// Full device model state (backend-independent).
 #[derive(Debug)]
 pub struct DeviceState {
@@ -2079,26 +1843,6 @@ pub struct DeviceState {
     /// be right the moment a caller reached the cap with a zero-keyed
     /// candidate. Anything that changes when the cap runs must re-check this.
     pub compute_storage_residency: BTreeMap<ComputeStorageResidencyKey, u32>,
-    /// Deferred mapping-keyed writebacks: windows whose guest pages are STALE —
-    /// a pinned engine resident is the authoritative content. Every host-side
-    /// read or write of intersecting mapping bytes must flush first
-    /// (`runtime::storage_flush::flush_intersecting`). The value says which
-    /// rail owns the pixels; see [`DeferredOwner`].
-    pub compute_deferred_flush: BTreeMap<ComputeStorageResidencyKey, DeferredOwner>,
-    /// Arm order for [`DeferredOwner::Render`] windows, so the population cap
-    /// can evict oldest-first. Compute windows are bounded by the dispatches
-    /// that create them; render windows are armed once per composite Store and
-    /// each one pins a display-sized image, so they need their own bound.
-    pub surface_deferred_seq: u64,
-    /// Physical page bases of each mapping with live deferred windows, for the
-    /// raw task-GVA sampling guard (`storage_flush::flush_intersecting_task_gva`).
-    /// Built at defer time from the just-resolved `page_entries`
-    /// ([`Self::index_deferred_alias_pages`] — per-sample resolution cost the
-    /// boot-19 setup_us regression measured at ~1.4 s/boot); entries drop when
-    /// the mapping's last deferred window is taken. A stale entry after a PFN
-    /// change costs one spurious no-op flush call, never a wrong flush — the
-    /// windows map stays the single flush authority.
-    pub deferred_alias_pages: DeferredWindows<u32, std::collections::HashSet<u64>>,
     /// Mapping ids the fence-bound writeback has landed a render window on,
     /// for one measurement and nothing else: does the guest declare its CPU
     /// reads on the same surfaces this device writes back eagerly?
@@ -2156,23 +1900,10 @@ pub struct DeviceState {
     pub gva_host_views: Vec<GvaHostView>,
     /// Linear-window residency keys whose `host_linear_textures` entry died
     /// (task/object delete). `DeviceState` cannot reach the engine; the
-    /// runtime unpins these (`storage_flush::retire_linear_residents`) so the
+    /// runtime unpins these
+    /// ([`crate::runtime::render_writeback::retire_linear_residents`]) so the
     /// pinned images become LRU-evictable instead of leaking.
     pub retired_linear_residents: Vec<ComputeStorageResidencyKey>,
-    /// Deferred linear windows whose guest pages the superseded sync path
-    /// WOULD have written (GVA-mapped at defer time): generation + defer-time
-    /// page-GPA index. A raw task-GVA read aliasing these pages flushes the
-    /// resident into the cache entry and guest pages first
-    /// (`storage_flush::flush_intersecting_task_gva`). Cache-only-shaped
-    /// windows never enter — their sync path never wrote guest pages either.
-    pub linear_deferred_flush: DeferredWindows<ComputeStorageResidencyKey, LinearDeferredEntry>,
-    /// Deferred GVA render-Store windows (type-2/3 color0, `target_gva != 0`)
-    /// whose guest bytes + `host_gva_surfaces` encode the superseded sync path
-    /// WOULD have written. The engine resident `TargetIdentity::Gva` is the
-    /// authoritative content until `storage_flush::flush_gva_one` lands it.
-    pub gva_deferred_flush: DeferredWindows<u64, GvaDeferredEntry>,
-    /// Monotonic arm counter for [`Self::gva_deferred_flush`] oldest-first cap.
-    pub gva_deferred_seq: u64,
     /// GVA render target → a hash of the guest physical pages its engine
     /// resident was last armed over.
     ///
@@ -2201,10 +1932,6 @@ pub struct DeviceState {
     /// answer to the one question its page-set guard cannot ask: was the guest
     /// told this render was done before we wrote its bytes?
     pub completion_stamp_seq: u64,
-    /// GVA windows whose task died (`delete_task`) — the GVA walk is gone, so
-    /// the runtime lands these **cache-only** (no guest write) and unpins
-    /// (`storage_flush::retire_gva_windows`).
-    pub retired_gva_windows: Vec<(u64, GvaDeferredEntry)>,
     /// Total stale views the reuse verify caught (fail-logged as
     /// `gva_view_stale`; the view self-heals via retire + rebuild).
     pub view_stale_reads: u64,
@@ -2267,10 +1994,7 @@ impl DeviceState {
             gva_eviction_witness: GvaEvictionWitness::default(),
             host_linear_textures: BTreeMap::new(),
             compute_storage_residency: BTreeMap::new(),
-            compute_deferred_flush: BTreeMap::new(),
             fence_flushed_mappings: std::collections::BTreeSet::new(),
-            surface_deferred_seq: 0,
-            deferred_alias_pages: DeferredWindows::new(),
             surface_write_kind: BTreeMap::new(),
             present: PresentState::default(),
             cursor: CursorState {
@@ -2288,12 +2012,8 @@ impl DeviceState {
             retired_views: Vec::new(),
             retired_guest_write_tokens: Vec::new(),
             retired_linear_residents: Vec::new(),
-            linear_deferred_flush: DeferredWindows::new(),
-            gva_deferred_flush: DeferredWindows::new(),
-            gva_deferred_seq: 0,
             completion_stamp_seq: 0,
             gva_resident_backing: std::collections::BTreeMap::new(),
-            retired_gva_windows: Vec::new(),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             #[cfg(feature = "backend-vulkan")]
             gather_witness: crate::runtime::gather_witness::GatherWitness::default(),
@@ -2308,48 +2028,8 @@ impl DeviceState {
         }
     }
 
-    /// Arm (or re-arm) a deferred GVA render-Store window.
-    pub fn arm_gva_deferred_window(&mut self, gva: u64, entry: GvaDeferredEntry) {
-        self.gva_deferred_flush.0.insert(gva, entry);
-    }
 
-    /// Arm (or re-arm) a linear compute-storage deferred window.
-    pub fn arm_linear_deferred_window(
-        &mut self,
-        key: ComputeStorageResidencyKey,
-        generation: u32,
-        pages: std::collections::HashSet<u64>,
-    ) {
-        let armed_stamp_seq = self.completion_stamp_seq;
-        self.linear_deferred_flush.0.insert(
-            key,
-            LinearDeferredEntry {
-                generation,
-                armed_stamp_seq,
-                pages,
-            },
-        );
-    }
 
-    /// Disarm a linear compute-storage deferred window.
-    ///
-    /// Returns the whole window, so a caller about to write those guest pages
-    /// can check they still belong to this window (see
-    /// `runtime::storage_flush::guards::deferred_pages_still_ours`) and can score the
-    /// landing against the fence the window was armed under
-    /// ([`LinearDeferredEntry::armed_stamp_seq`]). This used to return a bare
-    /// `bool` and drop the pages on the floor, which left the flush with no way
-    /// to tell that the guest had re-pointed the span since defer time — the
-    /// same hazard the GVA rail already guards. `Some` still means "an entry was
-    /// present", so the presence test is unchanged for callers that only want
-    /// that.
-    pub fn disarm_linear_deferred_window(
-        &mut self,
-        key: &ComputeStorageResidencyKey,
-    ) -> Option<LinearDeferredEntry> {
-        let entry = self.linear_deferred_flush.0.remove(key)?;
-        Some(entry)
-    }
 
     /// Detach `e`'s contiguous view for later unmap (page table changed).
     /// Returns the retired (ptr, len) to push into `retired_views`.
@@ -2632,67 +2312,6 @@ impl DeviceState {
         }
     }
 
-    /// Deferred GVA render-Store windows lose their GVA walk with the task —
-    /// hand them to the runtime for a cache-only landing
-    /// (`storage_flush::retire_gva_windows`); never write guest pages from
-    /// teardown.
-    ///
-    /// Only this task's windows. Both sides of the comparison are slot ids:
-    /// `GvaDeferredEntry::task_id` is the word `task_slot::resolve_task_word`
-    /// accepted, and `DeleteTask` (`0x20`) carries a slot id too — its words
-    /// include `5`, `11` and `13`, odd and greater than one, which the
-    /// `DefineTask2` doubled space (`0x1`, then strictly even) does not contain,
-    /// and all 968 deletes measured across the boots on disk report `ok=1`
-    /// against a live slot.
-    ///
-    /// So a `task_id >> 1` arm here matched no window this task owns and did
-    /// match every window owned by slots `2 * task_id` and `2 * task_id + 1`.
-    /// Task ids run densely from 0 and boots use ids
-    /// well past 14, so those are live tasks: deleting task 5 retired tasks 10
-    /// and 11's pending frames. Cache-only landing writes no guest pages, so the
-    /// effect was a live task silently losing rendered pixels out of guest RAM
-    /// and the guest compositing whatever those pages held before.
-    ///
-    /// Do not widen this back for symmetry with
-    /// [`crate::runtime::gva_view::task_matches`], which deliberately keeps an
-    /// aliased arm at its own overlap-retire site. The two are not the same
-    /// shape, and copying that pattern here without the asymmetry is how this
-    /// arrived. A *view* is a cached translation, so retiring one that did not
-    /// need retiring costs a re-walk and nothing else. A *window* is pixels this
-    /// device owes guest RAM, and retiring one lands it cache-only — the bytes
-    /// never reach the guest and nothing re-derives them. Widening is
-    /// conservative for the first and lossy for the second.
-    fn retire_task_gva_windows(&mut self, task_id: u32) {
-        let doomed: Vec<u64> = self
-            .gva_deferred_flush
-            .iter()
-            .filter(|(_, e)| e.task_id == task_id)
-            .map(|(&gva, _)| gva)
-            .collect();
-        for gva in doomed {
-            if let Some(entry) = self.gva_deferred_flush.0.remove(&gva) {
-                self.retired_gva_windows.push((gva, entry));
-            }
-        }
-    }
-
-    /// Take the deferred GVA window at exactly `gva`, if any.
-    pub fn take_gva_deferred_window(&mut self, gva: u64) -> Option<GvaDeferredEntry> {
-        let entry = self.gva_deferred_flush.0.remove(&gva)?;
-        Some(entry)
-    }
-
-    /// Take the oldest-armed deferred GVA window (window-cap eviction).
-    pub fn take_oldest_gva_deferred_window(&mut self) -> Option<(u64, GvaDeferredEntry)> {
-        let gva = self
-            .gva_deferred_flush
-            .iter()
-            .min_by_key(|(_, e)| e.armed_seq)
-            .map(|(&gva, _)| gva)?;
-        let entry = self.gva_deferred_flush.0.remove(&gva)?;
-        Some((gva, entry))
-    }
-
     /// Install the guest's task under `task_id`, replacing any previous one.
     ///
     /// Returns nothing: it used to return `bool`, and the only `false` it could
@@ -2706,7 +2325,6 @@ impl DeviceState {
         // Drop objects for this task on redefine.
         self.objects.retain(|&(t, _)| t != task_id);
         self.retire_task_linear_residents(task_id);
-        self.retire_task_gva_windows(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.
         self.retire_task_gva_views(task_id);
@@ -2746,7 +2364,6 @@ impl DeviceState {
         }
         self.objects.retain(|&(t, _)| t != task_id);
         self.retire_task_linear_residents(task_id);
-        self.retire_task_gva_windows(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         // Clear texture→mapping latches for this task.
         let doomed_refs: Vec<u32> = self
@@ -2855,102 +2472,6 @@ impl DeviceState {
         });
     }
 
-    /// How many deferred windows this mapping currently owes.
-    ///
-    /// Read before a drop so the drop can be counted: `drop_windows` reports
-    /// each window it takes on the fail path but returns nothing, and a rail
-    /// that needs to know whether it dropped anything must not re-derive the
-    /// answer from the log.
-    pub fn deferred_flush_window_count(&self, mapping_id: u32) -> u32 {
-        self.compute_deferred_flush
-            .keys()
-            .filter(|key| key.mapping_id == mapping_id)
-            .count() as u32
-    }
-
-    /// Remove one deferred window by exact key, pruning the alias index with it.
-    ///
-    /// For supersede: a writer that fully covers a window's guest range drops
-    /// the obligation instead of landing it, and must not disturb the
-    /// intersecting siblings [`Self::take_deferred_flush_windows`] would also
-    /// take. Going through here rather than `compute_deferred_flush.remove`
-    /// keeps the raw-GVA alias index in step — a mapping whose last window
-    /// leaves must lose its page refs, or the union index keeps counting pages
-    /// nothing defers on.
-    pub fn take_deferred_flush_window_exact(
-        &mut self,
-        key: &ComputeStorageResidencyKey,
-    ) -> Option<DeferredOwner> {
-        let owner = self.compute_deferred_flush.remove(key)?;
-        self.prune_alias_index(key.mapping_id);
-        Some(owner)
-    }
-
-    /// Remove and return every deferred-writeback window intersecting
-    /// `[lo, hi)` on this mapping. The caller owns flushing each returned
-    /// entry (or reporting the loss) — once taken, the map no longer names it.
-    pub fn take_deferred_flush_windows(
-        &mut self,
-        mapping_id: u32,
-        lo: u64,
-        hi: u64,
-    ) -> Vec<(ComputeStorageResidencyKey, DeferredOwner)> {
-        let keys: Vec<ComputeStorageResidencyKey> = self
-            .compute_deferred_flush
-            .keys()
-            .filter(|key| {
-                key.mapping_id == mapping_id && key.span_end > lo && key.surface_offset < hi
-            })
-            .cloned()
-            .collect();
-        let taken: Vec<(ComputeStorageResidencyKey, DeferredOwner)> = keys
-            .into_iter()
-            .filter_map(|key| {
-                self.compute_deferred_flush
-                    .remove(&key)
-                    .map(|owner| (key, owner))
-            })
-            .collect();
-        if !taken.is_empty() {
-            self.prune_alias_index(mapping_id);
-        }
-        taken
-    }
-
-    /// Record the physical page bases of `mapping_id` in the raw-GVA alias
-    /// index. Called at defer time, when `page_entries` are freshly resolved
-    /// (the Store/dispatch just targeted them) — never at sample time.
-    pub fn index_deferred_alias_pages(&mut self, mapping_id: u32) {
-        let page_shift = self.page_shift;
-        let page = self.page_size();
-        let Some(m) = self.mappings.get(&mapping_id) else {
-            return;
-        };
-        let set: std::collections::HashSet<u64> = m
-            .page_entries
-            .iter()
-            .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift))
-            .map(|gpa| gpa & !(page - 1))
-            .collect();
-        if set.is_empty() {
-            self.deferred_alias_pages.0.remove(&mapping_id);
-        } else {
-            self.deferred_alias_pages.0.insert(mapping_id, set);
-        }
-    }
-
-    /// Drop the alias-index entry once no mapping-keyed deferred window names
-    /// this mapping anymore.
-    fn prune_alias_index(&mut self, mapping_id: u32) {
-        let live = self
-            .compute_deferred_flush
-            .keys()
-            .any(|k| k.mapping_id == mapping_id);
-        if !live {
-            self.deferred_alias_pages.0.remove(&mapping_id);
-        }
-    }
-
     /// Drop cached page list + contig view without unmapping the slot.
     ///
     /// Used on ReplacePhysical / rebind: guest may have recycled PFNs into the
@@ -3014,7 +2535,6 @@ impl DeviceState {
     pub fn condemn_surface_backing(&mut self, mapping_id: u32) -> bool {
         self.forget_compositor_mapping(mapping_id);
         self.host_surfaces.remove(&mapping_id);
-        self.deferred_alias_pages.0.remove(&mapping_id);
         let Some(e) = self.mappings.get_mut(&mapping_id) else {
             return false;
         };

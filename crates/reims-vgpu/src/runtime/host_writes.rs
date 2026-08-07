@@ -15,8 +15,7 @@
 //! A per-mapping count was measured first and it leaks. One driven boot read
 //! fifteen binds where the sampled window's own mapping had not been written, the
 //! guest had not written, and the bytes moved anyway. Guest pages are reachable
-//! under more than one mapping id — `deferred_alias_pages` is the rail built for
-//! exactly that — so "mapping 12 was not written" is not "these pages were not
+//! under more than one mapping id, so "mapping 12 was not written" is not "these pages were not
 //! written", and a cache keyed on the former serves stale pixels fifteen times a
 //! minute.
 //!

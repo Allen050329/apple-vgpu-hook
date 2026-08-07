@@ -646,18 +646,6 @@ impl ResourcePools {
         }
     }
 
-    /// Record the post-flush layout of a resident (the flush read transitions
-    /// it to TRANSFER_SRC_OPTIMAL).
-    pub(crate) fn set_resident_storage_layout(
-        &mut self,
-        identity: &ComputeStorageResidencyKey,
-        layout: vk::ImageLayout,
-    ) {
-        if let Some(resident) = self.compute_storage_registry.get_mut(identity) {
-            resident.layout = layout;
-        }
-    }
-
     /// Generation of a resident compute storage image, if one is registered.
     /// Used by the runtime to decide a stage-time guest-read skip.
     ///

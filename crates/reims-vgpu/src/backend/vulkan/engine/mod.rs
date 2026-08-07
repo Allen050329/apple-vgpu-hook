@@ -584,9 +584,9 @@ static GUEST_WRITE_DEBT: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// The write-side twin of [`quiesce_guest_reads`], and the settle point for the
 /// fence `copy_target_to_guest_pages` no longer takes itself. Call it wherever a
 /// reader that is not this device's own command stream is about to observe those
-/// bytes: the completion stamp, and the flush-on-access choke points in
-/// `runtime::storage_flush::access` and
-/// `runtime::mapping_write::flush_windows_under_bgra8_write`.
+/// bytes: the completion stamp, and the host-side readers that call
+/// `runtime::render_writeback::settle_guest_writes` before touching guest
+/// mapping bytes.
 pub fn quiesce_guest_writes() {
     use std::sync::atomic::Ordering;
     if !GUEST_WRITE_DEBT.load(Ordering::Acquire) {
@@ -2708,78 +2708,6 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
 /// Full-frame readback of a resident target (present / Synchronize / Map / Store boundary).
 pub fn read_target(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
     read_target_inner(identity)
-}
-
-/// Flush read of a **pinned deferred-writeback resident storage image**: copy
-/// the GPU content to the host as tight `width*height*texel` bytes and unpin.
-///
-/// The caller (runtime deferred-flush) writes these bytes into the guest
-/// window and re-establishes its residency mirror. `expected_generation`
-/// guards against flushing content from a different chain step than the one
-/// the caller deferred — a mismatch (or an absent/evicted resident) is the
-/// named error the caller reports as `deferred_flush_lost`. Returns
-/// `(bytes, texel_size)`.
-pub fn read_resident_storage(
-    identity: &crate::model::ComputeStorageResidencyKey,
-    expected_generation: u32,
-) -> Result<(Vec<u8>, u32), DrawError> {
-    let mut guard = lock_engine();
-    let EngineState {
-        ref mut owner,
-        ref mut pools,
-        ref counters,
-        ..
-    } = &mut *guard;
-    let ctx = owner.ensure(counters)?;
-    unsafe { pools.ensure_init(ctx, counters)? };
-    let (image, key, generation, old_layout) =
-        pools.compute_resident_snapshot(identity).ok_or({
-            DrawError::Facade(EngineFacadeDecline::StorageReadResidentAbsent {
-                identity: *identity,
-            })
-        })?;
-    if generation != expected_generation {
-        return Err(DrawError::Facade(
-            EngineFacadeDecline::StorageReadGenerationMismatch {
-                identity: *identity,
-                actual_generation: generation,
-                expected_generation,
-            },
-        ));
-    }
-    let texel = key.format.bytes_per_texel() as u32;
-    let rb_size = (key.width as u64) * (key.height as u64) * texel as u64;
-    unsafe {
-        let out = copy_image_level0_to_host(
-            ctx,
-            pools,
-            counters,
-            image,
-            old_layout,
-            // A storage image is never a color attachment, so there is no
-            // `COLOR_ATTACHMENT_WRITE` to drain here.
-            ash::vk::AccessFlags::TRANSFER_WRITE | ash::vk::AccessFlags::SHADER_WRITE,
-            key.width,
-            key.height,
-            rb_size,
-            ReadbackOps {
-                reset_cb: VkOp::StorageReadResetCb,
-                begin_cb: VkOp::StorageReadBeginCb,
-                end_cb: VkOp::StorageReadEndCb,
-                submit: VkOp::StorageReadSubmit,
-                map: VkOp::StorageReadMap,
-                invalidate: VkOp::StorageReadInvalidate,
-            },
-        )?;
-        pools.set_resident_storage_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-        // The readback above landed — `copy_image_level0_to_host` returned the
-        // bytes rather than an error — so this image has stopped being the only
-        // place the dispatch's output exists and the reclaim paths may take it.
-        pools.note_compute_storage_copied_out(identity);
-        pools.pin_resident_storage(identity, false);
-        counters.note_compute_deferred_flush(rb_size);
-        Ok((out, texel))
-    }
 }
 
 /// Advance the wall-clock resident-target idle-drain clock to `now_ms`, keep the

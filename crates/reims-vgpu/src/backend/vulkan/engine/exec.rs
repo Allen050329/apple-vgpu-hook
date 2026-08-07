@@ -3036,8 +3036,7 @@ pub(crate) unsafe fn execute_draw_inner(
     if let Some(identity) = &req.target_identity {
         // How much of the attachment this draw could have written. Nothing in
         // this device acts on it — it is the standing instrument for whether
-        // bounding a flush to a damage rect could ever pay, which
-        // `runtime::storage_flush` names as a lever and this answers. See
+        // bounding a writeback to a damage rect could ever pay. See
         // `EngineCounters::note_draw_coverage` for the arithmetic and for the
         // reading that retired the rail built over it.
         //

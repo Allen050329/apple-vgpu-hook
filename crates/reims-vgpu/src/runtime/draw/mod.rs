@@ -3778,8 +3778,8 @@ fn host_cache_store_rgba8(
 /// pixels have landed in the mapping's guest pages.
 ///
 /// Route-independent: the synchronous `cpu_portability` Store calls it inline,
-/// and the deferred render rail calls it from the flush that finally performs
-/// the same write (`storage_flush::land::flush_render_one`). Both have just proved
+/// and the resident render Store calls it from the writeback that performs the
+/// same write. Both have just proved
 /// the same thing — `write_rgba8_image_changed` verified geometry and landed a
 /// complete frame — and without it the `present_unbacked` gate is structurally
 /// dead on whichever route skips it, because no mapping's `dense_frame_seq`
@@ -4079,17 +4079,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             // built, and the same seed it already took whenever the alias was
             // refused. Seeding here would need the mapping read twice.
             //
-            // A deferred GVA Store window at this exact target geometry means
-            // the engine resident is the authoritative prior content — skip
-            // the CPU seed; the encode-side Load resolves it (LoadFromTarget
-            // or flush-then-cache). A geometry mismatch flushes inside
-            // seed_color_load before its cache/guest reads.
-            let deferred_resident = gva != 0
-                && state
-                    .gva_deferred_flush
-                    .get(&gva)
-                    .is_some_and(|e| e.width == mw && e.height == mh);
-            if !deferred_resident {
+            {
                 seed = seed_color_load(state, host, task_id, att.texture_ref, gva, mw, mh);
                 if seed.is_none() {
                     crate::observe::fail(format!(
@@ -4253,8 +4243,8 @@ pub(crate) fn sync_store_target_pages<M: HostMemory>(
 /// the armed set into the walk makes them one question, so the bytes cannot
 /// reach a page the window was not given, whatever the guest did in between.
 ///
-/// This is what closes the gap `storage_flush::guards::deferred_pages_still_ours`
-/// leaves open. That guard walks, decides, and returns; the writer then walks
+/// This is what closes the gap a separate page-drift check leaves open. Such a
+/// guard walks, decides, and returns; the writer then walks
 /// again, and the guest runs on its own vCPUs between the two. The guard stays —
 /// it names the event in the always-on log with the counts a reader needs — but
 /// it is the report, and this is the bound.

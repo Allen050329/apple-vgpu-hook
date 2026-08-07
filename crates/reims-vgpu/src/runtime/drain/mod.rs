@@ -1218,9 +1218,9 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     note_stamp_direction(host, gpa, index, stamp_value);
     if gpa_map::write_u32(host, gpa, stamp_value, page_size).is_ok() {
         // The guest's fence has moved. Everything it allocated for the work this
-        // stamp completes may be freed from here on, so any deferred window
-        // still holding bytes for guest RAM is now writing behind the guest's
-        // back — see `GvaDeferredEntry::armed_stamp_seq`.
+        // stamp completes may be freed from here on, which is why a Store's
+        // guest-page write has to have landed before the stamp rather than
+        // after — see `runtime::render_writeback`.
         state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(1);
         state
             .gfx
@@ -4330,8 +4330,7 @@ pub fn publish_stranded_fifos<H: HostMemory + HostOps>(
 /// gap exists in principle for the translation-hold arm below, which has never
 /// been observed to hit it — worth knowing if one ever does.
 ///
-/// The cost is inside the render flush, not in the scheduling around it. See
-/// [`crate::runtime::storage_flush::fence::flush_mapping_windows_before_fence`].
+/// The cost is inside the render writeback, not in the scheduling around it.
 ///
 /// # What that refutation does *not* cover, and the measurement that separates them
 ///

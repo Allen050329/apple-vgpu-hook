@@ -1912,9 +1912,8 @@ const STAGING_MISS_EMIT_EVERY: u64 = 512;
 /// So batch length is set by **how often a readback occurs**, not by how a
 /// readback submits. 1.78 draws per batch is the guest issuing a Store about
 /// every other draw. The only thing that would lengthen these runs is deferring
-/// the readback past more draws, and `runtime::storage_flush`'s completion-stamp
-/// contract forbids that: every armed window must be in guest RAM before the
-/// stamp that claims it is.
+/// the readback past more draws, and the completion-stamp contract forbids that:
+/// a Store's pixels must be in guest RAM before the stamp that claims them.
 ///
 /// Before changing this constant, read `batch_flush_draws / batch_flushes`
 /// against it — while the ratio sits far below, the ceiling is not the bound.

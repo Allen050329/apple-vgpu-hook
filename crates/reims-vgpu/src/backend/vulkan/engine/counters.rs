@@ -58,9 +58,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// How much of its render target one draw could have written.
 ///
-/// The standing instrument for "would bounding what a flush copies pay
-/// anything?" — the question `runtime::storage_flush` carried as its largest
-/// named lever until it was built, measured at zero, and removed. It is a
+/// The standing instrument for "would bounding what a writeback copies pay
+/// anything?" — the deferred-flush rail's largest named lever, until it was
+/// built, measured at zero, and removed. It is a
 /// property of the *guest's* draws and not of any rail here, which is why it
 /// outlives the rail: the answer changes with the workload, and nothing else in
 /// this device can be read for it.
@@ -184,8 +184,6 @@ engine_counters! {
         compute_deferred_writeback_bytes,
         /// Deferred-flush reads (read_resident_storage): the on-access GPU→host
         /// copy that lands deferred content in guest pages.
-        compute_deferred_flushes,
-        compute_deferred_flush_bytes,
 
         // --- residency / oracle I/O ---
         /// Device→host copies taken as the tail of a draw or a compute dispatch,
@@ -731,14 +729,6 @@ impl EngineCounters {
         self.compute_sampled_resident_copies
             .fetch_add(1, Ordering::Relaxed);
         self.compute_sampled_resident_copy_bytes
-            .fetch_add(bytes, Ordering::Relaxed);
-    }
-
-
-    pub fn note_compute_deferred_flush(&self, bytes: u64) {
-        self.compute_deferred_flushes
-            .fetch_add(1, Ordering::Relaxed);
-        self.compute_deferred_flush_bytes
             .fetch_add(bytes, Ordering::Relaxed);
     }
 }

@@ -3730,21 +3730,18 @@ enum M2vDrawSpan {
     /// contract Store on portability devices.
     ResidentChain,
     /// Final/single record of a GVA render Store executed into the registry
-    /// resident with `skip_readback`: the caller arms a deferred-writeback
-    /// window (`DeviceState::gva_deferred_flush`) instead of the sync
-    /// readback + guest write on the stamp path; guest bytes + encode caches
-    /// land on first access (`storage_flush::flush_gva_one`).
+    /// resident with `skip_readback`: the caller lands the frame from that
+    /// resident, which is where the pixels are — this record produced none on
+    /// the host.
     ResidentGvaStore,
     /// Type-11 composite Store executed into its registry resident with
-    /// `skip_readback`: the caller arms a `RenderWindowSource::Resident` window
-    /// naming that image, so the GPU→host readback and the fence wait it implies
-    /// are paid only if a guest-side reader ever asks for the pixels
-    /// (`storage_flush::land::flush_render_one`).
+    /// `skip_readback`: the caller copies that image into the mapping's guest
+    /// pages through [`crate::runtime::render_writeback`], which never brings
+    /// the frame across host memory.
     ///
-    /// Distinct from [`Self::ResidentGvaStore`] because the two windows live in
-    /// different indexes and flush through different readers: this one is keyed by
-    /// mapping in `compute_deferred_flush`, that one by GVA in
-    /// `gva_deferred_flush`. Distinct from [`Self::Pixels`] because there are no
+    /// Distinct from [`Self::ResidentGvaStore`] because the destination is a
+    /// mapping rather than a raw task GVA, and the two reach guest memory by
+    /// different routes. Distinct from [`Self::Pixels`] because there are no
     /// pixels — a caller that treated an empty frame as one would write a blank
     /// framebuffer into guest memory.
     ResidentSurfaceStore,
@@ -4973,7 +4970,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // with its own CPU and no device operation is involved, so nothing calls
         // `mark_mapping_written` and the epoch does not move. Every caller of it
         // is a device-side writer — `compute_exec`, `mapping_write`, `exec`,
-        // `storage_flush` — and there is no entry for the owner of the pages.
+        // `render_writeback` — and there is no entry for the owner of the pages.
         //
         // On the epoch alone the elision answers "current" for a resident that
         // is stale, the pass loads from it, the matching Store publishes it back
@@ -6627,12 +6624,12 @@ fn store_surface_resident<M: HostMemory + HostOps>(
 
 
 
-/// Defer gate for the final/single record of a GVA render Store: the record
-/// may keep its pixels on the engine registry resident and land guest bytes
-/// on access (`storage_flush::flush_gva_one`) instead of a sync readback +
-/// fence wait on the stamp path. All gates are protocol-shape checks (never
-/// content): the flush must be able to replay the sync `write_gva_rgba8`
-/// exactly — identity geometry == c0 geometry, convertible format, sane BPR.
+/// Readback-skip gate for the final/single record of a GVA render Store: the
+/// record may leave its pixels on the engine registry resident and let the
+/// caller read them back once, instead of taking a readback plus a fence wait
+/// inside the record. All gates are protocol-shape checks (never content): the
+/// caller must be able to replay the sync `write_gva_rgba8` exactly — identity
+/// geometry == c0 geometry, convertible format, sane BPR.
 fn gva_store_defer_eligible(req: &DrawEncodeRequest) -> bool {
     let Some(c0) = req.colors.first() else {
         return false;

@@ -544,10 +544,9 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
 /// pointer has to be the one the rest of this write read from, the pitch has to
 /// be the packed row length, and the allocation has to cover the whole frame.
 /// Anything else takes the copying publish.
-/// Writes the frame whole. Its one caller is the deferred render flush, which
-/// preserves nothing by design — see
-/// [`crate::runtime::storage_flush`]'s `note_render_flush_over_guest_write` for
-/// why the witness a narrowing would rest on cannot answer. A caller that does
+/// Writes the frame whole. Its one caller is the render writeback, which
+/// preserves nothing by design: the witness a narrowing would rest on cannot
+/// say which bytes the guest still wants. A caller that does
 /// need to skip has [`write_bgra8_skipping`]; adding the parameter back here
 /// belongs with the caller that can fill it.
 pub fn write_bgra8_owned<M: HostMemory + HostOps>(
@@ -859,7 +858,7 @@ fn plan_guest_window(
 /// [`crate::runtime::gather_witness`] attribute its own writes to the guest, and
 /// the type-11 resident rung above it then refuses residents and gathers whole
 /// surfaces per bind. That failure is measured and it costs more than this rail
-/// saves — see the ledger in [`crate::runtime::storage_flush`].
+/// saves.
 ///
 /// # Errors
 ///
@@ -1383,8 +1382,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
         // rails that would bind a resident in place of this surface compare that
         // pair — the attachment LOAD elision always did, and the sampled ladder's
         // resident rung now does too. The caller that produced `src` must
-        // therefore not hand the stamp back after a skipping write; see
-        // `storage_flush::land::flush_render_one`.
+        // therefore not hand the stamp back after a skipping write.
         //
         // The guest-write stamp is re-taken, because the device has *adopted*
         // the guest's stores: they are in the pages it just wrote around.
@@ -1524,12 +1522,11 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     let tight = tight as usize;
     let mut native = vec![0u8; tight];
     let mut seed_native = vec![0u8; tight];
-    // Deferred-writeback flush-on-access, as at every other read/write entry in
-    // this file — the module doc for `storage_flush` names them all as choke
-    // points. It has to be here rather than on one arm: the fragmented arm ends
-    // in `mapper::write_mapping_bytes`, which flushes, while the
+    // Settle submitted guest-page writes, as at every other read/write entry in
+    // this file. It has to be here rather than on one arm: the fragmented arm
+    // ends in `mapper::write_mapping_bytes`, which settles, while the
     // `contig_for_write` arm is a raw `copy_nonoverlapping` into the mapped span
-    // and flushes nothing. Whether an armed window landed before or after this
+    // and settles nothing. Whether a submitted copy executed before or after this
     // write therefore depended on whether the guest's pages happened to be
     // contiguous, and landing after puts an older frame on top of this one —
     // which `mapper::write_mapping_bytes_only` states as its own reason for
