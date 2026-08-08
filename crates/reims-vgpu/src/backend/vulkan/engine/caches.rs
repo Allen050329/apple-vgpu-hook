@@ -1150,21 +1150,20 @@ impl ObjectCaches {
             .cull_mode(translate::raster::vk_cull_mode(key.cull_mode))
             .front_face(translate::raster::vk_front_face(key.front_face_ccw))
             .line_width(1.0);
-        // Likewise pinned rather than known, and every render target this
-        // backend allocates is single-sampled, so honouring a count would need
-        // the attachment path to carry one too.
+        // Pinned rather than unknown, and every render target this backend
+        // allocates is single-sampled, so honouring a count would need the
+        // attachment path to carry one too.
         //
         // `rasterSampleCount` is a property of `MTLRenderPipelineDescriptor`,
         // so it reaches this device inside the type-7 pipeline's own
-        // compact-TLV block — which `decode_render_pipeline_descriptor` reads
-        // five tags out of and drops the rest. That block is the *only* route
-        // to a guest's requested sample count: the render-pass attachment
-        // record on the wire carries a resolve ref and no count, and the
-        // texture objects are met through the kernel's object list, whose
-        // descriptor has no such field either. `type7_pipeline_shape` and
-        // `pipeline_descriptor_field_dropped` are what make that block's unread
-        // tags a reading rather than an argument, and the reading is the
-        // prerequisite for changing this line.
+        // compact-TLV block, which is the *only* route to it: the render-pass
+        // attachment record on the wire carries a resolve ref and no count, and
+        // the texture objects are met through the kernel's object list, whose
+        // descriptor has no such field either. That tag is now read —
+        // `PIPELINE_TAG_RASTER_SAMPLE_COUNT` — and a count this line cannot
+        // meet is named as `pipeline_raster_sample_count_degraded` rather than
+        // defaulted in silence. So the demand for multisampled attachments is
+        // now measurable, which is what widening this would need first.
         //
         // A pass that states a sample count *without* an attachment carrying
         // one — `defaultRasterSampleCount` — is refused rather than rasterized
