@@ -104,8 +104,8 @@ macOS 13 Ventura is the recommended guest release for bring-up.
    REIMS_VGPU_BACKEND=vulkan scripts/qemu-build/qemu-build.sh --target x86_64
    vm/boot-x86.sh --testing --device reims-vgpu-pci
 
-   # Host-window screenshot on the Linux/Plasma host
-   scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o /tmp/screen.png
+   # Host-window screenshot; picks a backend for whatever desktop this host runs
+   scripts/screenshot-host-window/screenshot-host-window.sh -o /tmp/screen.png
    ```
 
 ### arm64 guest on Apple Silicon (HVF / vmapple)
@@ -133,7 +133,7 @@ Arm bring-up is **in-tree**: Virtualization.framework via Homebrew **`macosvm`**
    ```bash
    vm/boot-arm64.sh --testing --device reims-vgpu-mmio    # product
    vm/boot-arm64.sh --testing --device apple-gfx-mmio   # Apple ParavirtualizedGraphics A/B
-   scripts/screenshot-when-macos-host/screenshot-when-macos-host.sh /tmp/screen.png
+   scripts/screenshot-host-window/screenshot-host-window.sh -o /tmp/screen.png
    ```
 
    Optional **performance ceiling** reference: the same guest under native VZ via `macosvm --gui`.

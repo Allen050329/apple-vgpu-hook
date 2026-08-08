@@ -425,10 +425,20 @@ hardware that lacks the extension.
 
 Pick the pathway your change affects.
 
-- Arm64: `vm/boot-arm64.sh --device reims-vgpu-mmio --testing`, then
-  `scripts/screenshot-when-macos-host/screenshot-when-macos-host.sh /tmp/screen.png`
-- x86: `vm/boot-x86.sh --device reims-vgpu-pci --testing`, then
-  `scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o /tmp/screen.png`
+- Arm64: `vm/boot-arm64.sh --device reims-vgpu-mmio --testing`
+- x86: `vm/boot-x86.sh --device reims-vgpu-pci --testing`
+
+Then, on either: `scripts/screenshot-host-window/screenshot-host-window.sh -o /tmp/screen.png`.
+It picks a capture backend for the host it is on and delegates; `--print-backend` names the
+choice without spending a capture. The reference environment is Plasma on Wayland, so that is
+the path with the most mileage — but naming it here would leave a GNOME or wlroots host with no
+verification step at all, which is what the dispatcher exists to fix.
+
+Read `scripts/screenshot-host-window/README.md` before relying on it away from Plasma or macOS.
+Two limits decide whether a screenshot means what you think: only the macOS, KDE and X11
+backends can single out the guest window, and the portal fallback captures the whole screen;
+and the portal asks the user for permission, so an unattended run on a portal-only host stalls
+until its 30-second deadline unless that permission is granted in advance.
 
 ### A boot on a capable host does not exercise the copying rails
 
