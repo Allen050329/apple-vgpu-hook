@@ -23,6 +23,26 @@ use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
 pub(crate) mod census;
 pub use census::*;
 
+/// Score a bound-buffer retirement against the cause that ordered it.
+///
+/// Counted in **entries dropped**, not events: one `SetObjectList` that retires
+/// forty resolutions and one that retires none are the same event and very
+/// different costs, because every dropped entry is a task-page-table walk the
+/// next draw pays again.
+///
+/// What this is for. The registry answers 86% of draw-time buffer binds on a
+/// host that can import guest RAM and 98% on one that cannot — a 12.8x
+/// difference in fresh resolutions that the two rails' throughput does not
+/// explain. A miss is either a key never seen or a key retired, and these
+/// counters are the second half. Sum them against `zc_buffer_imported` +
+/// `zc_buffer_gathered`: what the retirements do not account for is churn in the
+/// keys themselves, which is the `(task, reference, offset)` question
+/// [`crate::runtime::bound_buffers`] states and does not answer.
+#[inline]
+fn note_bb_retired(cause: &'static str, entries: usize) {
+    note_store_route_n(cause, entries as u64);
+}
+
 /// apple-gfx `pending_frames >= 2`: hold further guest presents at FIFO head
 /// until host paint consumes +0x188. Entry-side waitForPendingFrames — not
 /// stamp-after-paint (that inverted PGDisplay completion and stacked tooltips).
@@ -195,7 +215,7 @@ fn apply_delete_task(state: &mut DeviceState, payload: &[u8], channel: Option<u3
     // names bytes that are no longer this task's. Here rather than at the two
     // call sites: the root and child FIFOs both reach this, and a rule written
     // twice is the one that diverges.
-    state.retire_bound_buffers_for_task(task_id);
+    note_bb_retired("bb_retire_delete_task", state.retire_bound_buffers_for_task(task_id));
     let ok = state.delete_task(task_id);
     crate::observe::off(format!(
         "delete_task site={} task={task_id} ok={} plen={}",
@@ -247,7 +267,10 @@ fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Optio
     let count = ld32(&payload[SET_OBJECT_LIST_COUNT..]);
     // A new object list re-points every reference on this task, so no
     // resolution keyed by reference survives it. Both FIFOs reach this.
-    state.retire_bound_buffers_for_task(task_id);
+    note_bb_retired(
+        "bb_retire_set_object_list",
+        state.retire_bound_buffers_for_task(task_id),
+    );
     let applied = state.set_object_list(task_id, pfn, count);
     if crate::observe::first_sight(
         "set_object_list",
@@ -286,7 +309,7 @@ fn apply_define_task2<H: HostMemory + HostOps>(
     // through the old one may translate elsewhere now. Keyed on the shifted
     // `task_id`, not `raw_id` — the registry is keyed the way the draw path
     // keys it, and `raw_id` is the wrong number by a factor of two.
-    state.retire_bound_buffers_for_task(task_id);
+    note_bb_retired("bb_retire_define_task2", state.retire_bound_buffers_for_task(task_id));
     state.define_task(task_id, length, dir);
     // Capture directory + root/depth so one boot shows the page-table identity.
     let Some(slot) = state.tasks.get(task_id) else {
@@ -2817,7 +2840,19 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 let id = ld32(&packet.payload[4..]);
                 // Which references resolved through this object is not knowable
                 // from the packet, so the task's resolutions go together.
-                state.retire_bound_buffers_for_task(task_id);
+                // Measured the largest source of re-walks on this device: one
+                // driven boot retired 54 109 resolutions here, 95% of every
+                // bind miss. The whole task goes because this rule was written
+                // before anything counted it — but the packet's second word is
+                // the reference itself (`delete_object(task_id, ref_)`, and the
+                // object map is keyed the same way), so a per-reference retire
+                // is available and would drop ~32 entries where this drops the
+                // task. Narrowing a retirement is the direction that can serve
+                // stale bytes, so it wants its own change and its own test.
+                note_bb_retired(
+                    "bb_retire_delete_object",
+                    state.retire_bound_buffers_for_task(task_id),
+                );
                 let _ = state.delete_object(task_id, id);
             }
         }
@@ -3030,7 +3065,10 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     // The packet names an object, not a range, and which
                     // references resolved through it is not recorded — so the
                     // task's resolutions go together.
-                    state.retire_bound_buffers_for_task(cmd.task_id);
+                    note_bb_retired(
+                        "bb_retire_replace_physical",
+                        state.retire_bound_buffers_for_task(cmd.task_id),
+                    );
                     crate::runtime::objects::replace_physical(
                         state,
                         host,
@@ -3133,7 +3171,10 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     // Held bind resolutions over this range name pages the guest
                     // has just remapped. Retired by range, which is exactly what
                     // this notify carries.
-                    state.retire_bound_buffers_in_range(task_id, gva, length);
+                    note_bb_retired(
+                        "bb_retire_map_range",
+                        state.retire_bound_buffers_in_range(task_id, gva, length),
+                    );
                     let n = crate::runtime::gva_view::retire_gva_views_overlapping(
                         state, task_id, gva, length,
                     );

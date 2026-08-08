@@ -566,6 +566,11 @@ pub fn device_drain(id: u64) -> bool {
     // Same one-second cadence, so the cache trend lines up row-for-row with
     // `store_routes` and `drain_duty`. Measure-only; see `note_cache_levels`.
     crate::runtime::surface_cache::note_cache_levels(&device.state, &host);
+    // The bind registry's own levels, on that same cadence and read against the
+    // `bb_retire_*` routes: what the retirements dropped, and what the survivors
+    // look like.
+    #[cfg(feature = "backend-vulkan")]
+    crate::runtime::bound_buffers::note_registry_levels(&device.state);
     // The present-completion ack, re-homed off the QEMU paint — ONLY while the
     // host window is the display. With the window live no per-present
     // `ScanoutUpdate` is enqueued, so `display_surface::device_scanout_copy` —

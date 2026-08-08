@@ -2251,14 +2251,19 @@ impl DeviceState {
     ///
     /// Ungated so the packet handlers stay free of `cfg`; on a build with no
     /// Vulkan engine nothing can hold a resolution and this is a no-op.
-    pub fn retire_bound_buffers_for_task(&mut self, task_id: u32) {
+    /// Returns how many resolutions were dropped, so the caller can name the
+    /// cause on the census. A count, not an event: one `SetObjectList` that
+    /// retires forty entries and one that retires none read identically as
+    /// events, and it is the entries that become the re-walks.
+    pub fn retire_bound_buffers_for_task(&mut self, task_id: u32) -> usize {
         #[cfg(feature = "backend-vulkan")]
         {
-            self.bound_buffers.retire_task(task_id);
+            self.bound_buffers.retire_task(task_id)
         }
         #[cfg(not(feature = "backend-vulkan"))]
         {
             let _ = task_id;
+            0
         }
     }
 
@@ -2266,14 +2271,15 @@ impl DeviceState {
     ///
     /// The map/unmap answer, which names the exact range the guest moved. See
     /// [`Self::retire_bound_buffers_for_task`] for the gating.
-    pub fn retire_bound_buffers_in_range(&mut self, task_id: u32, gva: u64, len: u64) {
+    pub fn retire_bound_buffers_in_range(&mut self, task_id: u32, gva: u64, len: u64) -> usize {
         #[cfg(feature = "backend-vulkan")]
         {
-            self.bound_buffers.retire_range(task_id, gva, len);
+            self.bound_buffers.retire_range(task_id, gva, len)
         }
         #[cfg(not(feature = "backend-vulkan"))]
         {
             let _ = (task_id, gva, len);
+            0
         }
     }
 

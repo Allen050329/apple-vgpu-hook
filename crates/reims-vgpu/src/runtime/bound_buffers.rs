@@ -58,7 +58,17 @@
 //! unmapped tail page even though the bind itself resolves. Apple can afford
 //! that because `visitUnmappedRanges` tells them which sub-ranges are live;
 //! this device has no such record, so it keeps the narrower key and the wider
-//! admission. In practice a reference is bound at one offset and the two agree.
+//! admission.
+//!
+//! **This used to say the two keys agree in practice, because a reference is
+//! bound at one offset. That was never counted, and it is false.** A driven x86
+//! boot under a window-drag probe holds 704 resolutions across **22** distinct
+//! `(task, reference)` pairs — an average of 32 offsets per reference and 233
+//! at the widest ([`note_registry_levels`]). The offset is not an inert field
+//! that happens to be in the key; it is the dominant axis, and keying by it
+//! costs one page-table walk per offset where Apple's key costs one per
+//! reference. Anyone weighing the rekey should read `bound_buffers` levels from
+//! a driven boot rather than this paragraph.
 //!
 //! # No capacity
 //!
@@ -111,6 +121,58 @@ impl BoundBuffer {
 /// `(task, reference, offset)` — see the module doc on why the offset is here.
 type Key = (u32, u32, u64);
 
+/// What [`BoundBuffers::shape`] measures. Levels, not per-interval counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegistryShape {
+    /// Held resolutions.
+    pub entries: usize,
+    /// Distinct `(task, reference)` pairs behind them — what the registry would
+    /// hold if it were keyed the way Apple's is.
+    pub pairs: usize,
+    /// Pairs held at more than one offset. Zero means the offset in the key
+    /// never separates two live entries.
+    pub multi_offset_pairs: usize,
+    /// The most offsets any one pair is held at.
+    pub max_offsets: u32,
+}
+
+/// Report the registry's shape once per census interval, on the same one-second
+/// cadence as `store_routes` so the two line up row for row.
+///
+/// Read against the `bb_retire_*` routes: those say how many resolutions a
+/// retirement dropped, this says what the survivors look like. A miss is either
+/// a retired key or a key never seen, and the two together are what decide
+/// whether the 12.8x more fresh resolutions on an importing host are churn in
+/// the retirement rules or churn in the keys.
+pub fn note_registry_levels(state: &crate::model::DeviceState) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    static PEAK_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+    let shape = state.bound_buffers.shape();
+    let peak = PEAK_ENTRIES
+        .fetch_max(shape.entries as u64, Ordering::Relaxed)
+        .max(shape.entries as u64);
+
+    let now = crate::observe::elapsed_ms() as u64;
+    let last = LAST_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 1000 {
+        return;
+    }
+    // Losing the race only costs a skipped interval, never a double line.
+    if LAST_MS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    crate::observe::off(format!(
+        "bound_buffers (levels, not per-interval) entries={} peak={} pairs={} \
+         multi_offset_pairs={} max_offsets={}",
+        shape.entries, peak, shape.pairs, shape.multi_offset_pairs, shape.max_offsets
+    ));
+}
+
 /// Every held bind resolution on this device.
 #[derive(Default, Debug)]
 pub struct BoundBuffers {
@@ -157,6 +219,36 @@ impl BoundBuffers {
     /// How many resolutions are held, for the census.
     pub fn len(&self) -> usize {
         self.held.len()
+    }
+
+    /// The registry's shape: entries, the distinct `(task, reference)` pairs
+    /// behind them, how many of those pairs are held at more than one offset,
+    /// and the most offsets any single pair carries.
+    ///
+    /// This is the instrument for the question the module doc states and does
+    /// not answer. Apple keys by reference alone; this keys by
+    /// `(task, reference, offset)`, on the belief that a reference is bound at
+    /// one offset and the two keys therefore describe the same registry. That
+    /// belief has never been counted. `pairs == entries` says it holds and the
+    /// extra field is inert; `pairs < entries` says references really are bound
+    /// at several offsets, each paying its own walk, and the narrower key is
+    /// costing exactly `entries - pairs` resolutions.
+    ///
+    /// Walked once per census interval rather than tracked incrementally: a
+    /// second index would have to be maintained by every retirement rule, which
+    /// is a correctness surface bought for a measurement, and the population is
+    /// the guest's live working set rather than anything unbounded.
+    pub fn shape(&self) -> RegistryShape {
+        let mut per_pair: HashMap<(u32, u32), u32> = HashMap::new();
+        for (task, buffer_ref, _) in self.held.keys() {
+            *per_pair.entry((*task, *buffer_ref)).or_default() += 1;
+        }
+        RegistryShape {
+            entries: self.held.len(),
+            pairs: per_pair.len(),
+            multi_offset_pairs: per_pair.values().filter(|n| **n > 1).count(),
+            max_offsets: per_pair.values().copied().max().unwrap_or(0),
+        }
     }
 
     /// Whether nothing is held.
@@ -233,6 +325,37 @@ mod tests {
         assert_eq!(b.retire_range(1, 0x2000, 0x1000), 0, "starts where it ends");
         assert_eq!(b.retire_range(1, 0x0000, 0x1000), 0, "ends where it starts");
         assert_eq!(b.len(), 1);
+    }
+
+    /// The shape separates entries from the `(task, reference)` pairs behind
+    /// them, which is the whole reason it exists: `pairs == entries` says the
+    /// offset in the key never distinguishes two live entries, and anything
+    /// less counts the resolutions the narrower key is paying for.
+    #[test]
+    fn the_shape_counts_pairs_apart_from_entries() {
+        let mut b = BoundBuffers::default();
+        assert_eq!(b.shape(), RegistryShape::default(), "empty");
+
+        // One reference at one offset each: the two keys would agree.
+        b.insert(1, 1, 0, bound(0x1000, 0x1000));
+        b.insert(1, 2, 0, bound(0x2000, 0x1000));
+        let s = b.shape();
+        assert_eq!((s.entries, s.pairs), (2, 2));
+        assert_eq!((s.multi_offset_pairs, s.max_offsets), (0, 1));
+
+        // The same reference at a second offset is a second entry and not a
+        // second pair — exactly the divergence from Apple's key.
+        b.insert(1, 1, 0x400, bound(0x1400, 0x400));
+        let s = b.shape();
+        assert_eq!((s.entries, s.pairs), (3, 2), "one pair now holds two");
+        assert_eq!((s.multi_offset_pairs, s.max_offsets), (1, 2));
+
+        // The same reference under another task is a different pair, because a
+        // GVA has no meaning apart from the table it resolves against.
+        b.insert(2, 1, 0, bound(0x1000, 0x1000));
+        let s = b.shape();
+        assert_eq!((s.entries, s.pairs), (4, 3));
+        assert_eq!(s.multi_offset_pairs, 1);
     }
 
     /// A task retire takes that task's resolutions whatever their addresses,
