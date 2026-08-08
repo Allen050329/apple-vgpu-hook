@@ -2853,7 +2853,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
             apply_set_object_list(state, &packet.payload, Some(channel_id));
         }
         CHILD_OP_DELETE_RESOURCE => {
-            if !packet_short("delete_object", Some(channel_id), packet.payload.len(), 8) {
+            if !packet_short("delete_resource", Some(channel_id), packet.payload.len(), 8) {
                 let task_id = ld32(&packet.payload[0..]);
                 let id = ld32(&packet.payload[4..]);
                 // Which references resolved through this object is not knowable
@@ -2865,7 +2865,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 // source of re-walks: 54 109 resolutions dropped on one driven
                 // boot, 95% of every bind miss.
                 note_bb_retired(
-                    "bb_retire_delete_object",
+                    "bb_retire_delete_resource",
                     state.retire_bound_buffers_for_ref(task_id, id),
                 );
                 let _ = state.delete_object(task_id, id);
@@ -2968,7 +2968,32 @@ fn process_child_packet<H: HostMemory + HostOps>(
         // is unbounded: every object the guest asks to retire through this
         // command stays in this device's tables for the life of the boot.
         CHILD_OP_DELETE_OBJECT => {
-            note_unimplemented(state, channel_id, UnimplementedCommand::DeleteObject, packet);
+            // The payload is `{u32 task}` then a self-describing record whose
+            // own byte length sits at offset 8. Both bounds are checked before
+            // declining, so a corrupt packet is reported as corrupt rather than
+            // as a command this device merely has not implemented — those are
+            // different problems and only one of them is closed by writing a
+            // handler.
+            let plen = packet.payload.len();
+            if !packet_short("delete_object", Some(channel_id), plen, 12) {
+                let record_len = ld32(&packet.payload[8..]) as usize;
+                // The record starts one word in, so it is `record_len + 4` that
+                // has to fit. Saturating, because the guest's length is an
+                // arbitrary `u32` and the sum is what overflows.
+                if !packet_short(
+                    "delete_object_record",
+                    Some(channel_id),
+                    plen,
+                    record_len.saturating_add(4),
+                ) {
+                    note_unimplemented(
+                        state,
+                        channel_id,
+                        UnimplementedCommand::DeleteObject,
+                        packet,
+                    );
+                }
+            }
         }
         // `CmdDebug`, a host-side trace marker. Nothing is owed to the guest, but
         // the payload is what the guest wanted recorded, so the record echoes it

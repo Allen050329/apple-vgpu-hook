@@ -4309,7 +4309,10 @@ fn every_short_control_packet_names_itself() {
         "reason=set_object_list_short site=root",
         "reason=define_task2_short site=root",
         "reason=set_object_list_short site=ch4",
-        "reason=delete_object_short site=ch4",
+        // `0x25` is `CmdDeleteResource`. The slug must not say `delete_object`:
+        // that is `0x28`, a different command with a different payload, and a
+        // reader triaging this line would otherwise chase the wrong opcode.
+        "reason=delete_resource_short site=ch4",
         "reason=cursor_show_short site=ch4",
         "reason=setup_shared_state_short site=ch4",
         "reason=define_task2_short site=ch4",
@@ -4816,30 +4819,50 @@ fn a_packets_stamp_records_are_decoded_and_the_payload_starts_after_them() {
 #[test]
 fn a_dispatched_command_this_device_declines_names_itself() {
     let mut host = FakeHost::new();
-    for (opcode, expected) in [
-        (CHILD_OP_DEBUG, UnimplementedCommand::Debug),
+    // Every packet here is conformant for its own opcode, so what is being
+    // tested is the decline and not the shape. The floor differs by command:
+    // eight bytes for the display pair, twelve for `CmdDeleteObject`, whose
+    // payload is a task id plus a self-describing record.
+    let conformant_delete_object = || {
+        let mut payload = vec![0u8; 16];
+        st32(&mut payload[0..], 0x11);
+        st32(&mut payload[4..], 0x3eb);
+        // The record's own length, which must exactly fit what follows the id.
+        st32(&mut payload[8..], 12);
+        st32(&mut payload[12..], 0x20);
+        payload
+    };
+    let plain = || {
+        let mut payload = vec![0u8; 8];
+        st32(&mut payload[0..], 0x11);
+        st32(&mut payload[4..], 0x22);
+        payload
+    };
+    for (opcode, expected, payload) in [
+        (CHILD_OP_DEBUG, UnimplementedCommand::Debug, plain()),
         (
             CHILD_OP_DISPLAY_SLEEP_STATE,
             UnimplementedCommand::DisplaySleepState,
+            plain(),
         ),
         (
             CHILD_OP_DISPLAY_SET_PROPERTIES,
             UnimplementedCommand::DisplaySetProperties,
+            plain(),
         ),
-        (CHILD_OP_DELAY, UnimplementedCommand::Delay),
-        (CHILD_OP_DELETE_OBJECT, UnimplementedCommand::DeleteObject),
+        (CHILD_OP_DELAY, UnimplementedCommand::Delay, plain()),
+        (
+            CHILD_OP_DELETE_OBJECT,
+            UnimplementedCommand::DeleteObject,
+            conformant_delete_object(),
+        ),
     ] {
         let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
-        // Eight bytes is the payload floor the host checks for the two display
-        // commands, so the packets are conformant and the decline is about the
-        // execution and not about the shape.
-        let mut payload = vec![0u8; 8];
-        st32(&mut payload[0..], 0x11);
-        st32(&mut payload[4..], 0x22);
+        let plen = payload.len() as u32;
         let pkt = Packet {
             opcode,
             stamp_waits: Vec::new(),
-            total_size: PACKET_HEADER_LEN + 8,
+            total_size: PACKET_HEADER_LEN + plen,
             completion_stamp: 0,
             payload,
             next_head: 0,
@@ -4866,6 +4889,98 @@ fn a_dispatched_command_this_device_declines_names_itself() {
                 .any(|e| matches!(e, FailEvent::UnknownChildOpcode { .. })),
             "{opcode:#x} is a command with a handler in the host's table, so it \
              must not also read as undecodable"
+        );
+    }
+}
+
+/// `CmdDeleteObject`'s two payload bounds are checked before it is declined.
+///
+/// The command carries `{u32 task}` then a record that states its own byte
+/// length at offset 8, so a conformant packet is at least twelve bytes and the
+/// record must fit in what follows the id. A packet failing either bound is
+/// corrupt, and reporting it as "a command this device has not implemented"
+/// would send a reader off to write a handler for a packet that never had a
+/// meaning. Both halves are asserted: the malformed cases must name themselves
+/// **and** must not also raise the decline.
+#[test]
+fn a_delete_object_record_must_fit_the_payload_that_carries_it() {
+    let mut host = FakeHost::new();
+    let packet = |payload: Vec<u8>| Packet {
+        opcode: CHILD_OP_DELETE_OBJECT,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN + payload.len() as u32,
+        completion_stamp: 0,
+        payload,
+        next_head: 0,
+    };
+    let declined = |state: &DeviceState| {
+        state.fails.iter().any(|e| {
+            matches!(
+                e,
+                FailEvent::UnimplementedChildCommand { command, .. }
+                    if *command == UnimplementedCommand::DeleteObject
+            )
+        })
+    };
+
+    // One byte under the floor: there is no length word to read at offset 8.
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    assert_eq!(
+        process_child_packet(&mut state, &mut host, 3, &packet(vec![0u8; 11])),
+        ChildPacketDisposition::Complete,
+        "a malformed packet must still retire its stamps, or the guest waits forever"
+    );
+    assert!(
+        !declined(&state),
+        "a packet too short to hold the record's length word is corrupt, not unimplemented"
+    );
+
+    // At the floor, with a record claiming one byte more than the payload can
+    // hold. `9 + 4 = 13 > 12`, so the record overruns by exactly one byte —
+    // the off-by-one a `>=` in place of a `>` would let through.
+    let mut overrun = vec![0u8; 12];
+    st32(&mut overrun[0..], 0x11);
+    st32(&mut overrun[8..], 9);
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    process_child_packet(&mut state, &mut host, 3, &packet(overrun));
+    assert!(
+        !declined(&state),
+        "a record reaching past the payload is corrupt, not unimplemented"
+    );
+
+    // A `u32` length whose `+ 4` would wrap. The bound must still refuse it
+    // rather than wrapping to a small number and reading the record as valid.
+    let mut wrapping = vec![0u8; 12];
+    st32(&mut wrapping[0..], 0x11);
+    st32(&mut wrapping[8..], u32::MAX);
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    process_child_packet(&mut state, &mut host, 3, &packet(wrapping));
+    assert!(
+        !declined(&state),
+        "a record length whose bound arithmetic overflows must refuse, not wrap"
+    );
+
+    // Exactly filling the payload is conformant: `8 + 4 = 12`. This is the
+    // boundary on the accepting side, so a bound written one too tight would
+    // refuse it and this assertion is what catches that.
+    let mut exact = vec![0u8; 12];
+    st32(&mut exact[0..], 0x11);
+    st32(&mut exact[8..], 8);
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    process_child_packet(&mut state, &mut host, 3, &packet(exact));
+    assert!(
+        declined(&state),
+        "a record that exactly fills the payload is well formed and must reach the decline"
+    );
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    for reason in [
+        "reason=delete_object_short site=ch3",
+        "reason=delete_object_record_short site=ch3",
+    ] {
+        assert!(
+            log.contains(reason),
+            "a malformed CmdDeleteObject was dropped without naming itself: {reason}"
         );
     }
 }
@@ -5076,12 +5191,18 @@ fn a_declined_command_is_latched_in_the_log_and_counted_in_the_census() {
     use crate::runtime::drain::store_route_count;
     let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
+    // Conformant for this opcode: a task id and a record whose own length word
+    // exactly fills the twelve bytes. A short packet would be refused for its
+    // shape and never reach the decline this test is about.
+    let mut payload = vec![0u8; 12];
+    st32(&mut payload[0..], 0x11);
+    st32(&mut payload[8..], 8);
     let pkt = Packet {
         opcode: CHILD_OP_DELETE_OBJECT,
         stamp_waits: Vec::new(),
-        total_size: PACKET_HEADER_LEN + 8,
+        total_size: PACKET_HEADER_LEN + payload.len() as u32,
         completion_stamp: 0,
-        payload: vec![0u8; 8],
+        payload,
         next_head: 0,
     };
 

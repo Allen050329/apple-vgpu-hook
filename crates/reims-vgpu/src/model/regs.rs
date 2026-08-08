@@ -442,15 +442,35 @@ pub const CHILD_OP_DELETE_RESOURCE: u16 = 0x25;
 /// object allocator emits this one, and the resource layer emits that one.
 ///
 /// The payload is a `u32` task id followed by a variable-length serialized
-/// argument record, which is why no fixed length is declared here: the guest
-/// writes the id into four bytes of command space and then copies the record in
-/// after it. A driven x86 Safari-drag boot sends **1 931** of these in about
-/// forty seconds — which is what makes this device's not acting on the command
-/// a leak worth naming rather than a curiosity. Only the first was printed (the
-/// record latches; the rate lives in the `store_routes` counter of the same
-/// name), and that one carried 16 bytes, so the argument record was 12. Nothing
-/// says the record is fixed-length, and the emitter cannot tell you: the other
-/// 1 930 were counted, not read.
+/// argument record: the guest writes the id into four bytes of command space and
+/// then copies the record in after it. No fixed length is declared here because
+/// the record carries its own, but the shape is not open-ended:
+///
+/// ```text
+/// 0..4    u32  task id      — must name a live task
+/// 4..     the serialized argument record, `payload_len - 4` bytes, of which
+/// 8..12   u32  record byte length, and `length + 4` must not exceed the payload
+/// ```
+///
+/// So the payload floor is **12**, and the length word at offset 8 is the
+/// record's own size — the record is self-describing, and offset 8 is its second
+/// word rather than a field of the command. A record claiming more than the
+/// payload holds is malformed, not merely long, and both bounds are checked
+/// before the command is declined so a corrupt one is not reported as an
+/// unimplemented command.
+///
+/// A driven x86 Safari-drag boot sends **1 931** of these in about forty seconds
+/// — which is what makes this device's not acting on the command a leak worth
+/// naming rather than a curiosity. Only the first was printed (the record
+/// latches; the rate lives in the `store_routes` counter of the same name), and
+/// that one carried 16 bytes: task 1, a 12-byte record whose length word read
+/// 12, exactly filling the payload.
+///
+/// Retiring the object needs more than this layout. The record is a *tagged*
+/// descriptor — its first word is a class tag the guest validates against the
+/// object it names — so acting on the command means interpreting that tag, and
+/// deleting the wrong object costs more than the leak does. Declining is
+/// deliberate until the tag's meaning is contract rather than inference.
 pub const CHILD_OP_DELETE_OBJECT: u16 = 0x28;
 pub const CHILD_OP_SET_OBJECT_LIST: u16 = 0x33;
 /// PVG `CmdInvalidateResources`: `{u32 task_id, u32 count}` then `count`
