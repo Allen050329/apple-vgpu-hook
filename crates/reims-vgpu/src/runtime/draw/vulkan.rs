@@ -4751,6 +4751,81 @@ pub(super) fn prepare_vertex_step_function(
     })
 }
 
+/// Discharge [`DrawEncodeRequest::gva_load_from_resident`]: either chain colour0's
+/// LOAD off the engine resident, or put the CPU seed back.
+///
+/// `mrt_draw_request` skipped the seed because the engine still held what the
+/// render Store published into these guest pages, so `colors[0].target_seed_rgba`
+/// arrives `None` while the attachment still says `MTL_LOAD_ACTION_LOAD`. **That
+/// makes producing content here an obligation, not an optimisation**: an encode
+/// that neither chains nor re-seeds hands the pass an undefined attachment, and
+/// this class renders a *plausible* frame when it is wrong.
+///
+/// Returns the identity to chain from, and sets `chain_load_from_target`, when the
+/// resident is ready; otherwise re-reads the seed and returns `None`. Exactly one
+/// of `gvaseed_chained` / `gvaseed_reseeded` is counted per discharged request.
+///
+/// A cross-pass rung of this shape used to sit inline at the call site and was
+/// deleted for reading zero — `xpass_c0_gva_load_window_open` 0 against
+/// `xpass_c0_not_gva_load` 4859/5616 over two driven boots — on the reading that
+/// no draw arriving there has a colour0 that is a seedless LOAD'd GVA target. That
+/// was true and it was circular: the seed was built eagerly upstream, so nothing
+/// could arrive seedless however the guest behaved. Asked at the production site
+/// instead, the same question answers `gvaseed_elided` 4 849 against 13 refusals.
+///
+/// **The re-seed is not a formality.** `req.gva_alloc_gen` is recomputed after the
+/// request is built, so a page set that moved in between names a different target
+/// and the resident under it is not ready. `gvaseed_reseeded` says how often the
+/// race is real — zero on the boots measured so far, which is why it is a function
+/// with a test rather than a branch trusted to a workload that never took it.
+///
+/// This is a function rather than a block because it is the only seam a test can
+/// reach: `try_metal2vulkan_draw` loads a guest pipeline and translates two shader
+/// blobs before it gets here, so nothing can drive the arm end to end without a
+/// GPU. See `a_gva_load_from_resident_draw_with_no_resident_puts_the_seed_back`.
+pub(super) fn honour_gva_load_elision<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    req: &mut DrawEncodeRequest,
+    chain_load_from_target: &mut bool,
+) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
+    if !req.gva_load_from_resident || *chain_load_from_target {
+        return None;
+    }
+    let ready = gva_chain_identity(req)
+        .filter(crate::backend::vulkan::engine::resident_content_ready);
+    match ready {
+        Some(identity) => {
+            crate::runtime::drain::note_store_route("gvaseed_chained");
+            *chain_load_from_target = true;
+            Some(identity)
+        }
+        None => {
+            crate::runtime::drain::note_store_route("gvaseed_reseeded");
+            // `first()`, not `[0]`. This arm is reached whenever
+            // `gva_chain_identity` declined, and one of the things it declines
+            // for is an empty colour list — so indexing here would turn a
+            // decline into a panic on the drain worker.
+            let c0 = req.colors.first()?;
+            let (tex_ref, gva, cw, ch) = (c0.texture_ref, c0.target_gva, c0.width, c0.height);
+            let seed =
+                crate::runtime::draw::seed_color_load(state, host, req.task_id, tex_ref, gva, cw, ch);
+            if seed.is_none() {
+                crate::observe::fail(format!(
+                    "gvaseed_reseed_miss ref={tex_ref} {cw}x{ch} gva={gva:#x} \
+                     (the elision was decided on a page set that has since \
+                     moved, and the re-read found nothing: this pass loads \
+                     an undefined attachment)"
+                ));
+            }
+            if let Some(c0) = req.colors.first_mut() {
+                c0.target_seed_rgba = seed;
+            }
+            None
+        }
+    }
+}
+
 fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -5597,52 +5672,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Colour0's LOAD seed was skipped by `mrt_draw_request` because the
         // engine still held what the render Store published into its guest
         // pages. Honour that here, or put the seed back.
-        //
-        // A cross-pass rung of this shape used to sit at this line and was
-        // deleted for reading zero — `xpass_c0_gva_load_window_open` 0 against
-        // `xpass_c0_not_gva_load` 4859/5616 over two driven boots — on the
-        // reading that no draw arriving here has a colour0 that is a seedless
-        // LOAD'd GVA target. That was true and it was circular: the seed is
-        // built eagerly upstream, so nothing could arrive seedless however the
-        // guest behaved. Asked at the production site instead, the same question
-        // answers `gvaseed_elided` 4 849 against 13 refusals.
-        //
-        // **The re-seed is not a formality.** `req.gva_alloc_gen` is recomputed
-        // after the request is built, so a page set that moved in between names
-        // a different target and the resident under it is not ready. The seed is
-        // already gone at that point, and a LOAD with neither a chain nor a seed
-        // hands the pass an undefined attachment — so this arm must produce one
-        // or the other, and `gvaseed_reseeded` says how often the race is real.
-        let mut gva_load_identity = None;
-        if req.gva_load_from_resident && !chain_load_from_target {
-            let ready = gva_chain_identity(req).filter(|identity| {
-                crate::backend::vulkan::engine::resident_content_ready(identity)
-            });
-            match ready {
-                Some(identity) => {
-                    crate::runtime::drain::note_store_route("gvaseed_chained");
-                    gva_load_identity = Some(identity);
-                    chain_load_from_target = true;
-                }
-                None => {
-                    crate::runtime::drain::note_store_route("gvaseed_reseeded");
-                    let c0 = &req.colors[0];
-                    let (tex_ref, gva, cw, ch) =
-                        (c0.texture_ref, c0.target_gva, c0.width, c0.height);
-                    let seed =
-                        crate::runtime::draw::seed_color_load(state, host, req.task_id, tex_ref, gva, cw, ch);
-                    if seed.is_none() {
-                        crate::observe::fail(format!(
-                            "gvaseed_reseed_miss ref={tex_ref} {cw}x{ch} gva={gva:#x} \
-                             (the elision was decided on a page set that has since \
-                             moved, and the re-read found nothing: this pass loads \
-                             an undefined attachment)"
-                        ));
-                    }
-                    req.colors[0].target_seed_rgba = seed;
-                }
-            }
-        }
+        let mut gva_load_identity = honour_gva_load_elision(
+            state,
+            host,
+            req,
+            &mut chain_load_from_target,
+        );
         // Type-11 composite Load: when the resident this record is about to
         // render into was stamped with the mapping's current
         // `surface_content_epoch`, its image already holds exactly the bytes

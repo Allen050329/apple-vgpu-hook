@@ -3278,6 +3278,180 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
     assert_eq!(texture_seed, vec![0, 180, 0, 255, 0, 180, 0, 255]);
 }
 
+/// A draw whose colour0 LOAD seed was elided must leave the encode holding
+/// either a chain or a seed — never neither.
+///
+/// `mrt_draw_request` sets [`DrawEncodeRequest::gva_load_from_resident`] when the
+/// engine still holds what the render Store published into the target's guest
+/// pages, and it pays for that by leaving `colors[0].target_seed_rgba` as `None`
+/// while the attachment still says `MTL_LOAD_ACTION_LOAD`. The attachment is then
+/// only as defined as the encode side makes it: `honour_gva_load_elision` either
+/// chains off the resident or reads the seed back, and a pass that does neither
+/// loads undefined content.
+///
+/// **The regression this catches is the re-seed arm being dropped or
+/// short-circuited**, which is the arm that no boot has yet exercised — the
+/// commit that introduced the elision measured `gvaseed_chained` equal to
+/// `gvaseed_elided` exactly, 4 475 of each, and `gvaseed_reseeded` zero. A rail
+/// that never fires under the workload is a rail that regresses silently, and
+/// this one regresses into a *plausible* frame rather than a blank one: the pass
+/// composites onto whatever the attachment happened to contain. Deleting the
+/// `None` arm, returning early from it, or letting it count without re-reading
+/// would all keep every boot green and every existing test passing.
+///
+/// The race it stands in for is real. `gva_alloc_gen` is recomputed after the
+/// request is built, so a page set that moved in between names a different
+/// target — `gva_chain_identity` then resolves to an identity the registry has no
+/// resident for, exactly as it does here, and the seed is already gone.
+///
+/// There is no engine in a unit test, so `resident_content_ready` is false for
+/// every identity and the chain arm cannot be taken. That is the point: this is
+/// the seedless case by construction, and the only correct behaviour is to put
+/// the seed back. The guest pages below are real, so `Some` here means
+/// `seed_color_load` actually re-read the attachment rather than the arm merely
+/// counting itself.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_gva_load_from_resident_draw_with_no_resident_puts_the_seed_back() {
+    use crate::contract::endian::{st16, st32, st64};
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, TEXTURE_DESC_BASE_LEN,
+        TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
+        TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
+    };
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let dir_pfn = 2u32;
+    let root_pfn = 3u32;
+    let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
+    let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    assert!(host.write_gpa(dir_gpa, &d).is_ok());
+    for i in 0..4u32 {
+        let pfn = 4 + i;
+        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
+    }
+    state.define_task(1, 0x1000, dir_pfn);
+    assert!(state.set_object_list(1, 0, 32));
+
+    // The attachment the pass loads: a tight 4x2 BGRA8 linear texture whose
+    // texels live in guest pages, so the re-seed has something real to find.
+    let tex_ref = 6u32;
+    let body = TEXTURE_DESC_BASE_LEN;
+    let mut b = vec![0u8; body];
+    st64(&mut b[0..], 0x1000);
+    st32(&mut b[8..], 1); // handle -> base gva 1 << page_shift
+    st16(&mut b[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 1);
+    st32(&mut b[TEXTURE_DESC_USED_SIZE..], 16 * 2);
+    st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], 16);
+    st32(&mut b[TEXTURE_DESC_WIDTH..], 4);
+    st32(&mut b[TEXTURE_DESC_WIDTH + 4..], 2); // height
+    st16(&mut b[TEXTURE_DESC_PIXEL_FORMAT..], MTL_FORMAT_BGRA8_UNORM);
+    let desc_gva = 0x200u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &b);
+    let off = list_object_entry_offset(tex_ref, 32).unwrap();
+    let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut le[0..],
+        (crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE as u32) | ((body as u32) << 8),
+    );
+    le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
+    let texel_gva = 1u64 << PAGE_SHIFT_ARM64E;
+    let bgra = [7u8, 5, 3, 255].repeat(8);
+    write_task_gva_arm64e(&mut host, &state.tasks[1], texel_gva, &bgra);
+
+    // The request `mrt_draw_request` produces when it elides: LOAD, no seed, and
+    // the flag that says the absence was deliberate.
+    let mut req = DrawEncodeRequest {
+        task_id: 1,
+        gva_load_from_resident: true,
+        colors: vec![ColorRtRequest {
+            slot: 0,
+            texture_ref: tex_ref,
+            mapping_id: 0,
+            target_gva: texel_gva,
+            row_stride: 16,
+            width: 4,
+            height: 2,
+            format: MTL_FORMAT_BGRA8_UNORM,
+            load_action: MTL_LOAD_ACTION_LOAD,
+            store_action: MTL_STORE_ACTION_STORE,
+            target_seed_rgba: None,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(
+        crate::runtime::draw::vulkan::gva_chain_identity(&req).is_some(),
+        "the elided request must still name an identity — the arm under test is \
+         the one where that identity has no ready resident, not the one where \
+         there is nothing to look up"
+    );
+
+    let chained_before = store_route_count("gvaseed_chained");
+    let reseeded_before = store_route_count("gvaseed_reseeded");
+    let mut chain_load_from_target = false;
+    let identity = crate::runtime::draw::vulkan::honour_gva_load_elision(
+        &mut state,
+        &mut host,
+        &mut req,
+        &mut chain_load_from_target,
+    );
+
+    assert_eq!(
+        store_route_count("gvaseed_chained"),
+        chained_before,
+        "there is no engine resident here, so nothing may report a chain"
+    );
+    assert_eq!(
+        store_route_count("gvaseed_reseeded"),
+        reseeded_before + 1,
+        "the seedless LOAD must take the re-seed arm exactly once"
+    );
+    assert!(
+        identity.is_none() && !chain_load_from_target,
+        "a re-seeded pass loads from its attachment, not from a resident"
+    );
+
+    // The property, and the reason the counter alone is not enough: the seed is
+    // back, and it holds the guest's pixels rather than an empty buffer.
+    let seed = req.colors[0]
+        .target_seed_rgba
+        .as_ref()
+        .expect("a LOAD whose elision was not honoured must have its seed restored");
+    assert_eq!(
+        seed.len(),
+        4 * 2 * 4,
+        "the restored seed must cover the whole attachment"
+    );
+    // BGRA8 in guest memory, RGBA8 in the seed: the linear GVA door of
+    // `seed_color_load` converts, so the guest's `[7, 5, 3, 255]` arrives
+    // channel-reversed. Asserting the converted value rather than the raw one is
+    // deliberate — it pins that these bytes came through the seed path and not
+    // from some other buffer that happened to be the right length.
+    assert_eq!(
+        &seed[..4],
+        &[3, 5, 7, 255],
+        "the restored seed must be the attachment's own guest texels"
+    );
+    assert!(
+        seed.chunks_exact(4).all(|px| px == [3, 5, 7, 255]),
+        "every texel of the re-read attachment, not just the first row"
+    );
+}
+
 /// A type-5 ref is not itself a surface id. The descriptor's surface_id
 /// remains authoritative even when the numeric ref collides with another
 /// live display mapping (live app-launch ref=2 -> sid=71 class).
