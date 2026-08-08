@@ -1975,6 +1975,15 @@ pub struct GuestPageTarget {
     pub row_length_texels: u32,
     pub width: u32,
     pub height: u32,
+    /// Channel order the guest reads these bytes back in, from the format it
+    /// declared for this destination.
+    ///
+    /// The copy converts nothing, so this is the order the resident must
+    /// already hold; the engine checks the pair and refuses by name rather than
+    /// assuming either side. It lives here and not on the identity because it
+    /// is a property of the *destination* — the runtime is the only side that
+    /// knows what the guest declared, exactly as it is for the row pitch above.
+    pub bgra: bool,
 }
 
 impl GuestPageTarget {
@@ -2098,10 +2107,11 @@ pub fn copy_target_to_guest_pages(
     }
     unsafe { pools.ensure_init(ctx, counters)? };
     let snap = resident_read_snapshot(pools, identity)?;
-    if !snap.bgra {
-        return Err(DrawError::GuestPageWrite(
-            GuestWriteDecline::NotScanoutOrder,
-        ));
+    if snap.bgra != dst.bgra {
+        return Err(DrawError::GuestPageWrite(GuestWriteDecline::OrderMismatch {
+            resident_bgra: snap.bgra,
+            want_bgra: dst.bgra,
+        }));
     }
     if snap.width != dst.width || snap.height != dst.height {
         return Err(DrawError::GuestPageWrite(
@@ -3029,6 +3039,9 @@ mod guest_page_target_tests {
             row_length_texels,
             width,
             height,
+            // Immaterial to these tests: the order is checked against the
+            // resident's, and no fixture here reaches a resident.
+            bgra: true,
         }
     }
 

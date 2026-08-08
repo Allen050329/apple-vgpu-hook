@@ -190,6 +190,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // pages by `store_surface_resident`, so this encode owes the caller nothing
     // further.
     let mut surface_store_armed = false;
+    // GVA render Store: the frame was written into the target's guest pages by
+    // `store_gva_frame`, so this encode owes the caller nothing further. The
+    // twin of `surface_store_armed`, and it returns through the same door.
+    let mut gva_store_armed = false;
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         req.chain_resident_established = false;
         match try_metal2vulkan_draw(state, host, req, writeback_guest) {
@@ -218,17 +222,76 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // rail is gone, and on a driven boot this route armed 88 windows
                 // in 51 seconds against the surface rail's 21 314, so what it
                 // deferred was never where the cost was.
-                // `read_resident_chain` fail-logs a lost resident.
-                note_type11_store_route("gva_store_sync");
-                draw_rgba = read_resident_chain(state, req);
-                crate::observe::line(format!(
-                    "linux_m2v_draw ok resident_gva_store pipe={} {}x{} gva={:#x} rgba={}",
-                    req.pipeline_ref,
-                    pass_w,
-                    pass_h,
-                    req.colors.first().map(|c| c.target_gva).unwrap_or(0),
-                    draw_rgba.is_some() as u8
-                ));
+                let _store_span = StoreCostSpan::new("gva_store_us");
+                note_type11_store_route("gva_flush");
+                // The GPU writes the guest's pages directly, exactly as the
+                // type-11 surface Store does. Tried first because when it works
+                // there is nothing left to do: no fence is waited on, no
+                // staging buffer is mapped and no host pass over the frame
+                // happens at all. Every decline below pays a blocking readback
+                // of the whole framebuffer plus a per-row conversion of it,
+                // which is this device's largest single cost.
+                let direct = req.colors.first().and_then(|c0| {
+                    let identity = gva_chain_identity(req)?;
+                    Some((
+                        crate::runtime::render_writeback::store_gva_frame(
+                            state,
+                            host,
+                            &identity,
+                            c0,
+                            c0.texture_ref,
+                            sync_store_pages.as_ref(),
+                        ),
+                        c0.target_gva,
+                    ))
+                });
+                let landed = match direct {
+                    Some((Ok(_), gva)) => {
+                        note_type11_store_route("gva_flush_gpu_direct");
+                        crate::observe::line(format!(
+                            "linux_m2v_draw ok resident_gva_store_direct pipe={} {}x{} gva={gva:#x}",
+                            req.pipeline_ref, pass_w, pass_h
+                        ));
+                        true
+                    }
+                    Some((Err(decline), gva)) => {
+                        // Latched per target as well as per reason: a host
+                        // without the import declines every Store of every
+                        // target, and a line each would drown the channel.
+                        crate::observe::Emit::decline("gva_flush_gpu_declined", &decline)
+                            .field("gva", format!("{gva:#x}"))
+                            .field("geom", format!("{pass_w}x{pass_h}"))
+                            .fail_once(gva);
+                        note_type11_store_route("gva_flush_gpu_declined");
+                        false
+                    }
+                    // No color0 or no identity: the same pair
+                    // `gva_store_defer_eligible` already required to reach this
+                    // arm, so a `None` here is a contradiction rather than a
+                    // routing answer.
+                    None => {
+                        note_type11_store_route("gva_flush_no_identity");
+                        false
+                    }
+                };
+                if landed {
+                    gva_store_armed = true;
+                } else {
+                    // The copying rail: read the resident the draw just
+                    // rendered into and let the synchronous Store block below
+                    // run exactly as it does for a Store that never skipped its
+                    // readback. `read_resident_chain` fail-logs a lost resident.
+                    note_type11_store_route("gva_store_sync");
+                    draw_rgba = read_resident_chain(state, req);
+                    crate::observe::line(format!(
+                        "linux_m2v_draw ok resident_gva_store pipe={} {}x{} gva={:#x} rgba={}",
+                        req.pipeline_ref,
+                        pass_w,
+                        pass_h,
+                        req.colors.first().map(|c| c.target_gva).unwrap_or(0),
+                        draw_rgba.is_some() as u8
+                    ));
+                }
             }
             Ok(M2vDrawSpan::ResidentSurfaceStore) => {
                 // Into the same `t11_store_us` bucket the synchronous and `Owned`
@@ -315,7 +378,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // the guest write lands on first access. `None`, not the frame, for the same
     // reason the `Owned` route returns `None` — `writeback_guest` is granted only
     // to the last record of a packet, so there is no record N+1 to seed.
-    if surface_store_armed {
+    if surface_store_armed || gva_store_armed {
         return (EncodeStatus::Ok, None);
     }
 
@@ -524,7 +587,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     c0.row_stride,
                     c0.format,
                     &rgba,
-                    sync_store_pages.as_ref(),
+                    sync_store_pages.as_ref().map(|p| p.membership()),
                 )
                 .is_ok();
                 // Discrete-GPU rail: type-2/3 encode into **texture_ref** + **GVA**
@@ -3406,7 +3469,7 @@ pub(super) fn sync_store_allowed_pages<M: HostMemory>(
     task_id: u32,
     color0: Option<&ColorRtRequest>,
     writeback_guest: bool,
-) -> Option<std::collections::HashSet<u64>> {
+) -> Option<super::StoreTargetPages> {
     if !writeback_guest {
         return None;
     }

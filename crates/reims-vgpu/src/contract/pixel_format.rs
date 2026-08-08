@@ -649,6 +649,35 @@ pub fn render_target_bpp(format: u16) -> Option<u32> {
     })
 }
 
+/// The channel order a render Store's destination stores its texels in, or
+/// `None` for a destination whose texel is not one of the two 8-bit RGBA
+/// permutations.
+///
+/// This is the whole admission rule for landing a resident render target in
+/// guest memory with an image→buffer copy: that copy moves bytes and converts
+/// nothing, so the destination's texel must be four bytes wide and its channel
+/// order must be the order the resident already holds. Say `Some(order)` and
+/// the caller compares it against its resident; say `None` and the only route
+/// left is [`convert_rgba8_to_row`], which is a CPU pass over the frame.
+///
+/// Named once because both writeback rails ask it — the type-11 mapping rail
+/// wants `Bgra8` specifically and the GVA rail takes whichever order its
+/// resident was built in — and a rail that re-lists the formats drifts the
+/// first time one is added. It is deliberately not [`render_target_bpp`]`
+/// .is_some()`: `RGBA16_FLOAT` is renderable and is not a byte-copy
+/// destination.
+///
+/// sRGB folds onto its linear sibling for the same reason [`sampled_class`]
+/// folds it: the qualifier describes how a sampler interprets the bytes, not
+/// how they are stored, and only the storage matters to a copy.
+pub fn store_texel_order(format: u16) -> Option<TexelLayout> {
+    Some(match format {
+        MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => TexelLayout::Rgba8,
+        MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => TexelLayout::Bgra8,
+        _ => return None,
+    })
+}
+
 pub fn tight_row_bytes(width: u32, format: u16) -> Option<u32> {
     if width == 0 {
         return None;
@@ -1634,6 +1663,55 @@ mod tests {
         for layout in [TexelLayout::R8, TexelLayout::Rg8, TexelLayout::R16Float] {
             assert!(!layout.is_four_byte_color());
             assert_ne!(layout.bytes_per_texel(), RGBA8_BPP);
+        }
+    }
+
+    /// Every format [`store_texel_order`] admits must survive a raw byte copy.
+    ///
+    /// Exhaustive over `u16` rather than over a list, because the failure this
+    /// guards is a format being *added* to the admitted set whose texel is not
+    /// four bytes or whose channel order the CPU loaders read differently. Both
+    /// would land a frame in guest memory under the wrong layout, and neither
+    /// is visible at the copy — it converts nothing and cannot notice.
+    #[test]
+    fn a_byte_copy_destination_is_four_bytes_of_the_order_it_claims() {
+        for fmt in 0u16..=u16::MAX {
+            let Some(order) = store_texel_order(fmt) else {
+                continue;
+            };
+            assert!(
+                order.is_four_byte_color(),
+                "{fmt:#x} admitted as {order:?}, which is not a four-byte colour order"
+            );
+            assert_eq!(
+                bytes_per_pixel(fmt),
+                Some(order.bytes_per_texel()),
+                "{fmt:#x} stores a texel the copy would mis-stride"
+            );
+            assert_eq!(
+                render_target_bpp(fmt),
+                Some(order.bytes_per_texel()),
+                "{fmt:#x} is a Store destination this device will not render into"
+            );
+            // The sampled table is the independent statement of the same byte
+            // layout, so a disagreement here is one of the two being wrong.
+            assert_eq!(
+                sampled_class(fmt),
+                Some(match order {
+                    TexelLayout::Rgba8 => SampledClass::Rgba8Unorm,
+                    _ => SampledClass::Bgra8Unorm,
+                }),
+                "{fmt:#x} is read as one order by the sampler and copied as another"
+            );
+        }
+        // The renderable formats that are not byte-copy destinations, so a
+        // widening of the set above has to delete a line here to pass.
+        for fmt in [MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RG16_FLOAT] {
+            assert!(render_target_bpp(fmt).is_some());
+            assert!(
+                store_texel_order(fmt).is_none(),
+                "{fmt:#x} is wider than four bytes and cannot be handed to a copy"
+            );
         }
     }
 

@@ -1628,7 +1628,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // writeback: `render_core_mrt` below submits and waits, and the guest keeps
     // running on its own vCPUs across that. Indexed by attachment because MRT
     // stores every color target, not just slot 0.
-    let sync_store_pages: Vec<Option<std::collections::HashSet<u64>>> = if writeback_guest {
+    let sync_store_pages: Vec<Option<StoreTargetPages>> = if writeback_guest {
         color_list
             .iter()
             .map(|c| sync_store_target_pages(state, host, req.task_id, c))
@@ -2408,7 +2408,10 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                 )
             }
         } else if c.target_gva != 0 {
-            let allowed = sync_store_pages.get(i).and_then(|p| p.as_ref());
+            let allowed = sync_store_pages
+                .get(i)
+                .and_then(|p| p.as_ref())
+                .map(StoreTargetPages::membership);
             if gva_partial {
                 let r = store_rect.expect("gva_partial implies exactly one narrowing rect");
                 write_gva_rgba8_rect(
@@ -4208,7 +4211,7 @@ pub(crate) fn sync_store_target_pages<M: HostMemory>(
     host: &M,
     task_id: u32,
     c: &ColorRtRequest,
-) -> Option<std::collections::HashSet<u64>> {
+) -> Option<StoreTargetPages> {
     if c.target_gva == 0
         || c.store_action != MTL_STORE_ACTION_STORE
         || c.width == 0
@@ -4217,7 +4220,7 @@ pub(crate) fn sync_store_target_pages<M: HostMemory>(
         return None;
     }
     let span = (c.row_stride as u64).checked_mul(c.height as u64)?;
-    let pages = crate::runtime::gva_mem::task_gva_page_gpa_set(
+    let ordered = crate::runtime::gva_mem::task_gva_page_gpas(
         host,
         &state.tasks,
         task_id,
@@ -4225,12 +4228,60 @@ pub(crate) fn sync_store_target_pages<M: HostMemory>(
         span,
         state.page_shift,
     );
-    if pages.is_empty() {
+    if ordered.is_empty() {
         crate::runtime::drain::note_store_route("sync_store_unbounded");
         return None;
     }
     crate::runtime::drain::note_store_route("sync_store_bound");
-    Some(pages)
+    Some(StoreTargetPages {
+        set: ordered.iter().copied().collect(),
+        ordered,
+        span,
+    })
+}
+
+/// The guest pages a synchronous GVA render Store may write, from one walk
+/// taken before the draw was submitted.
+///
+/// Two shapes of one answer, because the two writers ask it differently. The
+/// row-by-row writer asks "is this page one of mine?" once per row, and the
+/// GPU-direct writer needs the pages in GVA order so neighbours coalesce into
+/// the contiguous runs a copy binds. Derived from a single walk rather than
+/// taken twice, so the two rails cannot end up authorised differently — which
+/// is the whole point of resolving before the submit.
+/// Only the Vulkan backend has a GPU-direct GVA writeback, so on the Metal arm
+/// the ordered form of the walk has no reader. Held rather than `cfg`-ed out of
+/// the struct: both fields are produced by the one walk either way, and a
+/// conditional shape would make the two arms disagree about what a Store's
+/// authorisation *is*.
+#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+pub(crate) struct StoreTargetPages {
+    ordered: Vec<u64>,
+    set: std::collections::HashSet<u64>,
+    span: u64,
+}
+
+impl StoreTargetPages {
+    /// The same pages as a membership test, which is the bound
+    /// [`write_gva_rgba8_within`] takes.
+    pub(crate) fn membership(&self) -> &std::collections::HashSet<u64> {
+        &self.set
+    }
+
+    /// Page GPAs in GVA order, **only** when the walk resolved every page of
+    /// the destination span.
+    ///
+    /// `None` on a short walk, and that is not the same fail-closed the
+    /// membership form has. A dropped page leaves the set a subset, which can
+    /// only refuse a row; it leaves this vector *shifted*, because a consumer
+    /// reads index `i` as page `i` of the window. A copy built from a shifted
+    /// list would land the frame's bytes at the wrong guest addresses without
+    /// anything noticing — the copy converts nothing and checks nothing.
+    #[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+    pub(crate) fn ordered_complete(&self, gva: u64, page_size: u64) -> Option<&[u64]> {
+        let want = reims_vgpu_paging::span::pages_spanned(gva, self.span, page_size);
+        (self.ordered.len() as u64 == want).then_some(&self.ordered[..])
+    }
 }
 
 /// [`write_gva_rgba8`] bounded to the guest pages a deferred window was armed

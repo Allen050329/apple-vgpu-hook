@@ -895,8 +895,14 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     // A buffer→image copy moves bytes and converts nothing, so the mapping's
     // format has to be the one the resident already holds. `into_bgra8` on the
     // copying rail is where a semantic-RGBA resident is exchanged, and the
-    // engine refuses one of those on its own account too.
-    if format != MTL_FORMAT_BGRA8_UNORM && format != pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB {
+    // engine refuses a mismatched pair on its own account too.
+    //
+    // `Bgra8` specifically, and not merely "some order this rail could copy":
+    // a type-11 resident is built in guest scanout order by
+    // `TargetIdentity::is_bgra`, so an RGBA mapping format here is a
+    // disagreement rather than a second rail, and the engine would refuse it a
+    // few lines later anyway.
+    if pixel_format::store_texel_order(format) != Some(pixel_format::TexelLayout::Bgra8) {
         return Err(GpuWritebackDecline::FormatNeedsConversion { format });
     }
     let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
@@ -988,6 +994,9 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
         row_length_texels: plan.row_length_texels,
         width: mw,
         height: mh,
+        // Checked above: this rail only reaches here for a mapping whose
+        // declared format is guest scanout order.
+        bgra: true,
     };
     // Both witnesses before the copy rather than after it, matching
     // `contig_for_write`: a refused write costs a spurious bump, which makes a

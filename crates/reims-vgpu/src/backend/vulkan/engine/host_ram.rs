@@ -329,6 +329,17 @@ unsafe fn import_ramblock(
     bound
 }
 
+/// Channel order as a decline field reads, so the two sides of an
+/// [`GuestWriteDecline::OrderMismatch`] name themselves rather than printing
+/// `true`/`false` a reader has to know the polarity of.
+fn order_name(bgra: bool) -> &'static str {
+    if bgra {
+        "bgra"
+    } else {
+        "rgba"
+    }
+}
+
 /// A check that stopped a resident's frame from being copied straight into the
 /// guest's own pages, so the flush took the CPU route instead.
 ///
@@ -343,10 +354,17 @@ pub enum GuestWriteDecline {
     Unsupported {
         rung: crate::backend::vulkan::caps::HostPointerImport,
     },
-    /// The resident's physical channel order is not the guest's scanout order,
-    /// so landing it would need an R/B exchange — which a buffer→image copy
-    /// cannot perform. The copying rail's `into_bgra8` is where that lives.
-    NotScanoutOrder,
+    /// The resident's physical channel order is not the order the destination
+    /// stores, so landing it would need an R/B exchange — which an image→buffer
+    /// copy cannot perform. The copying rail's per-row conversion is where that
+    /// lives.
+    ///
+    /// Stated as a disagreement between the two rather than as "the resident is
+    /// not BGRA", because both orders reach this call: a type-11 mapping's pages
+    /// are guest scanout order and a GVA render target's are whatever the guest
+    /// declared for it. A rail that spelled the rule as one fixed order refused
+    /// every RGBA destination it could have served unchanged.
+    OrderMismatch { resident_bgra: bool, want_bgra: bool },
     /// The resident's geometry is not the geometry the window promised the
     /// guest. Copying anyway would land one extent's pixels under another's row
     /// pitch.
@@ -373,7 +391,7 @@ impl Decline for GuestWriteDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::Unsupported { .. } => "gpu_writeback_unsupported",
-            Self::NotScanoutOrder => "gpu_writeback_not_scanout_order",
+            Self::OrderMismatch { .. } => "gpu_writeback_order_mismatch",
             Self::GeometryMoved { .. } => "gpu_writeback_geometry_moved",
             Self::WindowTooSmall { .. } => "gpu_writeback_window_too_small",
             // The inner decline's own slug, so a driver that refuses the pointer
@@ -386,7 +404,13 @@ impl Decline for GuestWriteDecline {
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::Unsupported { rung } => vec![("rung", rung.slug().to_string())],
-            Self::NotScanoutOrder => Vec::new(),
+            Self::OrderMismatch {
+                resident_bgra,
+                want_bgra,
+            } => vec![
+                ("resident", order_name(*resident_bgra).to_string()),
+                ("want", order_name(*want_bgra).to_string()),
+            ],
             Self::GeometryMoved {
                 resident_width,
                 resident_height,

@@ -266,3 +266,197 @@ fn finish(
         started.elapsed().as_micros()
     ));
 }
+
+/// Why a GVA render Store could not hand its resident straight to the guest's
+/// pages, so it fell back to reading the frame back and converting it row by
+/// row.
+///
+/// Every one of these is a routing answer and not a loss — the copying rail
+/// still lands the frame — but each costs a blocking GPU→host readback of a
+/// whole framebuffer plus a host pass over it, which is the largest single cost
+/// this device pays. They are named individually so a boot says which check is
+/// holding the volume.
+#[cfg(feature = "backend-vulkan")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GvaWritebackDecline {
+    /// The guest declared a destination format whose texel is not four bytes of
+    /// colour, so no image→buffer copy can produce it. A `RGBA16_FLOAT` render
+    /// target lands here and always will; `convert_rgba8_to_row` is its only
+    /// route.
+    FormatNeedsConversion { format: u16 },
+    /// The resident's channel order is not the order the destination stores.
+    /// Distinct from the engine's own check of the same pair: this one is asked
+    /// before the walk, so a mismatch costs no page-table work.
+    OrderMismatch { resident_bgra: bool, want_bgra: bool },
+    /// The guest's row pitch is not a whole number of texels, or is narrower
+    /// than the frame, so there is no `bufferRowLength` that describes it.
+    PitchNotTexels { row_stride: u32 },
+    /// The frame's first texel does not start on a texel boundary within its
+    /// page. `VkBufferImageCopy::bufferOffset` must be a multiple of the texel
+    /// block size, and a copy that ignored this is undefined rather than
+    /// misaligned.
+    OffsetNotTexelAligned { in_page: u64 },
+    /// The command resolved no destination pages before it was submitted, so
+    /// there is nothing this rail is authorised to write. The copying rail
+    /// treats the same answer as "unbounded" and writes anyway through its own
+    /// re-walk; this rail has no second walk to fail closed on, so it declines.
+    Unlicensed,
+    /// The pre-submit walk did not resolve every page of the destination span,
+    /// so its page list cannot be read positionally.
+    /// [`crate::runtime::draw::StoreTargetPages::ordered_complete`] states what
+    /// a short list would land.
+    SpanIncomplete,
+    /// The destination span did not become a guest-RAM reference; the inner
+    /// refusal names the check, restated here for the reason
+    /// `GpuWritebackDecline::GuestRefRefused` restates its own.
+    GuestRefRefused {
+        refusal: crate::runtime::guest_ram_map::MapRefusal,
+    },
+    /// The engine declined or the copy failed; the inner error names which.
+    Engine {
+        inner: crate::backend::vulkan::engine::DrawError,
+    },
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl crate::observe::Decline for GvaWritebackDecline {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::FormatNeedsConversion { .. } => "gvawb_format_needs_conversion",
+            Self::OrderMismatch { .. } => "gvawb_order_mismatch",
+            Self::PitchNotTexels { .. } => "gvawb_pitch_not_texels",
+            Self::OffsetNotTexelAligned { .. } => "gvawb_offset_not_texel_aligned",
+            Self::Unlicensed => "gvawb_unlicensed",
+            Self::SpanIncomplete => "gvawb_span_incomplete",
+            Self::GuestRefRefused { .. } => "gvawb_guest_ref_refused",
+            Self::Engine { inner } => crate::observe::Decline::slug(inner),
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::Unlicensed | Self::SpanIncomplete => Vec::new(),
+            Self::FormatNeedsConversion { format } => vec![("fmt", format!("{format:#x}"))],
+            Self::OrderMismatch {
+                resident_bgra,
+                want_bgra,
+            } => vec![
+                ("resident", if *resident_bgra { "bgra" } else { "rgba" }.to_string()),
+                ("want", if *want_bgra { "bgra" } else { "rgba" }.to_string()),
+            ],
+            Self::PitchNotTexels { row_stride } => vec![("bpr", row_stride.to_string())],
+            Self::OffsetNotTexelAligned { in_page } => vec![("in_page", in_page.to_string())],
+            Self::GuestRefRefused { refusal } => {
+                let mut f = vec![("via", crate::observe::Decline::slug(refusal).to_string())];
+                f.extend(crate::observe::Decline::fields(refusal));
+                f
+            }
+            Self::Engine { inner } => crate::observe::Decline::fields(inner),
+        }
+    }
+}
+
+#[cfg(feature = "backend-vulkan")]
+crate::observe::decline::decline_display!(GvaWritebackDecline);
+
+/// Copy `identity`'s pixels into the guest pages behind a type-2/3 render
+/// target's `target_gva`, with no host copy of the frame at any point.
+///
+/// The GVA twin of [`store_render_frame`]'s first arm, and worth diffing
+/// against it: both end in `copy_target_to_guest_pages` and they differ only in
+/// how the destination pages are named. A mapping carries its own page list and
+/// a page-table vouch licenses it; a GVA carries neither, so the licence is the
+/// walk the command took **before it was submitted** — `pages`, which the
+/// caller resolved at that point and which this rail may not widen.
+///
+/// # Why this is the whole cost of a GVA Store
+///
+/// The rail this stands in front of reads the resident back to the host
+/// (`read_resident_chain`, a blocking fence) and then writes it out again a row
+/// at a time through `convert_rgba8_to_row`. On a driven desktop-compositing
+/// boot that is 59 % of render Stores and most of the time the device spends
+/// waiting on a fence. Everything this call declines on pays that instead, so a
+/// decline is a cost and never a lost frame.
+///
+/// # What it does not do
+///
+/// It publishes no host-side copy of the frame. The two GVA pixel caches are
+/// *dropped* instead, for the same reason `store_render_frame` forgets the
+/// mapping's: after this call the guest's own pages are the only place the
+/// frame exists, and an entry left behind would serve a later sample the
+/// previous Store's bytes. The sampled rail re-reads them from guest memory,
+/// which is what `store_gva_owned`'s `guest_holds_bytes` already promised.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    c0: &crate::runtime::draw::ColorRtRequest,
+    texture_ref: u32,
+    pages: Option<&crate::runtime::draw::StoreTargetPages>,
+) -> Result<u64, GvaWritebackDecline> {
+    use crate::contract::pixel_format::{store_texel_order, TexelLayout};
+    // The destination's channel order, and the whole reason this rail can exist
+    // at all: a copy converts nothing, so the guest must already read these
+    // bytes in the order the resident holds them.
+    let Some(order) = store_texel_order(c0.format) else {
+        return Err(GvaWritebackDecline::FormatNeedsConversion { format: c0.format });
+    };
+    let want_bgra = order == TexelLayout::Bgra8;
+    let resident_bgra = identity.is_bgra();
+    if resident_bgra != want_bgra {
+        return Err(GvaWritebackDecline::OrderMismatch {
+            resident_bgra,
+            want_bgra,
+        });
+    }
+    let bpt = u64::from(order.bytes_per_texel());
+    let row_stride = u64::from(c0.row_stride);
+    if row_stride == 0 || !row_stride.is_multiple_of(bpt) || row_stride < u64::from(c0.width) * bpt {
+        return Err(GvaWritebackDecline::PitchNotTexels {
+            row_stride: c0.row_stride,
+        });
+    }
+    let Some(pages) = pages else {
+        return Err(GvaWritebackDecline::Unlicensed);
+    };
+    let page_size = state.page_size();
+    let Some(gpas) = pages.ordered_complete(c0.target_gva, page_size) else {
+        return Err(GvaWritebackDecline::SpanIncomplete);
+    };
+    let in_page = c0.target_gva % page_size;
+    if !in_page.is_multiple_of(bpt) {
+        return Err(GvaWritebackDecline::OffsetNotTexelAligned { in_page });
+    }
+    // The extent the copy names and nothing past it: padding after the final
+    // row belongs to the allocation but is not texels this Store was given, and
+    // the copying rail leaves it alone too. The two rails must land identical
+    // guest memory or a fallback would be visible.
+    let extent = u64::from(c0.height.saturating_sub(1)) * row_stride + u64::from(c0.width) * bpt;
+    let runs = crate::runtime::guest_ram_map::references_for_runs(
+        host, gpas, page_size, in_page, extent,
+    )
+    .map_err(|refusal| GvaWritebackDecline::GuestRefRefused { refusal })?;
+    let target = crate::backend::vulkan::engine::GuestPageTarget {
+        runs,
+        // Checked above to divide exactly, so this is the guest's pitch and not
+        // a rounding of it.
+        row_length_texels: (row_stride / bpt) as u32,
+        width: c0.width,
+        height: c0.height,
+        bgra: want_bgra,
+    };
+    crate::backend::vulkan::engine::copy_target_to_guest_pages(identity, &target)
+        .map_err(|inner| GvaWritebackDecline::Engine { inner })?;
+    // Nothing here leaves a host copy of the frame, so neither GVA-keyed cache
+    // may go on naming one.
+    crate::runtime::surface_cache::evict_gva(state, c0.target_gva);
+    if texture_ref != 0 {
+        crate::runtime::surface_cache::evict_texture(state, texture_ref);
+    }
+    // The copy means this image has stopped being the only place these pixels
+    // exist, so the reclaim paths may take it — the same handover
+    // `store_render_frame` performs in `finish`.
+    crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
+    Ok(extent)
+}

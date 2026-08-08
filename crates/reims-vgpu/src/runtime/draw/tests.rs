@@ -4585,6 +4585,52 @@ impl StoreRig {
     }
 }
 
+/// A page the pre-submit walk could not resolve takes the ordered page list
+/// away entirely rather than shortening it.
+///
+/// The two forms of [`StoreTargetPages`] fail differently on a short walk and
+/// only one of them can fail closed. The membership form is a subset, so a
+/// missing page can only refuse a row that wanted it. The ordered form is read
+/// *positionally* — `references_for_runs` takes index `i` as page `i` of the
+/// window — so a list with a hole shifts every page after it, and the GPU copy
+/// built from it lands the frame at guest addresses the command never named,
+/// converting nothing and checking nothing on the way.
+#[test]
+fn a_short_pre_submit_walk_takes_the_ordered_page_list_away() {
+    const PAGE: u64 = 1 << PAGE_SHIFT_ARM64E;
+    let gva = PAGE;
+    let span = PAGE * 3;
+    let complete = vec![0x10 * PAGE, 0x11 * PAGE, 0x12 * PAGE];
+
+    let whole = StoreTargetPages {
+        set: complete.iter().copied().collect(),
+        ordered: complete.clone(),
+        span,
+    };
+    assert_eq!(
+        whole.ordered_complete(gva, PAGE),
+        Some(&complete[..]),
+        "a walk that resolved every page of the span is positionally readable"
+    );
+
+    // The middle page dropped, which is what `task_gva_page_gpas` leaves behind
+    // for a span with an unmapped page in it.
+    let short = StoreTargetPages {
+        set: [complete[0], complete[2]].into_iter().collect(),
+        ordered: vec![complete[0], complete[2]],
+        span,
+    };
+    assert!(
+        short.ordered_complete(gva, PAGE).is_none(),
+        "a hole must take the whole list, not hand back a shifted one"
+    );
+    assert_eq!(
+        short.membership().len(),
+        2,
+        "the membership form stays usable: a subset can only refuse"
+    );
+}
+
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
@@ -4611,8 +4657,8 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
 
     let armed = sync_store_allowed_pages(&state, &host, 1, Some(&c0), true)
         .expect("a resolvable GVA target must be bounded");
-    assert_eq!(armed.len(), 1, "64x64 BGRA8 tight covers one 16 KiB page");
-    assert!(armed.contains(&((pt_base as u64 + 1) << PAGE_SHIFT_ARM64E)));
+    assert_eq!(armed.membership().len(), 1, "64x64 BGRA8 tight covers one 16 KiB page");
+    assert!(armed.membership().contains(&((pt_base as u64 + 1) << PAGE_SHIFT_ARM64E)));
 
     // The guest hands that virtual page to a different allocation while the GPU
     // is working. The write that follows must not reach the new owner.
@@ -4630,7 +4676,7 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
         64 * 4,
         c0.format,
         &rgba,
-        Some(&armed),
+        Some(armed.membership()),
     )
     .expect_err("a page the command never named must be refused");
     assert!(
@@ -4725,7 +4771,7 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
         }
         let armed = sync_store_target_pages(&rig.state, &rig.host, 1, &target)
             .expect("a resolvable GVA target must be bounded");
-        assert_eq!(armed.len(), 2, "64x128 BGRA8 tight covers two 16 KiB pages");
+        assert_eq!(armed.membership().len(), 2, "64x128 BGRA8 tight covers two 16 KiB pages");
 
         // The guest re-points the span's second page mid-flight.
         rig.point(2, moved_to);
@@ -4747,7 +4793,7 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
                     width: rw,
                     height: rh
                 },
-                Some(&armed)
+                Some(armed.membership())
             ),
             "packed={packed}: a page the command never named must be refused"
         );
