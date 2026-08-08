@@ -27,8 +27,12 @@ use super::*;
 #[cfg(feature = "host-window")]
 type WindowFrameKey = (u32, u32, u64);
 
+/// `pub(super)` for `device::tests::window_publish_key_advances_for_in_place_present`,
+/// which is `cfg`-ed to macOS + `host-window` — a combination no Linux arm
+/// compiles, so a private spelling here builds green on every arm anyone runs
+/// and fails only on the arm64 macOS pathway. It did.
 #[cfg(feature = "host-window")]
-fn window_frame_key(present: &crate::model::PresentState) -> WindowFrameKey {
+pub(super) fn window_frame_key(present: &crate::model::PresentState) -> WindowFrameKey {
     #[cfg(target_os = "macos")]
     let present_epoch = present.present_epoch;
     #[cfg(not(target_os = "macos"))]
@@ -44,6 +48,14 @@ fn window_frame_key(present: &crate::model::PresentState) -> WindowFrameKey {
 pub(crate) struct WindowLink {
     /// Shared latest-frame slot the window thread reads each redraw.
     frames: crate::host_window::present::FrameSlot,
+    /// Wakes the window's event loop once a frame has landed in `frames`.
+    ///
+    /// The window used to find frames by polling the slot every 2 ms, which on a
+    /// driven boot asked for 494 redraws a second to serve 8.7 — see
+    /// `host_window::present::ENGINE_WINDOW_REDRAW_BACKSTOP`. The publisher is
+    /// the only thing that knows a frame exists, so it is the only thing that
+    /// can end the polling.
+    wake: crate::host_window::present::WindowWakeHandle,
     /// `(mapping_id, generation, present_epoch)` of the last frame published.
     ///
     /// The resource generation alone is insufficient: the guest can update a
@@ -100,7 +112,7 @@ pub(crate) struct EarlyFb {
 /// [`publish_window_frame`], called by the drain. Idempotent; `true` on success.
 #[cfg(feature = "host-window")]
 pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
-    use crate::host_window::present::{FrameSlot, InputSink, WindowConfig};
+    use crate::host_window::present::{FrameSlot, InputSink, WindowConfig, WindowWaker};
     let Some(slot) = device_slot(id) else {
         return false;
     };
@@ -111,6 +123,11 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
     // FrameSlot is a std::sync::Mutex (owned by the window module); lib.rs's
     // bare `Mutex` is parking_lot, so qualify it here.
     let frames: FrameSlot = Arc::new(std::sync::Mutex::new(None));
+    // Created here rather than on the window thread so the link holds it before
+    // the loop exists: an unarmed waker is a no-op and the window's backstop
+    // covers the gap, so a publish that beats the loop's creation costs latency
+    // rather than a frame.
+    let wake = WindowWaker::new();
     // Weak so a live window does not pin a destroyed device; post-destroy input
     // upgrades to None and is dropped (the guest is gone anyway).
     let weak = Arc::downgrade(&slot);
@@ -155,6 +172,7 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
             Arc::clone(&frames),
             Arc::clone(&stop),
             Arc::clone(&exited),
+            Arc::clone(&wake),
         ) {
             crate::observe::Emit::decline("host_window_start", &error)
                 .field("id", id)
@@ -169,9 +187,11 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         on_input,
         Arc::clone(&frames),
         Arc::clone(&stop),
+        Arc::clone(&wake),
     ));
     *link = Some(WindowLink {
         frames,
+        wake,
         last: (u32::MAX, u32::MAX, u64::MAX),
         seq: 0,
         bgra_short_geom: None,
@@ -350,9 +370,15 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
 }
 
 /// Write a frame into the window's slot, stamping the next monotonic `seq` so
-/// the window prepares only new content. Returns false if the slot lock is
+/// the window prepares only new content, and wake the window's event loop to
+/// come and read it. Returns false if the slot lock is
 /// poisoned (a panicked window thread — the window is gone, drop the publish).
 /// Bound so the inner guard drops before the caller's outer `window` guard.
+///
+/// The wake is after the store and outside the slot lock: the loop wakes to a
+/// frame that is already there, and it never blocks on a lock this thread is
+/// still holding. A wake that does not land is not a lost frame — the window's
+/// backstop still runs — which is why nothing here checks that it did.
 #[cfg(feature = "host-window")]
 fn window_write_frame(
     link: &mut WindowLink,
@@ -369,13 +395,17 @@ fn window_write_frame(
         bgra,
         resident,
     });
-    match link.frames.lock() {
+    let stored = match link.frames.lock() {
         Ok(mut slot_frame) => {
             *slot_frame = Some(frame);
             true
         }
         Err(_) => false,
+    };
+    if stored {
+        link.wake.wake();
     }
+    stored
 }
 
 /// Stop the host-owned window during VM teardown. Sets the stop flag so the

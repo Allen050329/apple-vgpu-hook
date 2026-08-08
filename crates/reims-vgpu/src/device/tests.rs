@@ -84,6 +84,7 @@ fn drain_without_ops_is_ok() {
 #[cfg(all(feature = "host-window", target_os = "macos"))]
 #[test]
 fn window_publish_key_advances_for_in_place_present() {
+    use super::window_publish::window_frame_key;
     let mut state = crate::model::DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_ARM64E);
     state.present.frame_mapping = 7;
     state.present.frame_generation = 11;
