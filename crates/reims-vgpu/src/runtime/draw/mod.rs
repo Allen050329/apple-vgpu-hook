@@ -1305,9 +1305,20 @@ fn resolve_buffer_backing<M: HostMemory>(
     }
 }
 
-/// CPU staging read of a pre-resolved buffer backing at `offset`. Reads guest
-/// RAM directly (reflects guest CPU writes), no host-store flush — the CPU path
-/// has always read the pages as-is (the zero-copy rail owns the flush).
+/// CPU staging read of a pre-resolved buffer backing at `offset`.
+///
+/// The one place a buffer's guest bytes are read with this thread, and so the
+/// one place the settle belongs. It used to say "no host-store flush — the CPU
+/// path has always read the pages as-is (the zero-copy rail owns the flush)",
+/// and that stopped being true when the render Store began writing guest pages
+/// through the GPU without waiting: a buffer-backed sampled texture
+/// ([`load_buffer_texture_rgba`]) whose bytes a Store had just written read the
+/// pre-Store frame. The rail above it settled at a fork two calls up
+/// ([`seed_color_load`]) and the other three callers settled nowhere.
+///
+/// Narrowed on the buffer's own span, so the vertex and index reads that reach
+/// here — none of which a render Store ever writes — do not start paying for a
+/// wait they never owed.
 fn read_buffer_bytes_resolved<M: HostMemory>(
     state: &DeviceState,
     host: &M,
@@ -1324,6 +1335,17 @@ fn read_buffer_bytes_resolved<M: HostMemory>(
     }
     let avail = size - offset;
     let want = host_alloc_len(avail).filter(|&n| n > 0)?;
+    let (read_gva, read_span) = (gva + offset, want as u64);
+    let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
+    crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
+        crate::runtime::render_writeback::SettleSite::BufferGuestRead,
+        || {
+            let pages = reims_vgpu_paging::span::pages_spanned(read_gva, read_span, page_size);
+            let gpas =
+                gva_mem::task_gva_page_gpas(host, tasks, task_id, read_gva, read_span, page_shift);
+            (gpas.len() as u64 == pages).then_some(gpas)
+        },
+    );
     let mut buf = vec![0u8; want];
     // Use device page_shift (x86=12); unshifted helper defaults to arm14 and fails.
     if gva_mem::read_task_gva_by_id(
@@ -4745,21 +4767,18 @@ fn seed_color_load<M: HostMemory + HostOps>(
     }
     // Type-2/3 (or type-8 base) linear GVA → convert to RGBA8.
     //
-    // The settle belongs here and not at the head of this function. Everything
-    // above serves the seed out of a host-side cache or answers from device
-    // state — `gva_backing_state` walks the guest's page tables and reads no
-    // pixel byte — so hoisting it made every cache hit block on a writeback it
-    // would never read. Measured at 5 023 waits and **2.63 s** on a driven
-    // Safari-drag boot, against `load_seed_color_from_gva` firing three times in
-    // the same class of boot: nearly all of it was the cache-hit path paying for
-    // this one.
+    // No settle at this fork. It used to sit at the head of this function, above
+    // every host-cache lookup, and blocked 5 023 times for 2.63 s on a driven
+    // Safari-drag boot serving seeds that never touched guest memory. Moving it
+    // here narrowed it to the branch that reads, and then the branch turned out
+    // to be three leaves that each know their own span while this fork knows
+    // none: a settle here has to assume the whole of guest RAM.
     //
-    // Below, guest pixel bytes really are read — `load_buffer_texture_rgba`
-    // reads a buffer-backed texture's GVA span directly, and it takes no settle
-    // of its own — so the wait is owed from this line down.
-    crate::runtime::render_writeback::settle_guest_writes(
-        crate::runtime::render_writeback::SettleSite::SeedColorLoad,
-    );
+    // So each leaf under `load_sampled_rgba_static` owns it, narrowed on what it
+    // actually reads — `read_buffer_bytes_resolved` on the buffer's span,
+    // `scanout::paint_mapping` behind `load_type11_mapping_rgba`, and
+    // `draw::texture_view::load_linear_texture_impl` for the linear arm. The
+    // buffer leaf had no settle at all before that, on any of its four callers.
     let rgba = load_sampled_rgba_static(state, host, task_id, texture_ref)?;
     Some(rgba)
 }

@@ -137,9 +137,10 @@ settle_sites! {
     /// `draw::vulkan::mapping_window_guest_runs` — resolving a type-11 gather
     /// window over a mapping's pages.
     Type11GatherWindow => "settle_type11_gather_window",
-    /// `draw::seed_color_load` — reading a render target's guest pages to seed
-    /// an attachment that will be loaded rather than cleared.
-    SeedColorLoad => "settle_seed_color_load",
+    /// `draw::read_buffer_bytes_resolved` — the one CPU read of a buffer's
+    /// guest bytes, reached by buffer-backed sampled textures, the indirect
+    /// command buffer decode and the CPU buffer fallback.
+    BufferGuestRead => "settle_buffer_guest_read",
     /// `compute_exec::stage_texture_raw` — staging a compute texture's guest
     /// bytes.
     ComputeStageTexture => "settle_compute_stage_texture",

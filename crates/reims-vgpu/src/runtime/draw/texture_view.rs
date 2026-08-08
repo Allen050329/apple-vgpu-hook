@@ -670,9 +670,20 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     }
     // Deferred-writeback flush-on-access: the reads below walk raw task GVAs
     // and bypass the mapping-keyed hooks — land any resident-authoritative
-    // window whose physical pages alias the sampled span first.
-    crate::runtime::render_writeback::settle_guest_writes(
+    // window whose physical pages alias the sampled span first, and only then.
+    //
+    // Narrowed on this read's own pages, as `load_linear_guest_memoized` is: the
+    // walk runs only when something is outstanding, and the pages read are the
+    // ones `read_span` names — not `bpr * h`, so a padded source does not claim
+    // the trailing padding it never touches.
+    let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
+    crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
         crate::runtime::render_writeback::SettleSite::LinearTextureLoad,
+        || {
+            let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
+            let gpas = gva_mem::task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift);
+            (gpas.len() as u64 == want).then_some(gpas)
+        },
     );
     // Tight display textures are the common compositor source. Read the whole
     // image with one task-root/cache lifetime: the row loop below otherwise
