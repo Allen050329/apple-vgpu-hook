@@ -18,6 +18,39 @@
 //! ever fully covered a live window. A ratio pinned at 1.0 by the workload is
 //! not coalescing; it is the statement that none was available.
 //!
+//! # There is repetition, and the 1.0 above does not rule it out
+//!
+//! A later census counted how many *distinct* surfaces a run of Stores names.
+//! Sampling the surface rail in fixed batches of 1 024 Stores over a driven
+//! Safari drag, each batch touched about **six** distinct mapping ids. Against
+//! ~1 560 Stores a second and 78 displayed frames, that is roughly **three
+//! full-target Stores into each surface per frame the user sees**.
+//!
+//! Set beside the arms-equals-lands reading, those two do not conflict, and the
+//! difference between them is what a future attempt has to be careful about.
+//! "No later Store fully covered a **live window**" is a statement about
+//! windows, and a window that is landed promptly is rarely alive when the next
+//! Store arrives — so a ratio of 1.0 can mean the windows were short rather
+//! than that the Stores were unique. It is not evidence that the third Store
+//! into a surface was carrying different pixels from the second.
+//!
+//! What it is *not* is a licence to elide. A repeated Store is redundant only if
+//! nothing read those guest pages in between, and that is the part neither
+//! census measured: the guest CPU may read them with no device operation, and
+//! `pass_scissor_union_full` at 99.92 % says only that each pass covered its own
+//! target, not that no one looked at the previous one. Anything built here needs
+//! the reader question answered first, and the hazards this module's own list
+//! below records — resident drift, pin leaks, page recycling, write ordering
+//! against the guest's own claim — all return with any window that outlives its
+//! Store.
+//!
+//! It matters because this rail is the device's largest single cost. Removing
+//! only its copy commands, with every barrier, flush and stamp left in place,
+//! took a driven drag from 76 Hz to 104 Hz and collapsed `slot_us` by a factor
+//! of 62 — see `backend::vulkan::engine::context`'s `dedicated_transfer_family`,
+//! which also records the other way to spend that finding: the host has a copy
+//! engine and this device submits every byte to the graphics queue instead.
+//!
 //! What the rail did buy is real and is kept: the Store does not read the frame
 //! back off the GPU. [`crate::runtime::mapping_write::write_bgra8_from_resident_gpu`]
 //! makes the guest's own pages the destination of the copy the GPU was going to
