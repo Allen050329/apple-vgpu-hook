@@ -1023,7 +1023,7 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
         ReadbackPhase::Resolve,
         resolve_started.elapsed().as_micros() as u64,
     );
-    crate::backend::vulkan::engine::copy_target_to_guest_pages(identity, &target)
+    crate::backend::vulkan::engine::copy_target_to_guest_pages(identity, &target, &gpas)
         .map_err(|inner| GpuWritebackDecline::Engine { inner })?;
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);

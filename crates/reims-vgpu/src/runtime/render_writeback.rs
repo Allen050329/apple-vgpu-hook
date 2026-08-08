@@ -105,6 +105,24 @@ macro_rules! settle_sites {
             pub fn route_us(self) -> &'static str {
                 match self { $(Self::$variant => concat!($slug, "_us"),)* }
             }
+
+            /// Waits [`settle_guest_writes_unless_disjoint`] skipped here
+            /// because nothing outstanding lands in what this site reads.
+            pub fn route_disjoint(self) -> &'static str {
+                match self { $(Self::$variant => concat!($slug, "_disjoint"),)* }
+            }
+
+            /// Waits genuinely owed: the outstanding writeback lands in a page
+            /// this site is about to read.
+            pub fn route_overlap(self) -> &'static str {
+                match self { $(Self::$variant => concat!($slug, "_overlap"),)* }
+            }
+
+            /// Waits taken because nothing could be ruled out — this site could
+            /// not name its pages, or more than one writeback was outstanding.
+            pub fn route_unnamed(self) -> &'static str {
+                match self { $(Self::$variant => concat!($slug, "_unnamed"),)* }
+            }
         }
     };
 }
@@ -190,6 +208,58 @@ pub fn settle_guest_writes(site: SettleSite) {
     }
     #[cfg(not(feature = "backend-vulkan"))]
     let _ = site;
+}
+
+/// [`settle_guest_writes`], skipped when the outstanding writeback lands nowhere
+/// near what this caller is about to read.
+///
+/// A writeback lands in one surface's pages. Most readers that block on it are
+/// reading somewhere else entirely — a glyph atlas, a small linear texture — and
+/// the wait they take is for a write that will never touch a byte they read. A
+/// driven Safari-drag boot spent 11.5 s in one such reader.
+///
+/// `pages` is resolved by the closure and the closure runs **only** when
+/// something is outstanding, so a caller may put a page-table walk in it: the
+/// common answer is the debt flag being clear, and that costs one atomic load
+/// exactly as [`settle_guest_writes`] does. It must return every page the caller
+/// is about to read, and `None` for "cannot say" — a short list would license a
+/// read of pages it had omitted, which is a stale frame.
+///
+/// Three outcomes, counted apart because they want different fixes:
+/// `<site>_disjoint` is the wait this saved, `<site>_overlap` is a wait that was
+/// genuinely owed, and `<site>_unnamed` is one taken because nothing could be
+/// ruled out — a caller whose walk failed, or a second outstanding writeback
+/// (`gwdebt_unnamed`).
+pub fn settle_guest_writes_unless_disjoint(
+    site: SettleSite,
+    pages: impl FnOnce() -> Option<Vec<u64>>,
+) {
+    #[cfg(feature = "backend-vulkan")]
+    {
+        if !crate::backend::vulkan::engine::guest_writes_outstanding() {
+            return;
+        }
+        use crate::backend::vulkan::engine::GuestWriteReach as Reach;
+        let reach = match pages() {
+            Some(p) => crate::backend::vulkan::engine::guest_writes_reaching(&p),
+            // The caller could not name its own window, which is the same
+            // undecidable as the ledger failing to name the writeback's.
+            None => Reach::Unnamed,
+        };
+        crate::runtime::drain::note_store_route(match reach {
+            Reach::Disjoint => site.route_disjoint(),
+            Reach::Overlap => site.route_overlap(),
+            Reach::Unnamed => site.route_unnamed(),
+        });
+        if reach == Reach::Disjoint {
+            return;
+        }
+        settle_guest_writes(site);
+    }
+    #[cfg(not(feature = "backend-vulkan"))]
+    {
+        let _ = (site, pages);
+    }
 }
 
 /// Release the engine residents of linear cache entries whose task or object
@@ -583,7 +653,7 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     // bump costs a re-read of bytes that did not change, and the opposite error
     // hands out a stale copy.
     state.note_host_wrote_pages(gpas.to_vec());
-    crate::backend::vulkan::engine::copy_target_to_guest_pages(identity, &target)
+    crate::backend::vulkan::engine::copy_target_to_guest_pages(identity, &target, gpas)
         .map_err(|inner| GvaWritebackDecline::Engine { inner })?;
     // Nothing here leaves a host copy of the frame, so neither GVA-keyed cache
     // may go on naming one.

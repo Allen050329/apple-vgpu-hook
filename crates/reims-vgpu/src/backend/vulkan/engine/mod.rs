@@ -578,6 +578,150 @@ pub fn flush_batched_draws() {
 /// was outstanding.
 static GUEST_WRITE_DEBT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Which guest pages the outstanding writeback lands in, when it can be said.
+///
+/// [`GUEST_WRITE_DEBT`] answers "is anything outstanding", and every caller that
+/// reads guest bytes then blocks on the answer. But a writeback lands in one
+/// surface's pages and most of the readers asking are reading somewhere else
+/// entirely — a glyph atlas, a small linear texture, a uniform staging window —
+/// so the wait they take is for a write that will never touch a byte they read.
+/// A driven Safari-drag boot spent **11.5 s** in one such reader
+/// ([`crate::runtime::render_writeback::SettleSite::LinearMemoRead`]) alone.
+///
+/// This names the pages so a disjoint reader can be let through. The currency is
+/// the guest page address, because it is the only one the two sides share: the
+/// writer knows its destination as a page list from a walk, the reader knows its
+/// window as a task GVA it can walk to the same list, and
+/// [`GuestPageTarget::runs`] carries neither — a [`GuestRef`] deliberately does
+/// not expose an absolute position.
+///
+/// [`GuestRef`]: crate::runtime::guest_ram_map::GuestRef
+///
+/// # How many writebacks are named, and what happens past that
+///
+/// One destination's page list per armed-and-unsettled writeback, up to
+/// [`RING_DEPTH`] of them. The bound is the submission ring's, because that is
+/// what bounds writebacks in flight: a ninth submission blocks in `begin_entry`
+/// on the oldest fence rather than being recorded. Between the ring retiring and
+/// a settle clearing this the two can drift, so overflow is real and is handled
+/// by giving up naming entirely — [`GuestWriteFootprint::unnamed`] — after which
+/// every reader waits, exactly as it did before this existed. **Never by
+/// dropping an entry**: a footprint missing a page it holds would answer
+/// "disjoint" for a page a copy is landing in, which is a stale frame served as
+/// fresh.
+///
+/// A single-entry version of this measured `gwdebt_unnamed` **14 125** against
+/// 16 626 arms on a driven Safari-drag boot, so 85 % of arms found one already
+/// outstanding and gave up. Holding the ring's worth is what makes the naming
+/// usable rather than nominal.
+///
+/// # Ordering
+///
+/// Armed under the engine lock immediately before [`GUEST_WRITE_DEBT`] is
+/// published, and cleared under the same lock immediately after it is cleared,
+/// so a reader that observes the flag set observes a footprint that already
+/// names the write, and a reader that observes it clear needs nothing. Readers
+/// take only this mutex and never the engine lock — taking that at every guest
+/// read is the cost the flag exists to avoid.
+static GUEST_WRITE_PAGES: std::sync::Mutex<GuestWriteFootprint> =
+    std::sync::Mutex::new(GuestWriteFootprint {
+        armed: Vec::new(),
+        unnamed: false,
+    });
+
+/// The page lists behind [`GUEST_WRITE_PAGES`].
+struct GuestWriteFootprint {
+    /// One entry per outstanding writeback, each ascending and deduplicated.
+    /// Sorted at arm time — armed thousands of times a boot and asked tens of
+    /// thousands, so the ordering is paid on the rarer side and every ask is a
+    /// binary search.
+    ///
+    /// Kept as separate lists rather than merged into one, so a settle could
+    /// retire them individually later without re-deriving which page belonged to
+    /// which copy. Never longer than [`RING_DEPTH`].
+    armed: Vec<Vec<u64>>,
+    /// Set when a writeback armed that could not be recorded, so `armed` no
+    /// longer covers everything outstanding and nothing may be ruled out.
+    unnamed: bool,
+}
+
+/// What the ledger can say about a reader's window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GuestWriteReach {
+    /// Nothing outstanding lands in any of the pages asked about. The caller may
+    /// read them without settling.
+    Disjoint,
+    /// An outstanding writeback lands in one of them.
+    Overlap,
+    /// The ledger cannot say, so the caller must settle. Distinguished from
+    /// [`Self::Overlap`] because the two want opposite fixes: an overlap is a
+    /// wait genuinely owed and this is precision the ledger failed to keep.
+    Unnamed,
+}
+
+/// Record the guest pages a writeback about to be submitted will land in.
+///
+/// Called under the engine lock, beside the [`GUEST_WRITE_DEBT`] publish.
+fn arm_guest_write_pages(pages: &[u64]) {
+    let Ok(mut f) = GUEST_WRITE_PAGES.lock() else {
+        return;
+    };
+    if f.unnamed {
+        return;
+    }
+    if f.armed.len() >= pools::RING_DEPTH {
+        f.unnamed = true;
+        f.armed.clear();
+        f.armed.shrink_to_fit();
+        crate::runtime::drain::note_store_route("gwdebt_unnamed");
+        return;
+    }
+    let mut sorted = pages.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    f.armed.push(sorted);
+}
+
+/// Forget the outstanding writebacks' pages. Called under the engine lock, after
+/// the wait has landed and [`GUEST_WRITE_DEBT`] is cleared.
+fn clear_guest_write_pages() {
+    if let Ok(mut f) = GUEST_WRITE_PAGES.lock() {
+        f.armed.clear();
+        f.unnamed = false;
+    }
+}
+
+/// What the ledger can say about `pages` — see [`GuestWriteReach`].
+///
+/// [`GuestWriteReach::Unnamed`] is the safe answer and is returned whenever this
+/// cannot say otherwise, including a poisoned lock. A [`GuestWriteReach::Disjoint`]
+/// licenses the caller to read those guest pages without settling.
+///
+/// `pages` need not be sorted; it is the reader's window and is usually a
+/// handful of entries against a whole frame's worth here.
+pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
+    let Ok(f) = GUEST_WRITE_PAGES.lock() else {
+        return GuestWriteReach::Unnamed;
+    };
+    if f.unnamed {
+        return GuestWriteReach::Unnamed;
+    }
+    if f.armed.is_empty() {
+        // The flag said something was outstanding and the ledger names nothing:
+        // the settle that cleared it raced this ask. Nothing to rule out
+        // against, so nothing may be ruled out.
+        return GuestWriteReach::Unnamed;
+    }
+    let hit = pages
+        .iter()
+        .any(|p| f.armed.iter().any(|a| a.binary_search(p).is_ok()));
+    if hit {
+        GuestWriteReach::Overlap
+    } else {
+        GuestWriteReach::Disjoint
+    }
+}
+
 /// Wait until every guest-page writeback this device has recorded has landed in
 /// guest RAM.
 ///
@@ -603,6 +747,7 @@ pub fn quiesce_guest_writes() {
     let Some(ctx) = owner.ctx.as_ref() else {
         // No device, so nothing can be in flight and nothing can settle it.
         GUEST_WRITE_DEBT.store(false, Ordering::Release);
+        clear_guest_write_pages();
         return;
     };
     if let Err(e) = unsafe { pools.quiesce_guest_writes(ctx, counters) } {
@@ -617,6 +762,9 @@ pub fn quiesce_guest_writes() {
     // the slot stays pending either way and the next claimant re-waits, so the
     // ordering survives without every later settle re-running a failing wait.
     GUEST_WRITE_DEBT.store(false, Ordering::Release);
+    // Under the same lock as the flag it accompanies, so no reader can see the
+    // flag set beside a footprint that has already been forgotten.
+    clear_guest_write_pages();
     // Reported as `ReadbackPhase::Fence` because it *is* that phase — the same
     // block on the same fences, moved. Its count is now settles rather than
     // windows, which is the whole of what this change did to the rail, so
@@ -2087,9 +2235,17 @@ impl GuestPageTarget {
 /// copying rail — except that a `VkCall` failure after the submit means the copy
 /// may have partly landed. That is the same exposure the copying rail carries
 /// for a partial scatter, and the caller reports it the same way.
+/// # `pages` is the ledger's currency, not the copy's
+///
+/// The copy is driven entirely by `dst`. `pages` is the same destination spelled
+/// as guest page addresses, which is the only spelling a later reader of those
+/// bytes can compare its own window against — see [`GUEST_WRITE_PAGES`]. Both
+/// callers walk it to build `dst.runs` and hand the walk's own output here, so
+/// the two cannot describe different memory.
 pub fn copy_target_to_guest_pages(
     identity: &TargetIdentity,
     dst: &GuestPageTarget,
+    pages: &[u64],
 ) -> Result<(), DrawError> {
     use host_ram::GuestWriteDecline;
     let mut guard = lock_engine();
@@ -2178,6 +2334,10 @@ pub fn copy_target_to_guest_pages(
     // the engine lock and a reclaim needs the same lock: nothing can take the
     // image while this function is running, only after it returns.
     pools.note_guest_write_recorded(identity);
+    // Before the flag and under the same lock: a reader that observes the flag
+    // set must observe a footprint that already names this write, or it would be
+    // told "disjoint" about pages this copy is landing in.
+    arm_guest_write_pages(pages);
     // Published after the ledger entry and while the engine lock is still held,
     // so no thread can observe the flag clear while a copy is outstanding.
     GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
@@ -2908,6 +3068,91 @@ mod group_by_buffer_tests {
         }
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].1.len(), 5);
+    }
+}
+
+#[cfg(test)]
+mod guest_write_footprint_tests {
+    use super::*;
+
+    /// The whole point: a reader whose window shares no page with the
+    /// outstanding writeback is let through, and one that shares a single page
+    /// is not. The wrong answer here is a stale frame, so the overlapping case
+    /// is asserted on a window that touches the footprint at exactly one page —
+    /// the case an envelope check or an off-by-one bound would wave past.
+    ///
+    /// Serialized against the rest of the suite by `--test-threads=1`, which the
+    /// global these exercise needs as much as the GPU tests do.
+    #[test]
+    fn a_disjoint_reader_is_let_through_and_a_touching_one_is_not() {
+        clear_guest_write_pages();
+        arm_guest_write_pages(&[0x4000, 0x9000, 0x2000]);
+        let reach = guest_writes_reaching;
+        assert_eq!(reach(&[0x1000, 0x3000, 0xa000]), GuestWriteReach::Disjoint);
+        assert_eq!(reach(&[0x1000, 0x9000]), GuestWriteReach::Overlap);
+        assert_eq!(reach(&[0x2000]), GuestWriteReach::Overlap);
+        // Unsorted input on both sides: the arm sorts, the ask does not have to.
+        assert_eq!(reach(&[0xf000, 0x4000, 0x1000]), GuestWriteReach::Overlap);
+        clear_guest_write_pages();
+    }
+
+    /// A second writeback is *also* named, up to the ring, and a page belonging
+    /// to any of them is an overlap. The single-entry version of this gave up
+    /// naming on 85 % of arms.
+    #[test]
+    fn every_writeback_up_to_the_ring_is_named_and_the_next_gives_up() {
+        clear_guest_write_pages();
+        for i in 0..pools::RING_DEPTH as u64 {
+            arm_guest_write_pages(&[0x1000 * (i + 1)]);
+        }
+        assert_eq!(guest_writes_reaching(&[0x1000]), GuestWriteReach::Overlap);
+        assert_eq!(
+            guest_writes_reaching(&[0x1000 * pools::RING_DEPTH as u64]),
+            GuestWriteReach::Overlap
+        );
+        assert_eq!(
+            guest_writes_reaching(&[0x1000 * (pools::RING_DEPTH as u64 + 2)]),
+            GuestWriteReach::Disjoint
+        );
+        // One past the ring: nothing may be ruled out, including a page none of
+        // them named. Dropping the overflowing entry instead would answer
+        // Disjoint for a page a copy is landing in.
+        arm_guest_write_pages(&[0xdead_0000]);
+        assert_eq!(
+            guest_writes_reaching(&[0x1000 * (pools::RING_DEPTH as u64 + 2)]),
+            GuestWriteReach::Unnamed
+        );
+        assert_eq!(guest_writes_reaching(&[0x1000]), GuestWriteReach::Unnamed);
+        clear_guest_write_pages();
+    }
+
+    /// A second writeback armed before the first settled means the footprint no
+    /// longer covers everything outstanding, and nothing may be ruled out — not
+    /// even a page neither of them named. Getting this backwards would serve the
+    /// second writeback's pages stale.
+    #[test]
+    fn a_settle_restores_naming_after_the_ledger_gave_up() {
+        clear_guest_write_pages();
+        for i in 0..=pools::RING_DEPTH as u64 {
+            arm_guest_write_pages(&[0x1000 * (i + 1)]);
+        }
+        assert_eq!(guest_writes_reaching(&[0x8000_0000]), GuestWriteReach::Unnamed);
+        // One loss of precision must not disable the rail for the rest of the
+        // boot: the settle that clears the debt clears this too.
+        clear_guest_write_pages();
+        arm_guest_write_pages(&[0x4000]);
+        assert_eq!(guest_writes_reaching(&[0x8000]), GuestWriteReach::Disjoint);
+        clear_guest_write_pages();
+    }
+
+    /// With nothing armed there is nothing to rule out *against*, and the safe
+    /// answer is to settle. Callers only ask when the debt flag is set, so this
+    /// state is a race the answer has to be conservative about rather than a
+    /// path worth optimising.
+    #[test]
+    fn an_unarmed_footprint_rules_nothing_out() {
+        clear_guest_write_pages();
+        assert_eq!(guest_writes_reaching(&[0x1000]), GuestWriteReach::Unnamed);
     }
 }
 

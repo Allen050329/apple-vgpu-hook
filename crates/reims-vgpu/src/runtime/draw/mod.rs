@@ -4597,11 +4597,6 @@ fn seed_color_load<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> Option<Vec<u8>> {
-    // The guest reads below may be served by pages a Store wrote through the
-    // GPU, whose copy is submitted and not waited on.
-    crate::runtime::render_writeback::settle_guest_writes(
-        crate::runtime::render_writeback::SettleSite::SeedColorLoad,
-    );
     // Discrete GPU: exact target GVA is the strongest identity across object-ref
     // recycling. Fall back to the type-2/3 texture namespace, never the
     // unrelated type-4 surface_id namespace. Guest memory is last.
@@ -4749,6 +4744,22 @@ fn seed_color_load<M: HostMemory + HostOps>(
         }
     }
     // Type-2/3 (or type-8 base) linear GVA → convert to RGBA8.
+    //
+    // The settle belongs here and not at the head of this function. Everything
+    // above serves the seed out of a host-side cache or answers from device
+    // state — `gva_backing_state` walks the guest's page tables and reads no
+    // pixel byte — so hoisting it made every cache hit block on a writeback it
+    // would never read. Measured at 5 023 waits and **2.63 s** on a driven
+    // Safari-drag boot, against `load_seed_color_from_gva` firing three times in
+    // the same class of boot: nearly all of it was the cache-hit path paying for
+    // this one.
+    //
+    // Below, guest pixel bytes really are read — `load_buffer_texture_rgba`
+    // reads a buffer-backed texture's GVA span directly, and it takes no settle
+    // of its own — so the wait is owed from this line down.
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::SeedColorLoad,
+    );
     let rgba = load_sampled_rgba_static(state, host, task_id, texture_ref)?;
     Some(rgba)
 }

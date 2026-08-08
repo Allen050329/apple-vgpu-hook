@@ -3127,10 +3127,28 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
         return None;
     }
-    // Same coherence rule as the general loader: land any resident-
-    // authoritative writeback aliasing the sampled span before reading it.
-    crate::runtime::render_writeback::settle_guest_writes(
+    // Same coherence rule as the general loader: land any resident-authoritative
+    // writeback *aliasing the sampled span* before reading it — and only then.
+    //
+    // This is the device's largest single wait, 11.5 s across a driven
+    // Safari-drag boot, and almost none of it was owed: a writeback lands in one
+    // surface's pages while this reader is usually somewhere else entirely. The
+    // walk below runs only when something is outstanding, so the binds that
+    // dominate this rail — the ones with a clear debt flag — still pay one
+    // atomic load.
+    //
+    // A short walk is `None` and settles. `pages_spanned` is the count the
+    // resolver would have produced with nothing dropped, and a dropped page is
+    // one this reader cannot rule out.
+    let (tasks, page_shift) = (&state.tasks, state.page_shift);
+    let page_size = state.page_size();
+    crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
         crate::runtime::render_writeback::SettleSite::LinearMemoRead,
+        || {
+            let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
+            let gpas = gva_mem::task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift);
+            (gpas.len() as u64 == want).then_some(gpas)
+        },
     );
     let mut scratch = std::mem::take(&mut state.guest_linear_scratch);
     scratch.resize(native_len, 0);

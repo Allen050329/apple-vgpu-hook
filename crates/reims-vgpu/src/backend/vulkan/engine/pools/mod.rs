@@ -513,7 +513,7 @@ struct CmdSlot {
 /// pooled staging live at once — bounded, pooled. `retire_wait` still ~17 µs, so
 /// a deeper ring or render-pass batching (only ~37 % of draws join a shared pass)
 /// may reclaim more.
-const RING_DEPTH: usize = 8;
+pub(crate) const RING_DEPTH: usize = 8;
 
 /// One bit per ring slot: the set of slots a deferred handle is still waiting
 /// on. Sized so the whole ring fits, which is what bounds the graveyard — a
