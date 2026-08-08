@@ -1296,7 +1296,7 @@ impl ResidentTargetSlot {
     /// The desktop workload creates no framebuffer-less resident at all: on a
     /// driven x86/Vulkan boot (Safari window drag, 2 892 posted events, ~37.5 Hz
     /// median present) the `vk_alloc_sites` census reads `mrt_secondary=0:0:0`,
-    /// and only [`ResourcePools::registry_ensure_color`] allocates under that
+    /// and only [`ResourcePools::registry_ensure_attachment`] allocates under that
     /// site. So every slot the drain and the recreate arms retired that boot had
     /// a real framebuffer, and all three disposal sites would have behaved
     /// identically with the check and without it.
@@ -2133,7 +2133,21 @@ pub(crate) enum AllocSite {
     /// boot: `mrt_draw_single=24579` with no `secondary_mrt_drop` at all — the
     /// guest never asked for MRT, rather than asking and being degraded.
     MrtSecondary,
+    /// A depth buffer allocated for one draw and destroyed after it, because
+    /// the pass named no guest depth texture to key a resident on. See
+    /// [`AllocSite::DepthResident`] for the rail that owns the identified case;
+    /// this one should read near zero, and a rising count means guests are
+    /// binding depth state without a depth attachment.
     TransientDepth,
+    /// A depth buffer held in the registry under the guest texture the pass
+    /// bound, for as long as the guest keeps that texture.
+    ///
+    /// Split from [`AllocSite::TransientDepth`] rather than replacing it because
+    /// the two answer different questions and a boot series spanning the change
+    /// has to stay readable: this counts allocations that amortise over a
+    /// texture's life, that one counts allocations that do not amortise at all.
+    /// Summing them would hide exactly the ratio the split exists to show.
+    DepthResident,
     /// A HOST_VISIBLE upload block, not one staging buffer.
     ///
     /// Every staging bind is a sub-allocation out of one of these
@@ -2158,7 +2172,7 @@ pub(crate) enum AllocSite {
     GuestGatherBlock,
 }
 
-const ALLOC_SITE_N: usize = 9;
+const ALLOC_SITE_N: usize = 10;
 
 impl AllocSite {
     const fn idx(self) -> usize {
@@ -2166,12 +2180,13 @@ impl AllocSite {
             AllocSite::StorageImage => 0,
             AllocSite::MrtSecondary => 1,
             AllocSite::TransientDepth => 2,
-            AllocSite::StagingBlock => 3,
-            AllocSite::Readback => 4,
-            AllocSite::ReadbackMulti => 5,
-            AllocSite::SlabBlock => 6,
-            AllocSite::GuestScratch => 7,
-            AllocSite::GuestGatherBlock => 8,
+            AllocSite::DepthResident => 3,
+            AllocSite::StagingBlock => 4,
+            AllocSite::Readback => 5,
+            AllocSite::ReadbackMulti => 6,
+            AllocSite::SlabBlock => 7,
+            AllocSite::GuestScratch => 8,
+            AllocSite::GuestGatherBlock => 9,
         }
     }
 }
@@ -2180,6 +2195,7 @@ const ALLOC_SITE_NAMES: [&str; ALLOC_SITE_N] = [
     "storage_image",
     "mrt_secondary",
     "transient_depth",
+    "depth_resident",
     "staging_block",
     "readback",
     "readback_multi",

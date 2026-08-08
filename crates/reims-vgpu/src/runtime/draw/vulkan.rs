@@ -6408,6 +6408,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 None
                             };
                             resources.depth = Some(crate::backend::vulkan::engine::DepthState {
+                                identity: depth_chain_identity(req, stencil.is_some()),
                                 test_enable: true,
                                 write_enable: ds.depth_write_enabled,
                                 compare,
@@ -6696,6 +6697,52 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
 /// type-2/3 targets use the GVA identity below. Unlike deferred writeback, this
 /// lifetime is safe on portability-subset devices because the final record
 /// materializes guest bytes before the packet completes.
+/// The registry resident this draw's **depth** attachment renders into, if the
+/// guest's pass descriptor named a depth texture.
+///
+/// The depth buffer is a guest resource with a guest lifetime. A pass descriptor
+/// binds `MTLRenderPassDepthAttachment.texture`, this device decodes its ref, and
+/// that ref is the identity — so one resident exists per guest depth texture and
+/// survives for as long as the guest keeps the texture, instead of being
+/// allocated and destroyed inside one draw.
+///
+/// # Why the generation is zero
+///
+/// Every other identity carries a generation because its resident holds content
+/// that must not survive the guest reusing the key — a surface's
+/// `map_generation` is the worked example. A depth resident in this rail holds
+/// no such content: the pass always CLEARs it (`DepthState::load` is `false`
+/// here), so the pixels a recreated texture would inherit are overwritten before
+/// anything reads them. Geometry and format changes still recreate the image,
+/// through `ResidentTargetSlot::reusable_for`.
+///
+/// **That argument is exactly as strong as the CLEAR, and no stronger.** Wiring
+/// depth LOAD — which is what `depth_load_unsupported_transient` asks for —
+/// makes the contents load-bearing and needs a real per-texture generation
+/// first, or a guest that deletes and re-creates a ref at the same geometry
+/// inherits a stranger's depth.
+pub(super) fn depth_chain_identity(
+    req: &DrawEncodeRequest,
+    with_stencil: bool,
+) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
+    let depth = req.depth_attach.as_ref()?;
+    if depth.texture_ref == 0 {
+        return None;
+    }
+    let c0 = req.colors.first()?;
+    let (width, height) = (c0.width, c0.height);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(crate::backend::vulkan::engine::TargetIdentity::Texture {
+        ref_: depth.texture_ref,
+        width,
+        height,
+        generation: 0,
+        stencil: with_stencil,
+    })
+}
+
 pub(super) fn render_chain_identity(
     state: &DeviceState,
     req: &DrawEncodeRequest,

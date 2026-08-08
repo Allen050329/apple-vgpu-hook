@@ -1136,14 +1136,24 @@ impl ResourcePools {
         Ok(self.registry.get(&identity).unwrap())
     }
 
-    /// Ensure a resident color attachment of an arbitrary Vulkan format (MRT
-    /// secondary path — the primary single-RT `registry_ensure` only speaks
-    /// `bgra`). No per-slot framebuffer is built: a secondary attachment is
-    /// only ever bound as attachment N of an ad-hoc MRT framebuffer or sampled
-    /// via its view, never as a standalone single-RT target. Reuse requires an
-    /// exact (geometry, generation, format) match. Returns (image, view).
+    /// Ensure a resident attachment of an arbitrary Vulkan format — an MRT
+    /// secondary colour target, or a depth-stencil buffer.
+    ///
+    /// The primary single-RT [`Self::registry_ensure`] only speaks `bgra` and
+    /// owns a framebuffer; this one builds none, because its residents are only
+    /// ever attachment N of an ad-hoc framebuffer or sampled through the view,
+    /// never a standalone single-RT target. Reuse requires an exact (geometry,
+    /// generation, format) match. Returns (image, view).
+    ///
+    /// **Colour and depth share this body rather than having one each.** The two
+    /// differ only in image usage and view aspect, and both of those are
+    /// functions of the format — see
+    /// [`crate::backend::vulkan::engine::registry_target_usage`]. A second copy
+    /// specialised for depth would be a copied arm over one wire form, which is
+    /// how the recycle bucket's usage invariant would drift out of step with the
+    /// creation site that has to honour it.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) unsafe fn registry_ensure_color(
+    pub(crate) unsafe fn registry_ensure_attachment(
         &mut self,
         ctx: &DeviceContext,
         identity: TargetIdentity,
@@ -1165,17 +1175,15 @@ impl ResourcePools {
         }
         // Census only, as in the primary `registry_ensure`.
         self.note_registry_reach();
-        let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
-            | vk::ImageUsageFlags::INPUT_ATTACHMENT
-            | vk::ImageUsageFlags::TRANSFER_SRC
-            | vk::ImageUsageFlags::TRANSFER_DST
-            | vk::ImageUsageFlags::SAMPLED;
+        let usage = super::super::registry_target_usage(format);
         // Reuse a recycled image+memory+view of identical (geometry, format)
         // before allocating — same recycle discipline as the primary
-        // `registry_ensure` (the usage set is identical, so images cross-flow
-        // between the two paths by geometry+format). Skips the create/alloc/bind/
-        // view + their note_create/note_alloc; recycled contents are stale, so
-        // the slot below is inserted layout=UNDEFINED / content_ready=false.
+        // `registry_ensure`. Usage is a function of the format
+        // (`registry_target_usage`), so images cross-flow between these paths by
+        // geometry+format without a bucket ever mixing usages. Skips the
+        // create/alloc/bind/view + their note_create/note_alloc; recycled
+        // contents are stale, so the slot below is inserted layout=UNDEFINED /
+        // content_ready=false.
         let (image, memory, view) = if let Some(free) = self.take_free_target(width, height, format)
         {
             (free.image, free.memory, free.view)
@@ -1217,7 +1225,11 @@ impl ResourcePools {
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(ireq.size)
                     .memory_type_index(imt),
-                AllocSite::MrtSecondary,
+                if super::super::format_is_depth(format) {
+                    AllocSite::DepthResident
+                } else {
+                    AllocSite::MrtSecondary
+                },
             )
             .map_err(|e| {
                 ctx.device.destroy_image(image, None);
@@ -1238,7 +1250,7 @@ impl ResourcePools {
                         .image(image)
                         .view_type(vk::ImageViewType::TYPE_2D)
                         .format(format)
-                        .subresource_range(color_subresource_range()),
+                        .subresource_range(super::super::registry_subresource_range(format)),
                     None,
                 )
                 .map_err(|e| {
@@ -1309,6 +1321,58 @@ impl ResourcePools {
     /// is the number that would say a future workload changed this; until it is
     /// nonzero there is nothing here to recycle.
     ///
+    /// The depth resident the guest's bound depth texture names, created on
+    /// first use and held until the guest stops touching it.
+    ///
+    /// This is the rail that replaced a per-draw allocation. A depth buffer is a
+    /// guest resource: the pass descriptor binds one, so it has an identity and
+    /// a lifetime, and the device's job is to resolve it rather than to
+    /// manufacture a private one per draw and throw it away. Under a drag the
+    /// guest re-binds the same texture every frame, the registry touches it every
+    /// frame, and the idle reclaim — which fires on age, not on population —
+    /// never reaches it. Steady state is therefore zero allocations for any
+    /// amount of traffic, which a pool keyed by geometry could not promise: that
+    /// would have a hit rate, and hit rates fall off when a second window with a
+    /// different size appears.
+    ///
+    /// Contents are *not* preserved by this: the pass still CLEARs, and
+    /// `DepthState::load` is still false. What became persistent is the
+    /// allocation, not the pixels. See
+    /// [`crate::runtime::draw::vulkan::depth_chain_identity`] for why that
+    /// distinction is what lets the identity carry generation zero.
+    pub(crate) unsafe fn registry_ensure_depth(
+        &mut self,
+        ctx: &DeviceContext,
+        identity: TargetIdentity,
+        width: u32,
+        height: u32,
+        with_stencil: bool,
+        counters: &EngineCounters,
+    ) -> Result<(vk::Image, vk::ImageView), DrawError> {
+        let format = Self::depth_format(ctx, with_stencil);
+        self.registry_ensure_attachment(ctx, identity, width, height, 0, format, counters)
+    }
+
+    /// The attachment format a depth buffer of this device is created with.
+    ///
+    /// Device-queried combined depth-stencil format when the bound state runs
+    /// the stencil test (D32_S8 preferred, D24_S8 fallback — see
+    /// `DeviceContext::depth_stencil_format`); plain D32_SFLOAT (no stencil
+    /// aspect) otherwise, which is spec-mandatory. Depth is 32-bit float in the
+    /// preferred case; the D24_S8 fallback is 24-bit UNORM depth, which the
+    /// stencil-test path tolerates (it asserts stencil, not depth bits).
+    ///
+    /// One function because the resident rail and the transient fallback must
+    /// pick the same format for the same draw — they feed the same render pass,
+    /// whose attachment format is fixed by `PassKey`.
+    fn depth_format(ctx: &DeviceContext, with_stencil: bool) -> vk::Format {
+        if with_stencil {
+            ctx.depth_stencil_format
+        } else {
+            translate::pixel::TRANSIENT_DEPTH_FORMAT
+        }
+    }
+
     pub(crate) unsafe fn create_transient_depth(
         &mut self,
         ctx: &DeviceContext,
@@ -1946,7 +2010,7 @@ impl ResourcePools {
     /// it.
     ///
     /// This site is safe for a reason that does not generalise: it runs inside
-    /// `registry_ensure_color`, at the one point in a draw where retiring a
+    /// `registry_ensure_attachment`, at the one point in a draw where retiring a
     /// resident has always been safe — before the caller holds anything and
     /// before any sampled source has been resolved. The retired slot cap ran
     /// here for the same reason.
@@ -2323,7 +2387,7 @@ pub(super) mod pin_count_tests {
     ///
     /// The two arms differ in exactly these two handles, so they are the
     /// parameters: `registry_ensure` passes a real framebuffer and the pass it
-    /// was built against, `registry_ensure_color` passes neither.
+    /// was built against, `registry_ensure_attachment` passes neither.
     fn new_resident(framebuffer: vk::Framebuffer, render_pass: vk::RenderPass) -> NewResident {
         NewResident {
             image: vk::Image::null(),

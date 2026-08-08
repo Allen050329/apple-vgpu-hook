@@ -724,7 +724,7 @@ impl ResourcePools {
     /// [`ResourcePools::reclaim_pools_for_allocation_retry`] is the half of the
     /// recovery that is safe there — a free-list entry is by construction one no
     /// command buffer holds. Retiring live residents is not safe here, and is
-    /// done only by `registry_ensure_color`, which calls the fuller
+    /// done only by `registry_ensure_attachment`, which calls the fuller
     /// [`ResourcePools::reclaim_for_allocation_retry`] itself; that function
     /// records the segfault which established the difference.
     pub(super) unsafe fn bind_image_slab(
@@ -811,7 +811,7 @@ impl ResourcePools {
     }
 
     /// Return a displaced resident-target image to `target_free` for reuse by a
-    /// later same-(geometry, format) `registry_ensure`/`registry_ensure_color`
+    /// later same-(geometry, format) `registry_ensure`/`registry_ensure_attachment`
     /// create. `None` means it was recycled; `Some(img)` means a cap was full and
     /// the caller must destroy it.
     fn try_recycle_target(&mut self, img: FreeTargetImage) -> Option<FreeTargetImage> {

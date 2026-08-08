@@ -230,12 +230,29 @@ pub enum DepthClipMode {
 }
 
 /// Per-draw depth-test state (Metal `MTLDepthStencilState` + depth attachment).
-/// When a `DrawRequest` carries `Some`, the engine attaches a transient
-/// D32_SFLOAT depth buffer to the pass and enables the depth test; `None` (the
-/// default) means no depth attachment at all — byte-identical to the pre-depth
-/// engine, which is the whole macOS 2D UI path (it binds no depth-stencil).
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// When a `DrawRequest` carries `Some`, the engine attaches a depth buffer to
+/// the pass and enables the depth test; `None` (the default) means no depth
+/// attachment at all — byte-identical to the pre-depth engine, which is the
+/// whole macOS 2D UI path (it binds no depth-stencil).
+#[derive(Clone, Debug, PartialEq)]
 pub struct DepthState {
+    /// The guest texture this depth attachment names, when the render pass
+    /// descriptor named one.
+    ///
+    /// The depth buffer is **the guest's resource**, not this device's scratch:
+    /// the guest allocated a depth texture and bound it, and
+    /// [`crate::runtime::decode::render::DepthAttachment::texture_ref`] is its
+    /// ref. Carrying it lets the engine resolve one resident per guest texture
+    /// out of the registry, which is what makes the depth allocation live as
+    /// long as the guest's texture does instead of as long as one draw.
+    ///
+    /// `None` is a draw that bound a non-trivial `MTLDepthStencilState` with no
+    /// depth attachment in its pass descriptor. There is no guest resource to
+    /// key on, so the engine falls back to a per-draw transient buffer. The two
+    /// rails are counted apart in the `vk_alloc_sites` census — `depth_resident`
+    /// against `transient_depth` — so the fallback's share is a reading rather
+    /// than an assumption.
+    pub identity: Option<TargetIdentity>,
     /// `false` disables the test (draw always passes) — used only when a bound
     /// depth-stencil is non-trivial in some *other* way (e.g. a write with
     /// compare Always); the plain trivial state never reaches here.
@@ -1326,6 +1343,18 @@ pub enum TargetIdentity {
         width: u32,
         height: u32,
         generation: u64,
+        /// Whether this resident carries a stencil aspect beside its depth one.
+        ///
+        /// **Part of the key because it selects the image's format**, and the
+        /// registry's reuse test compares formats: a depth texture drawn into
+        /// with the stencil test on and then off would otherwise retire and
+        /// recreate its resident on every alternation — one allocation per draw
+        /// again, and arrived at by a path that looks like reuse. The two are
+        /// genuinely different images, so they are two residents, each stable.
+        ///
+        /// Always `false` for a colour target, which is what every non-depth
+        /// constructor of this variant passes.
+        stencil: bool,
     },
     /// Guest-VA surface namespace.
     Gva {
@@ -1745,6 +1774,7 @@ mod tests {
                 width: 8,
                 height: 8,
                 generation: 0,
+                stencil: false,
             },
             TargetIdentity::Anonymous { slot: 0 },
         ] {

@@ -264,12 +264,14 @@ pub(super) fn identity_fields(identity: &TargetIdentity) -> Vec<(&'static str, S
             width,
             height,
             generation,
+            stencil,
         } => vec![
             ("identity_kind", "texture".into()),
             ("identity_ref", ref_.to_string()),
             ("identity_width", width.to_string()),
             ("identity_height", height.to_string()),
             ("identity_generation", generation.to_string()),
+            ("identity_stencil", u8::from(*stencil).to_string()),
         ],
         TargetIdentity::Gva {
             gva,
@@ -424,6 +426,7 @@ mod tests {
                     width: 80,
                     height: 60,
                     generation: 11,
+                    stencil: false,
                 },
                 "texture",
                 ("identity_ref", "8"),

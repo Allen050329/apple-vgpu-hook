@@ -1467,6 +1467,56 @@ fn draw_has_no_invocations(req: &DrawRequest) -> bool {
     element_count == 0 || req.instance_count == Some(0)
 }
 
+/// A depth image a single draw allocated for itself and must destroy after
+/// submit, because the pass named no guest texture to hold it under.
+///
+/// The registry-resident rail has no equivalent and wants none: its image is
+/// owned by the guest's texture, and a handle to dispose is exactly what must
+/// not exist for it.
+type OwnedDepthImage = (vk::Image, vk::DeviceMemory, vk::ImageView);
+
+/// This draw's depth attachment view, and the image behind it *only if this
+/// draw owns it*.
+///
+/// Two rails, and which one runs is decided by the guest rather than by this
+/// device:
+///
+/// * The pass descriptor bound a depth texture, so the buffer has a guest
+///   identity and a guest lifetime. It resolves to one registry resident per
+///   guest texture, created on first use and reclaimed by age like every other
+///   resident. Nothing is returned to dispose — the resident outlives the draw,
+///   which is the whole point.
+/// * The pass bound none, and there is no key to hold a resident under. A
+///   private buffer is allocated for this draw and handed back for disposal.
+///   `vk_alloc_sites transient_depth` is that rail's count and it is expected to
+///   be near zero; `depth_resident` is the other's.
+///
+/// The framebuffer is this draw's either way and is not this function's to make:
+/// it binds one specific `render_pass` alongside the colour view, and only the
+/// caller knows which.
+unsafe fn acquire_depth_view(
+    ctx: &super::context::DeviceContext,
+    pools: &mut super::pools::ResourcePools,
+    req: &DrawRequest,
+    counters: &EngineCounters,
+) -> Result<(vk::ImageView, Option<OwnedDepthImage>), DrawError> {
+    let with_stencil = req.depth.as_ref().and_then(|d| d.stencil).is_some();
+    if let Some(identity) = req.depth.as_ref().and_then(|d| d.identity.clone()) {
+        let (_image, view) = pools.registry_ensure_depth(
+            ctx,
+            identity,
+            req.width,
+            req.height,
+            with_stencil,
+            counters,
+        )?;
+        return Ok((view, None));
+    }
+    let (dimg, dmem, dview) =
+        pools.create_transient_depth(ctx, req.width, req.height, with_stencil, counters)?;
+    Ok((dview, Some((dimg, dmem, dview))))
+}
+
 pub(crate) unsafe fn execute_draw_inner(
     owner: &mut ContextOwner,
     caches: &mut ObjectCaches,
@@ -1844,14 +1894,16 @@ pub(crate) unsafe fn execute_draw_inner(
         front_face_ccw: req.front_face_ccw,
         fill_mode: req.fill_mode,
         depth_clip: req.depth_clip,
-        depth_test: req.depth.map(|d| d.test_enable).unwrap_or(false),
-        depth_write: req.depth.map(|d| d.write_enable).unwrap_or(false),
+        depth_test: req.depth.as_ref().map(|d| d.test_enable).unwrap_or(false),
+        depth_write: req.depth.as_ref().map(|d| d.write_enable).unwrap_or(false),
         depth_compare: req
             .depth
+            .as_ref()
             .map(|d| d.compare)
             .unwrap_or(super::types::SamplerCompareFunction::Always),
         stencil: req
             .depth
+            .as_ref()
             .and_then(|d| d.stencil)
             .map(|s| super::caches::StencilKey {
                 front: s.front,
@@ -2053,11 +2105,12 @@ pub(crate) unsafe fn execute_draw_inner(
         super::pools::ResidentAccess,
     )> =
         Vec::new();
-    // Transient depth attachment (image, memory, view, ad-hoc framebuffer) —
-    // owned for exactly this draw, disposed deferred after submit. `None` on the
-    // 2D path so nothing changes there.
-    let mut transient_depth: Option<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Framebuffer)> =
-        None;
+    // This draw's depth attachment, when it has one. The framebuffer is always
+    // this draw's own and is always disposed after submit; the image behind it
+    // is only owned here when the pass named no guest depth texture to key a
+    // resident on — see `acquire_depth_view`. `None` on the 2D path so nothing
+    // changes there.
+    let mut transient_depth: Option<(Option<OwnedDepthImage>, vk::Framebuffer)> = None;
     // Mark everything this draw is about to read *before* resolving its own
     // target, so a reclaim between here and `prepare_sampled` cannot take one
     // of this draw's own sampled sources.
@@ -2112,7 +2165,7 @@ pub(crate) unsafe fn execute_draw_inner(
                         .registry_get(&sec.identity)
                         .map(|s| s.access)
                         .unwrap_or(super::pools::ResidentAccess::Untouched);
-                    let (img, view) = pools.registry_ensure_color(
+                    let (img, view) = pools.registry_ensure_attachment(
                         ctx,
                         sec.identity.clone(),
                         sec.width,
@@ -2134,13 +2187,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 )?;
                 (primary_image, fb, primary_access, primary_view)
             } else if req.depth.is_some() {
-                let (dimg, dmem, dview) = pools.create_transient_depth(
-                    ctx,
-                    req.width,
-                    req.height,
-                    req.depth.and_then(|d| d.stencil).is_some(),
-                    counters,
-                )?;
+                let (dview, owned) = acquire_depth_view(ctx, pools, req, counters)?;
                 let fb = pools.create_mrt_framebuffer(
                     ctx,
                     render_pass,
@@ -2149,7 +2196,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     req.height,
                     counters,
                 )?;
-                transient_depth = Some((dimg, dmem, dview, fb));
+                transient_depth = Some((owned, fb));
                 (primary_image, fb, primary_access, primary_view)
             } else if req.color_input {
                 // Fetch pass carries an input reference → the slot's cached
@@ -2179,13 +2226,7 @@ pub(crate) unsafe fn execute_draw_inner(
             let t = pools.acquire_target(ctx, target_key, primary_pass, counters)?;
             let (pool_image, pool_view, pool_fb) = (t.image, t.view, t.framebuffer);
             if req.depth.is_some() {
-                let (dimg, dmem, dview) = pools.create_transient_depth(
-                    ctx,
-                    req.width,
-                    req.height,
-                    req.depth.and_then(|d| d.stencil).is_some(),
-                    counters,
-                )?;
+                let (dview, owned) = acquire_depth_view(ctx, pools, req, counters)?;
                 let fb = pools.create_mrt_framebuffer(
                     ctx,
                     render_pass,
@@ -2194,7 +2235,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     req.height,
                     counters,
                 )?;
-                transient_depth = Some((dimg, dmem, dview, fb));
+                transient_depth = Some((owned, fb));
                 (pool_image, fb, super::pools::ResidentAccess::Untouched, pool_view)
             } else if req.color_input {
                 let fb = pools.create_mrt_framebuffer(
@@ -3102,7 +3143,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // Dynamic stencil reference (Metal `setStencilFrontReferenceValue:back…`)
     // — only bound for stencil pipelines, which list STENCIL_REFERENCE as a
     // dynamic state; front/back set separately to honor Metal's split refs.
-    if let Some(s) = req.depth.and_then(|d| d.stencil) {
+    if let Some(s) = req.depth.as_ref().and_then(|d| d.stencil) {
         ctx.device
             .cmd_set_stencil_reference(cb, vk::StencilFaceFlags::FRONT, s.reference_front);
         ctx.device
@@ -3374,16 +3415,22 @@ pub(crate) unsafe fn execute_draw_inner(
             super::pools::DeferredHandle::Framebuffer(target_fb),
         );
     }
-    if let Some((dimg, dmem, dview, dfb)) = transient_depth {
+    if let Some((owned, dfb)) = transient_depth {
         pools.dispose(&ctx.device, super::pools::DeferredHandle::Framebuffer(dfb));
-        pools.dispose(
-            &ctx.device,
-            super::pools::DeferredHandle::Image {
-                image: dimg,
-                view: dview,
-                memory: dmem,
-            },
-        );
+        // Only the unidentified case owns its image. A resident one belongs to
+        // the registry and to the guest texture it is keyed on; disposing it
+        // here would put the rail straight back to one allocation per draw, with
+        // the added defect that the next draw would find a destroyed handle.
+        if let Some((dimg, dmem, dview)) = owned {
+            pools.dispose(
+                &ctx.device,
+                super::pools::DeferredHandle::Image {
+                    image: dimg,
+                    view: dview,
+                    memory: dmem,
+                },
+            );
+        }
     }
 
     // A draw with no pixel readback (resident target, skip_readback) hands
@@ -4125,6 +4172,9 @@ mod tests {
                 secondary_with_clear([0.0, 1.0, 0.0, 0.5]),
             ],
             depth: Some(super::super::types::DepthState {
+                // No guest depth texture: this synthetic request exercises the
+                // transient rail, which is the one that still owns its image.
+                identity: None,
                 test_enable: true,
                 write_enable: true,
                 compare: super::super::types::SamplerCompareFunction::Less,

@@ -88,6 +88,87 @@ pub(crate) fn color_subresource_range() -> ash::vk::ImageSubresourceRange {
     }
 }
 
+/// Whether a registry resident of this format is a depth(-stencil) attachment
+/// rather than a colour one.
+///
+/// The two depth formats this device ever creates are
+/// [`crate::backend::vulkan::translate::pixel::TRANSIENT_DEPTH_FORMAT`] and
+/// whichever combined format `DeviceContext::depth_stencil_format` selected, and
+/// that second one is device-queried — so this asks the format's own aspect
+/// rather than comparing against a list a third format would not be on.
+pub(crate) fn format_is_depth(format: ash::vk::Format) -> bool {
+    matches!(
+        format,
+        ash::vk::Format::D16_UNORM
+            | ash::vk::Format::X8_D24_UNORM_PACK32
+            | ash::vk::Format::D32_SFLOAT
+            | ash::vk::Format::D16_UNORM_S8_UINT
+            | ash::vk::Format::D24_UNORM_S8_UINT
+            | ash::vk::Format::D32_SFLOAT_S8_UINT
+    )
+}
+
+/// Whether a format carries a stencil aspect as well as depth.
+pub(crate) fn format_has_stencil(format: ash::vk::Format) -> bool {
+    matches!(
+        format,
+        ash::vk::Format::D16_UNORM_S8_UINT
+            | ash::vk::Format::D24_UNORM_S8_UINT
+            | ash::vk::Format::D32_SFLOAT_S8_UINT
+            | ash::vk::Format::S8_UINT
+    )
+}
+
+/// The subresource range a registry resident's view is created with, derived
+/// from its format. See [`registry_target_usage`] for why these are functions of
+/// the format rather than parameters beside it.
+pub(crate) fn registry_subresource_range(
+    format: ash::vk::Format,
+) -> ash::vk::ImageSubresourceRange {
+    if !format_is_depth(format) {
+        return color_subresource_range();
+    }
+    let mut aspect = ash::vk::ImageAspectFlags::DEPTH;
+    if format_has_stencil(format) {
+        aspect |= ash::vk::ImageAspectFlags::STENCIL;
+    }
+    ash::vk::ImageSubresourceRange {
+        aspect_mask: aspect,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    }
+}
+
+/// The usage set a registry resident's image is created with, derived from its
+/// format.
+///
+/// **A function of the format, deliberately, and not a parameter.** The recycle
+/// free-list buckets displaced images by `(geometry, format)` and hands one back
+/// to the next resident of that bucket, so a bucket whose members disagree about
+/// usage would eventually bind an image to an attachment it was not created for
+/// — invalid, and invalid in the quiet way, because the image is real and the
+/// geometry matches. Deriving usage here makes "same bucket implies same usage"
+/// true by construction, so a fourth creation site cannot get it wrong and
+/// nothing has to scan for one that did.
+pub(crate) fn registry_target_usage(format: ash::vk::Format) -> ash::vk::ImageUsageFlags {
+    if format_is_depth(format) {
+        // A depth resident is only ever attachment N of an ad-hoc framebuffer.
+        // No SAMPLED and no TRANSFER: nothing in this device reads a depth
+        // buffer back or copies one, and asking for usage the host need not
+        // support for a depth format would refuse the image on hosts that
+        // support the attachment alone.
+        ash::vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+    } else {
+        ash::vk::ImageUsageFlags::COLOR_ATTACHMENT
+            | ash::vk::ImageUsageFlags::INPUT_ATTACHMENT
+            | ash::vk::ImageUsageFlags::TRANSFER_SRC
+            | ash::vk::ImageUsageFlags::TRANSFER_DST
+            | ash::vk::ImageUsageFlags::SAMPLED
+    }
+}
+
 /// [`color_subresource_range`] as a copy's subresource selector: colour aspect,
 /// base mip, single layer.
 pub(crate) fn color_subresource_layers() -> ash::vk::ImageSubresourceLayers {
