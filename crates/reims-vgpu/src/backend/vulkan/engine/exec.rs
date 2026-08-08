@@ -2421,26 +2421,13 @@ pub(crate) unsafe fn execute_draw_inner(
             continue;
         };
         target_snapshotted = true;
-        if snapshotted_targets.insert(identity.clone())
-            && *source_old_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL
-        {
-            let (src_stage, src_access) = layout_source_scope(*source_old_layout)?;
-            let barrier = [vk::ImageMemoryBarrier::default()
-                .src_access_mask(src_access)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .old_layout(*source_old_layout)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .image(*source_image)
-                .subresource_range(super::color_subresource_range())];
-            ctx.device.cmd_pipeline_barrier(
-                cb,
-                src_stage,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &barrier,
-            );
+        // Once per distinct source: duplicate bindings of one target share the
+        // image, so a second barrier for it would order nothing new. The
+        // *first* is unconditional — the source is a registry resident this
+        // draw's own predecessor may have written, and the layout it sits in
+        // says nothing about that.
+        if snapshotted_targets.insert(identity.clone()) {
+            barrier_resident_for_transfer_read(ctx, cb, *source_image, *source_old_layout);
         }
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
@@ -2548,30 +2535,10 @@ pub(crate) unsafe fn execute_draw_inner(
         // GPU present-boundary seed: resident front frame → draw target copy,
         // then the pass runs with LOAD.
         //
-        // Unconditional: the source is a resident that a draw just produced, so
-        // it is normally already in TRANSFER_SRC_OPTIMAL and gating on a
-        // transition being needed skipped the dependency on exactly the frames
-        // worth copying. See `resident_read_source_scope` for why the scope
-        // cannot come from the tracked layout.
-        {
-            let (src_stage, src_access) = resident_read_source_scope();
-            let barrier = [vk::ImageMemoryBarrier::default()
-                .src_access_mask(src_access)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .old_layout(seed_layout)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .image(seed_image)
-                .subresource_range(super::color_subresource_range())];
-            ctx.device.cmd_pipeline_barrier(
-                cb,
-                src_stage,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &barrier,
-            );
-        }
+        // The source is a resident that a draw just produced, so it is normally
+        // already in TRANSFER_SRC_OPTIMAL and gating on a transition being
+        // needed skipped the dependency on exactly the frames worth copying.
+        barrier_resident_for_transfer_read(ctx, cb, seed_image, seed_layout);
         let (dst_stage, dst_access) =
             target_write_source_scope(target_snapshotted, target_old_layout)?;
         let barrier = [vk::ImageMemoryBarrier::default()
@@ -3484,6 +3451,48 @@ pub(super) fn resident_read_source_scope() -> (vk::PipelineStageFlags, vk::Acces
             | vk::AccessFlags::SHADER_WRITE
             | vk::AccessFlags::TRANSFER_WRITE,
     )
+}
+
+/// Record the barrier that makes a registry-resident image readable as a
+/// transfer source, waiting for every writer it can have.
+///
+/// The two questions a call site could get wrong are both answered here rather
+/// than asked: it takes no condition, so the barrier cannot be skipped because
+/// the image already sits in `TRANSFER_SRC_OPTIMAL`, and it takes no scope, so
+/// the scope cannot be derived from the tracked layout. Both mistakes were live
+/// at the copy-on-sample site, and both are invisible — a resident has no fence
+/// between consecutive users, so the missing dependency only shows up as a copy
+/// that raced the draw producing the pixels it copied.
+///
+/// `tracked` is the registry's layout for `image`, which is where the image is;
+/// [`resident_read_source_scope`] is what last touched it, and the two disagree
+/// by design. A barrier whose old and new layouts match performs no transition
+/// and still carries the dependency, which is the case this exists for.
+pub(super) unsafe fn barrier_resident_for_transfer_read(
+    ctx: &super::context::DeviceContext,
+    cb: vk::CommandBuffer,
+    image: vk::Image,
+    tracked: vk::ImageLayout,
+) {
+    let (src_stage, src_access) = resident_read_source_scope();
+    let barrier = [vk::ImageMemoryBarrier::default()
+        .src_access_mask(src_access)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .old_layout(tracked)
+        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .image(image)
+        .subresource_range(super::color_subresource_range())];
+    unsafe {
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            src_stage,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barrier,
+        );
+    }
 }
 
 fn target_write_source_scope(

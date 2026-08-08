@@ -583,32 +583,11 @@ pub(crate) unsafe fn execute_compute_inner(
             // exit so the storage-acquire's captured initial_layout (and the
             // storage pre-dispatch barrier, which syncs on TRANSFER when that
             // layout is TRANSFER_SRC_OPTIMAL) remains truthful.
-            // Unconditional, and the scope comes from `resident_read_source_scope`
-            // rather than from `src_layout`. A resident a draw just produced
-            // already sits in TRANSFER_SRC_OPTIMAL — that is the layout a render
-            // pass resolves its primary to — so gating on a transition being
-            // needed skipped the dependency on exactly the content worth
-            // copying. The old source mask compounded it: it named
-            // SHADER_WRITE | TRANSFER_WRITE but not COLOR_ATTACHMENT_WRITE, so
-            // even when it did fire it did not drain the draw that wrote the
-            // pixels this copy is about to read.
-            let (src_stage, src_access) = super::exec::resident_read_source_scope();
-            let to_src = [vk::ImageMemoryBarrier::default()
-                .src_access_mask(src_access)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .old_layout(src_layout)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .image(src_image)
-                .subresource_range(range)];
-            ctx.device.cmd_pipeline_barrier(
-                cb,
-                src_stage,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &to_src,
-            );
+            // Both halves — that the barrier is unconditional and that its scope
+            // does not come from `src_layout` — are `barrier_resident_for_
+            // transfer_read`'s to answer, and this site had each of them wrong
+            // once.
+            super::exec::barrier_resident_for_transfer_read(ctx, cb, src_image, src_layout);
             let copy = [vk::ImageCopy::default()
                 .src_subresource(super::color_subresource_layers())
                 .dst_subresource(super::color_subresource_layers())
