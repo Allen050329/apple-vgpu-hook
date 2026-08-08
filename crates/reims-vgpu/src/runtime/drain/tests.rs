@@ -1,80 +1,6 @@
 use super::*;
 use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86, PAGE_SIZE_ARM64E};
 
-/// No child opcode may be handled twice — once by its own `match` arm and again
-/// by an `if packet.opcode ==` inside another arm's body.
-///
-/// `process_child_packet` dispatches on the opcode and then, inside the
-/// bookkeeping family's shared body, branches on it again to separate the five
-/// packets that arm covers. Both shapes are fine on their own. What is not fine
-/// is an inner branch on an opcode the enclosing arm's pattern does not list:
-/// the outer `match` has already claimed it, so the inner branch is
-/// unreachable — and it reads exactly like a handler.
-///
-/// `CHILD_OP_REPLACE_PHYSICAL` was in that state. The reachable arm cleared the
-/// named mapping's page list; the unreachable one also routed the object id
-/// through `texture_to_mapping` and took the mapping's deferred windows. Nothing
-/// in the toolchain saw it — the code compiles, the body is well-formed, and a
-/// coverage sweep reports it as an untaken branch among thousands.
-///
-/// So the invariant is asserted against the source itself. It is a source test
-/// rather than a behavioural one because the failure has no behaviour: the
-/// second handler does nothing, which is indistinguishable at runtime from a
-/// handler whose conditions never held.
-#[test]
-fn no_child_opcode_is_claimed_by_an_arm_and_branched_on_inside_another() {
-    const SRC: &str = include_str!("mod.rs");
-    // The dispatch `match` is the only place in the file at this indentation
-    // whose arms are bare opcode constants, so arms are found by shape.
-    let mut current: Option<Vec<&str>> = None;
-    let mut pending: Vec<&str> = Vec::new();
-    let mut violations: Vec<String> = Vec::new();
-    for line in SRC.lines() {
-        let body = line.trim();
-        let is_arm_indent = line.starts_with("        ") && !line.starts_with("         ");
-        if is_arm_indent && body.starts_with("CHILD_OP_") || is_arm_indent && body.starts_with("| ")
-        {
-            for name in body.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
-                if name.starts_with("CHILD_OP_") {
-                    pending.push(name);
-                }
-            }
-            if body.contains("=>") {
-                current = Some(std::mem::take(&mut pending));
-            }
-            continue;
-        }
-        // Any other arm-indent line ends the arm we were inside.
-        if is_arm_indent && body.ends_with("=> {") {
-            current = Some(std::mem::take(&mut pending));
-            continue;
-        }
-        let Some(patterns) = current.as_ref() else {
-            continue;
-        };
-        let Some(rest) = body.split("packet.opcode ==").nth(1) else {
-            continue;
-        };
-        let Some(named) = rest
-            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .find(|t| t.starts_with("CHILD_OP_"))
-        else {
-            continue;
-        };
-        if !patterns.contains(&named) {
-            violations.push(format!(
-                "{named} is branched on inside an arm matching {patterns:?}, \
-                 which does not list it — the branch is unreachable"
-            ));
-        }
-    }
-    assert!(
-        violations.is_empty(),
-        "unreachable opcode handlers in process_child_packet:\n  {}",
-        violations.join("\n  ")
-    );
-}
-
 /// I2's carve-out, asserted rather than trusted: a partial packet is the
 /// normal state of a ring whose producer is mid-write, so it must not reach
 /// the always-on log. A bad size or a desync must.
@@ -5305,6 +5231,138 @@ fn the_discarding_commands_share_the_synchronize_record_layout() {
             )),
             "{opcode:#x}: a record layout the guest and this device disagree on \
              must name the check that refused; got {line}"
+        );
+    }
+}
+
+/// Each member of the map/lifecycle family is dispatched under its own identity.
+///
+/// Six opcodes share one body, and the member is bound at the dispatch arm
+/// rather than re-read from the packet inside that body. That makes a dead
+/// branch a compile error, but it moves the risk to the binding: an arm naming
+/// the wrong member compiles, and the packet then silently runs another
+/// command's branch. Nothing in the toolchain sees that, so it is asserted here
+/// by the effect each branch has and no other has.
+///
+/// `CmdMapMemory2` and `CmdUnmapMemory` are deliberately absent. They share one
+/// branch and this device does not yet do anything different for the two, so
+/// there is no effect that separates them — asserting one would be asserting the
+/// log string, not the behaviour. The pair's shared branch is covered by
+/// `map_memory2_does_not_flush_gva_host_cache_on_wire` and the view-retire tests.
+#[test]
+fn each_map_family_command_takes_its_own_branch() {
+    use crate::contract::endian::st32;
+    use crate::runtime::decode::fifo::CHILD_INVALIDATE_PAGEON_FLAGS;
+
+    const MAPPING: u32 = 0x2a;
+
+    // `{u32 task, u32 count}` then one 8-byte validity record: the invalidate
+    // layout. The synchronise family reads the same header and 4-byte ids, so
+    // this payload is well-formed for either and the opcode is the only thing
+    // that decides which decoder sees it.
+    let mut invalidate = vec![0u8; 16];
+    st32(&mut invalidate[4..], 1);
+    st32(&mut invalidate[8..], MAPPING);
+    st32(&mut invalidate[12..], CHILD_INVALIDATE_PAGEON_FLAGS);
+    // `{u32 task, u32 count}` then one 4-byte object id.
+    let mut synchronize = vec![0u8; 12];
+    st32(&mut synchronize[4..], 1);
+    st32(&mut synchronize[8..], MAPPING);
+    // `{u32 object_id, u32 task_id}`.
+    let mut delete_backing = vec![0u8; 8];
+    st32(&mut delete_backing[0..], MAPPING);
+
+    // Each row is a payload and the two effects that tell this branch from its
+    // five neighbours: whether the named mapping's content generation moved, and
+    // whether the command reported itself unimplemented.
+    for (opcode, payload, bumps_generation, declined) in [
+        (
+            CHILD_OP_INVALIDATE_RESOURCES,
+            &invalidate,
+            true,
+            None,
+        ),
+        (
+            CHILD_OP_SYNCHRONIZE_RESOURCES,
+            &synchronize,
+            false,
+            None,
+        ),
+        (
+            CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES,
+            &synchronize,
+            false,
+            Some(UnimplementedCommand::SynchronizeAndDiscardResources),
+        ),
+        (
+            CHILD_OP_DELETE_IOSURFACE_BACKING2,
+            &delete_backing,
+            false,
+            None,
+        ),
+    ] {
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.map_surface(MAPPING));
+        state.mappings.get_mut(&MAPPING).unwrap().content_generation = 7;
+
+        assert_eq!(
+            process_child_packet(
+                &mut state,
+                &mut host,
+                4,
+                &Packet {
+                    opcode,
+                    stamp_waits: Vec::new(),
+                    total_size: PACKET_HEADER_LEN + payload.len() as u32,
+                    completion_stamp: 0,
+                    payload: payload.clone(),
+                    next_head: 0,
+                },
+            ),
+            ChildPacketDisposition::Complete,
+            "{opcode:#x}: the guest is waiting on the stamp whatever the branch did"
+        );
+
+        // `CmdInvalidateResources` is the only member that reads validity
+        // records, so the generation bump is its signature. A mis-bound arm
+        // either loses the bump or produces one for a command that never
+        // invalidates anything.
+        let generation = state.mappings.get(&MAPPING).map(|m| m.content_generation);
+        if bumps_generation {
+            assert_eq!(
+                generation,
+                Some(8),
+                "{opcode:#x}: this command clears host validity, so the mapping's \
+                 content generation must move"
+            );
+        } else {
+            assert_ne!(
+                generation,
+                Some(8),
+                "{opcode:#x}: this command does not touch validity, so a bump means \
+                 it ran the invalidate branch"
+            );
+        }
+
+        // `CmdDeleteIOSurfaceBacking2` is the only member that ends a backing's
+        // lifetime, and with no resolved pages there is nothing a stale delete
+        // could hurt, so it unmaps outright. The slot survives — the id can be
+        // reused — so what separates it is the mapped bit, not the entry.
+        assert_eq!(
+            state.mappings[&MAPPING].mapped,
+            opcode != CHILD_OP_DELETE_IOSURFACE_BACKING2,
+            "{opcode:#x}: only the backing delete unmaps the surface"
+        );
+
+        let reported = state.fails.iter().find_map(|e| match e {
+            FailEvent::UnimplementedChildCommand { command, .. } => Some(*command),
+            _ => None,
+        });
+        assert_eq!(
+            reported, declined,
+            "{opcode:#x}: the half of this command that is not implemented must be \
+             named, and a fully-handled one must report nothing"
         );
     }
 }
