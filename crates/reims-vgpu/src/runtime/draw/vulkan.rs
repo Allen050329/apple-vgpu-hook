@@ -940,6 +940,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     task_id: u32,
     texture_ref: u32,
     entry: Option<ListObjectEntry>,
+    may_bind_resident: bool,
 ) -> Option<(u32, u32, u32, SampledSourceRequest)> {
     if texture_ref == 0 {
         return None;
@@ -1150,7 +1151,16 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // them into the guest's pages first — see
                 // [`merge_guest_writes_into_pages`] — and every rung below then
                 // reads a surface that holds both halves.
-                if resident_ready {
+                // A bind whose view remaps channels cannot take a resident
+                // directly — the engine hands the swizzle to the image view and
+                // the direct bind has none — so it falls straight to a byte rung
+                // that can apply it. Counted on its own route and *outside* the
+                // refusal below: nothing was replaced and there is nothing to
+                // merge, so borrowing `_refused` would report a repaint that did
+                // not happen and run a merge for it.
+                if resident_ready && !guest_replaced && !may_bind_resident {
+                    note_type11_sample_rung("t11rung_resident_swizzled", guest_write);
+                } else if resident_ready {
                     if !guest_replaced {
                         note_type11_sample_rung("t11rung_resident", guest_write);
                         return Some((w, h, mid, SampledSourceRequest::Target(resident_id)));
@@ -1408,6 +1418,15 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
             objects::read_descriptor(state, host, task_id, &e)
                 .and_then(|d| decode_texture_descriptor(&d).ok())
         }) {
+            // Above the gather: a span whose pages a render Store published and
+            // nothing has written since is already an engine image, so there is
+            // nothing to gather and — the point of the rung — no writeback to
+            // wait for. See [`try_gva_resident_sample`].
+            if may_bind_resident {
+                if let Some((w, h, src)) = try_gva_resident_sample(state, host, task_id, &tex) {
+                    return Some((w, h, 0, src));
+                }
+            }
             if let Some((w, h, src)) =
                 try_linear_sample_zero_copy(state, host, task_id, texture_ref, &tex)
             {
@@ -2667,6 +2686,100 @@ fn load_buffer_content<M: HostMemory + HostOps>(
 /// bind, hit or miss. That was 62 µs of a 191 µs draw. A rail that costs the
 /// device its largest per-draw item when it declines may not decline silently;
 /// the routes below are what turn "the gather is not running" into which gate.
+/// Serve a sampled GVA span off the engine resident a render Store published
+/// into it — the GVA twin of `t11rung_resident`.
+///
+/// # What it is worth
+///
+/// The rung below this one reads the span out of guest pages, and before it can
+/// read it has to wait for any render writeback landing in those same pages.
+/// That wait was **94 % of `sampled_phase`'s `resolve_us`** on a driven Safari
+/// drag — 275 ms of a 610 ms drain second, the largest single item in the
+/// device — and narrowing cannot touch it, because the pages the reader wants
+/// are exactly the pages the Store is writing:
+/// `settle_linear_memo_read_overlap` was 4 700 of 4 717 waits.
+///
+/// A probe on that rung counted the join before this was built. Of the sampled
+/// binds it saw, **20 688** named a GVA target a Store had stamped and
+/// **16 202 of those read
+/// [`crate::runtime::gva_store_witness::GvaWriteReach::Quiet`]** — the pages
+/// still hold the Store's frame, so the resident does too and nobody has to
+/// read anything.
+/// Genuine refusals (the guest repainted, or the Store never stamped) were 79.
+///
+/// # Why the whole key and not the address
+///
+/// The generation is recomputed here from the span's *current* page set rather
+/// than taken from any entry found at this address. The witness map can hold an
+/// orphan — a target whose pages have since moved, keyed under the hash they
+/// had — and an orphan's token still answers about pages that now belong to
+/// something else. Recomputing means a moved page list simply misses, which is
+/// [`crate::runtime::gva_store_witness`]'s own rule: the wrong answer is
+/// unreachable rather than guarded.
+///
+/// # The two conditions, and what each rules out
+///
+/// * [`crate::runtime::gva_store_witness::GvaWriteReach::Quiet`] — neither the
+///   guest CPU nor another rail of this device has written the span since the
+///   Store. Everything undecidable answers as written, so a host with no dirty
+///   bitmap never reaches this rung.
+/// * `resident_content_ready` — the engine still holds an image under this
+///   identity. A reclaimed or never-filled slot refuses.
+///
+/// What is deliberately *not* a condition is "no draw has landed in the resident
+/// since the Store". A draw landing there is the guest rendering into this very
+/// texture, and Metal's model is that a render pass changes the texture it
+/// targets — so the resident being ahead of the guest's pages is the content the
+/// guest asked to sample, not a stale read.
+pub(super) fn try_gva_resident_sample<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    tex: &TextureDescriptor,
+) -> Option<(u32, u32, SampledSourceRequest)> {
+    use crate::runtime::drain::note_store_route;
+    use crate::runtime::gva_store_witness::{reach, GvaTargetKey};
+
+    let (gva, layout) = tex.level_gva(0, state.page_shift)?;
+    let (w, h) = (layout.width, layout.height);
+    if gva == 0 || w == 0 || h == 0 {
+        return None;
+    }
+    let row_stride = u32::try_from(layout.row_stride).ok()?;
+    let generation = gva_span_alloc_generation(state, host, task_id, gva, row_stride, h);
+    if generation == 0 {
+        // The page walk came up short, so this span has no identity to look up.
+        // Not counted against the rung: it is the same refusal the Store itself
+        // takes, and a target that never got a key was never a candidate.
+        return None;
+    }
+    let key = GvaTargetKey {
+        gva,
+        generation,
+        width: w,
+        height: h,
+        bgra: gva_resident_bgra(tex.pixel_format),
+    };
+    let verdict = reach(state, host, key);
+    if !verdict.is_quiet() {
+        note_store_route(verdict.route());
+        return None;
+    }
+    let identity = crate::backend::vulkan::engine::TargetIdentity::Gva {
+        gva,
+        width: w,
+        height: h,
+        generation,
+        bgra: key.bgra,
+    };
+    if !crate::backend::vulkan::engine::resident_content_ready(&identity) {
+        note_store_route("gvarung_resident_absent");
+        return None;
+    }
+    note_store_route("gvarung_resident");
+    Some((w, h, SampledSourceRequest::Target(identity)))
+}
+
 fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -3150,11 +3263,6 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     // A short walk is `None` and settles. `pages_spanned` is the count the
     // resolver would have produced with nothing dropped, and a dropped page is
     // one this reader cannot rule out.
-    // Does this sampled span name a GVA render target a Store has published? The
-    // answer is discarded; the count is what says whether the resident rung the
-    // type-11 ladder has is worth building here, and this settle is where it
-    // would pay off.
-    crate::runtime::gva_store_witness::note_sampled_probe(state, host, gva, w, h);
     let (tasks, page_shift) = (&state.tasks, state.page_shift);
     let page_size = state.page_size();
     crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
@@ -4993,6 +5101,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             req.task_id,
                             texture_ref,
                             texture_entry,
+                            view_swizzle.is_none(),
                         ) else {
                             let detail = sample_miss_detail(state, host, req.task_id, texture_ref);
                             return Err(DrawError::DrawPreparation(

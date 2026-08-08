@@ -2953,7 +2953,7 @@ fn gva_layer_host_cache_roundtrip_for_sample() {
     // from a cache entry is what used to happen.
     let mut host = crate::runtime::host::FakeHost::new();
     assert!(
-        resolve_sampled_source(&mut state, &mut host, 0, tex_ref, None).is_none(),
+        resolve_sampled_source(&mut state, &mut host, 0, tex_ref, None, true).is_none(),
         "a ref with no object-list entry must resolve to no sampled source"
     );
 }
@@ -3361,7 +3361,7 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
     );
 
     let (width, height, sampled_mid, sampled) =
-        resolve_sampled_source(&mut state, &mut host, 1, texture_ref, None)
+        resolve_sampled_source(&mut state, &mut host, 1, texture_ref, None, true)
             .expect("type-5 descriptor surface must sample");
     assert_eq!((width, height, sampled_mid), (4, 3, surface_id));
     let SampledSourceRequest::Bytes(sampled, _, layout) = sampled else {
@@ -3388,7 +3388,7 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
         "type-5 fixture must expose an object-list entry to thread"
     );
     let (tw, th, tmid, tsrc) =
-        resolve_sampled_source(&mut state, &mut host, 1, texture_ref, threaded_entry)
+        resolve_sampled_source(&mut state, &mut host, 1, texture_ref, threaded_entry, true)
             .expect("threaded-entry sample must resolve");
     assert_eq!(
         (tw, th, tmid),
@@ -3497,7 +3497,7 @@ fn type11_host_cache_rung_identity_tracks_the_cached_frame() {
     );
 
     let resolve = |state: &mut DeviceState, host: &mut FakeHost| {
-        let (_, _, _, src) = resolve_sampled_source(state, host, 1, texture_ref, None)
+        let (_, _, _, src) = resolve_sampled_source(state, host, 1, texture_ref, None, true)
             .expect("host-cache rung must serve the stored frame");
         let SampledSourceRequest::Bytes(bytes, identity, layout) = src else {
             panic!("cache-backed fixture unexpectedly resolved a resident target");
@@ -3696,7 +3696,7 @@ fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
     assert!(state.set_mapping_device_desc(surface_id, &device_desc));
 
     let (sample_w, sample_h, sample_mid, sampled) =
-        resolve_sampled_source(&mut state, &mut host, 1, texture_ref, None)
+        resolve_sampled_source(&mut state, &mut host, 1, texture_ref, None, true)
             .expect("serialized RG8 view must sample the 2-byte surface");
     assert_eq!(
         (sample_w, sample_h, sample_mid),
@@ -5230,4 +5230,133 @@ fn a_bind_stride_overrides_the_pipeline_stride_only_where_it_exists() {
         12,
         "a stride neither backend can carry must not be truncated into one they can"
     );
+}
+
+/// The GVA resident sample rung must fail closed, and this pins the direction
+/// it fails in.
+///
+/// `try_gva_resident_sample` declines to read the guest's pages at all and
+/// hands the draw an engine image instead, on the strength of one claim: a
+/// render Store published this exact page set and nothing has written it since.
+/// Where no Store ever stamped the span, there is no evidence for that claim,
+/// and serving a resident anyway binds whatever image is parked under a
+/// colliding identity while the guest's own pixels go unread. The symptom is a
+/// frame that stops updating and stays wrong — the worst class this crate has,
+/// because every layer above the rung sees a successful bind.
+///
+/// The refusal is therefore asserted twice, and the second half is the half
+/// that catches the regression. A rung that lost its `GvaWriteReach::Quiet`
+/// test would still answer `None` here, since no engine exists in a unit test
+/// to hold a resident under any identity, so the return value alone cannot tell
+/// a working guard from a deleted one. The census route can: `gvaw_no_entry`
+/// means the witness was asked and had nothing, while `gvarung_resident_absent`
+/// in its place means the rung walked past the witness and went straight to the
+/// registry.
+///
+/// The second leg is the orphan. A witness entry at the same address and extent
+/// under a stale page-set generation must not answer for the allocation that
+/// replaced it: the generation is recomputed from the pages as they stand now
+/// rather than read back out of whatever entry the address happens to find, so
+/// a moved page list misses instead of being wrong.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{TextureDescriptor, TextureLevelLayout};
+    use crate::runtime::drain::store_route_count;
+    use crate::runtime::gva_store_witness::{note_store, GvaTargetKey};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    // GVA pages 0..7 → data PFNs 4..11: the one-level table every task-GVA walk
+    // in this file uses.
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+
+    // A 32x32 BGRA8 linear texture whose tight level-0 span sits wholly inside
+    // mapped GVA page 2. The span has to walk, or the rung declines on the short
+    // walk before it ever reaches the witness and the test proves nothing.
+    let page = 1u64 << PAGE_SHIFT_ARM64E;
+    let (width, height, row_stride) = (32u32, 32u32, 128u64);
+    let span = row_stride * u64::from(height);
+    let tex = TextureDescriptor {
+        allocation_size: page,
+        handle: 2,
+        mipmap_level_count: 1,
+        data_offset: 0,
+        bytes_per_element: 4,
+        used_size: width * height * 4,
+        row_stride: row_stride as u32,
+        width,
+        height,
+        depth: 1,
+        pixel_format: MTL_FORMAT_BGRA8_UNORM,
+        levels: vec![TextureLevelLayout {
+            offset: 0,
+            size: span,
+            row_stride,
+            width,
+            height,
+            depth: 1,
+        }],
+    };
+    let gva = tex
+        .level_gva(0, state.page_shift)
+        .expect("the fixture descriptor must name a level-0 window")
+        .0;
+    assert_eq!(gva, 2 * page, "handle 2 at the arm64e shift is GVA page 2");
+    let gpas: Vec<u64> =
+        gva_mem::task_gva_page_gpa_set(&host, &state.tasks, 1, gva, span, state.page_shift)
+            .into_iter()
+            .collect();
+    assert_eq!(
+        gpas.len(),
+        1,
+        "fixture: the level-0 span must resolve to its one mapped page, or the \
+         rung declines on the walk instead of on the witness"
+    );
+
+    let no_entry = store_route_count("gvaw_no_entry");
+    let absent = store_route_count("gvarung_resident_absent");
+    let served = store_route_count("gvarung_resident");
+
+    assert!(
+        super::try_gva_resident_sample(&mut state, &mut host, 1, &tex).is_none(),
+        "no Store has stamped this span, so nothing licenses serving a resident for it"
+    );
+    assert_eq!(
+        store_route_count("gvaw_no_entry"),
+        no_entry + 1,
+        "the witness has to be the thing that refused, and has to name itself"
+    );
+    assert_eq!(
+        store_route_count("gvarung_resident_absent"),
+        absent,
+        "the registry must not be consulted for a span the witness knows nothing about"
+    );
+    assert_eq!(store_route_count("gvarung_resident"), served);
+
+    // Same address, same extent, a page-set generation that is not this span's:
+    // an entry the guest's recycling left behind. Recomputing the generation
+    // makes it unreachable rather than merely out-voted.
+    let orphan = GvaTargetKey {
+        gva,
+        generation: 0xdead_beef,
+        width,
+        height,
+        // What the descriptor declares, so the orphan differs from the live key
+        // in the generation alone.
+        bgra: true,
+    };
+    note_store(&mut state, &mut host, orphan, &gpas);
+    assert!(
+        super::try_gva_resident_sample(&mut state, &mut host, 1, &tex).is_none(),
+        "a stale page set stamped at this address must not answer for the one that replaced it"
+    );
+    assert_eq!(
+        store_route_count("gvaw_no_entry"),
+        no_entry + 2,
+        "the orphan is a miss, not a hit under a different generation"
+    );
+    assert_eq!(store_route_count("gvarung_resident_absent"), absent);
+    assert_eq!(store_route_count("gvarung_resident"), served);
 }
