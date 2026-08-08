@@ -2721,9 +2721,23 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         return None;
     }
     // Same coherence rule as the CPU loaders: land any resident-authoritative
-    // writeback aliasing the span before the GPU reads the pages (the CPU
-    // flush completes before this draw's submit).
-    crate::runtime::render_writeback::settle_guest_writes();
+    // No settle here, and that is the difference between this rail and the CPU
+    // loaders it replaces.
+    //
+    // A CPU loader reads the guest's pages with this thread, which nothing
+    // orders against a submitted-but-unexecuted writeback, so it has to block
+    // until the writeback has landed. This rail does not read anything: it hands
+    // the engine guest-RAM runs and the *GPU* reads them when the draw's command
+    // buffer executes. A guest-page writeback is a GPU command on the same
+    // single queue, and `copy_image_level0_to_buffer` submits it before
+    // returning — it is already on the queue by the time the debt flag that a
+    // settle consults is even set. Queue order therefore already puts the
+    // writeback ahead of this gather, and a CPU fence wait buys an ordering that
+    // holds without it.
+    //
+    // `try_type11_sample_zero_copy` and `try_type5_sample_zero_copy` are the two
+    // rails that were already written this way, and this one is now consistent
+    // with them.
     // Fixed per-texture window: the walk covers exactly the bound span.
     let (gpas, runs) = match task_gva_guest_run_window(state, host, task_id, gva, span) {
         Ok(window) => window,
