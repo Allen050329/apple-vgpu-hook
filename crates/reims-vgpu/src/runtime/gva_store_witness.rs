@@ -378,6 +378,69 @@ pub fn reach<H: HostOps>(state: &DeviceState, host: &H, key: GvaTargetKey) -> Gv
     }
 }
 
+/// Whether a sampled span at `gva` names a GVA render target this witness has
+/// stamped, and if so what the two witnesses say about it — counted, answer
+/// discarded.
+///
+/// # What it is deciding
+///
+/// A driven Safari drag pays **94 %** of `sampled_phase`'s `resolve_us` — the
+/// largest column in the chain at 275 ms/s — inside one
+/// `settle_guest_writes_unless_disjoint` at
+/// [`crate::runtime::render_writeback::SettleSite::LinearMemoRead`]. The reader
+/// is a sampled linear bind and the writeback it blocks on is the GVA render
+/// Store that just published those same pages, so the wait is real and
+/// narrowing cannot reach it: `settle_linear_memo_read_overlap` is 4 700 of
+/// 4 717 waits.
+///
+/// The way out is the rung `resolve_sampled_source` already has for type-11 —
+/// `t11rung_resident`, 31 705 binds a boot served straight off the engine image
+/// — applied to GVA targets, which is what this witness was built to license.
+/// That rung is only worth building if the sampled spans a drag binds are
+/// actually the targets its Stores publish, and nothing has measured whether
+/// they are.
+///
+/// So this counts the join and changes nothing. Three outcomes, because they
+/// mean different things: no target ever stamped at this address, one stamped
+/// but at another extent (a resident whose pixels are the wrong shape is not a
+/// source), and a match — which then reports its [`GvaWriteReach`] under the
+/// same routes [`GvaWriteReach::route`] gives, so the refusal split is the one a
+/// real rung would see.
+pub fn note_sampled_probe<H: HostOps>(state: &DeviceState, host: &H, gva: u64, w: u32, h: u32) {
+    use crate::runtime::drain::note_store_route;
+    if gva == 0 {
+        return;
+    }
+    let lo = GvaTargetKey {
+        gva,
+        ..Default::default()
+    };
+    // The map is keyed in field order with `gva` first, so every entry for this
+    // address sits in one contiguous run and the scan is over that run alone.
+    let hit = state
+        .gva_store_witness
+        .entries
+        .range(lo..)
+        .take_while(|(k, _)| k.gva == gva)
+        .find(|(k, _)| k.width == w && k.height == h)
+        .map(|(k, _)| *k);
+    match hit {
+        Some(key) => {
+            note_store_route("gvaw_probe_match");
+            note_store_route(reach(state, host, key).route());
+        }
+        None if state
+            .gva_store_witness
+            .entries
+            .range(lo..)
+            .any(|(k, _)| k.gva == gva) =>
+        {
+            note_store_route("gvaw_probe_extent_differs")
+        }
+        None => note_store_route("gvaw_probe_no_target"),
+    }
+}
+
 /// How far back the host-write record is being asked to reach for `key`, banded.
 ///
 /// `host_writes`'s own doc asks for exactly this distribution before anyone
@@ -426,6 +489,43 @@ mod tests {
 
     fn armed(state: &mut DeviceState, host: &mut FakeHost, k: GvaTargetKey, gpas: &[u64]) {
         note_store(state, host, k, gpas);
+    }
+
+    /// The probe's three outcomes have to be told apart by the join and not by
+    /// the address alone: a resident whose pixels are the wrong shape is not a
+    /// source for this bind, and counting it as one would report a rung as
+    /// available where it is not.
+    ///
+    /// Also pins that the range scan stops at its own address. The map is keyed
+    /// in field order, so a neighbouring target one address along sits in the
+    /// same `BTreeMap` immediately after this one, and a scan that forgot its
+    /// `take_while` would find it and call every miss a match.
+    #[test]
+    fn the_sampled_probe_separates_no_target_from_a_target_of_another_shape() {
+        use crate::runtime::drain::store_route_count;
+        let mut state = device();
+        let mut host = FakeHost::new();
+        let k = key(7);
+        armed(&mut state, &mut host, k, &[3 * PAGE, 4 * PAGE]);
+
+        let before = |r| store_route_count(r);
+        let (m0, e0, n0) = (
+            before("gvaw_probe_match"),
+            before("gvaw_probe_extent_differs"),
+            before("gvaw_probe_no_target"),
+        );
+
+        note_sampled_probe(&state, &host, k.gva, k.width, k.height);
+        note_sampled_probe(&state, &host, k.gva, k.width, k.height + 1);
+        note_sampled_probe(&state, &host, k.gva + 1, k.width, k.height);
+
+        assert_eq!(store_route_count("gvaw_probe_match"), m0 + 1);
+        assert_eq!(store_route_count("gvaw_probe_extent_differs"), e0 + 1);
+        assert_eq!(
+            store_route_count("gvaw_probe_no_target"),
+            n0 + 1,
+            "an address one byte along is a different target, not this one"
+        );
     }
 
     /// The whole contract of the guest half: a Store stamps, a quiet guest reads

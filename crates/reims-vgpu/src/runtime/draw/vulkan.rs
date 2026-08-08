@@ -3150,6 +3150,11 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     // A short walk is `None` and settles. `pages_spanned` is the count the
     // resolver would have produced with nothing dropped, and a dropped page is
     // one this reader cannot rule out.
+    // Does this sampled span name a GVA render target a Store has published? The
+    // answer is discarded; the count is what says whether the resident rung the
+    // type-11 ladder has is worth building here, and this settle is where it
+    // would pay off.
+    crate::runtime::gva_store_witness::note_sampled_probe(state, host, gva, w, h);
     let (tasks, page_shift) = (&state.tasks, state.page_shift);
     let page_size = state.page_size();
     crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
