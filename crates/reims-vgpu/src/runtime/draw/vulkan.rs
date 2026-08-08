@@ -2731,6 +2731,36 @@ fn load_buffer_content<M: HostMemory + HostOps>(
 /// texture, and Metal's model is that a render pass changes the texture it
 /// targets — so the resident being ahead of the guest's pages is the content the
 /// guest asked to sample, not a stale read.
+///
+/// # What it measured
+///
+/// Driven Safari drag, against the boot that supplied the numbers above:
+///
+/// ```text
+///                                    before    after
+/// gvarung_resident                        -   20 539
+/// gvarung_resident_absent                 -        0
+/// settle_linear_memo_read (waits)     4 717    1 446
+/// settle_linear_memo_read_overlap     4 700        0
+/// settle_linear_memo_read_us          6.70 s   3.74 s
+/// fence (waits)                       9 475    6 071
+/// fence_us                           11.92 s   5.77 s
+/// sampled_phase resolve_us/s          290 ms   195 ms
+/// ```
+///
+/// The row that says the rung did what it was built to do is the third one:
+/// **the overlap class is gone**, not reduced. Every remaining memo wait is
+/// `_unnamed` — a span whose page walk came up short, which this rung declines
+/// before the witness. `gvarung_resident_absent` reading zero says every quiet
+/// witness had a live resident behind it, so nothing is being armed and then
+/// reclaimed out from under the rung.
+///
+/// Correctness was taken separately and not from a screenshot, because a rung
+/// that serves a stale resident renders a *plausible* frame: the multi-round
+/// recomposite run over a live Wikipedia article scored **PATCHED none,
+/// UNSCOREABLE none** across six anchors with its reload and movement gates
+/// both satisfied. A second workload (page loads and scrolling) served 11 103
+/// binds off the rung with no loss on the fail channel.
 pub(super) fn try_gva_resident_sample<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
