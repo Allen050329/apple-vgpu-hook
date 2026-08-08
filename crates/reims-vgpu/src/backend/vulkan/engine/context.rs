@@ -440,14 +440,6 @@ impl DeviceContext {
                 for name in available {
                     instance_extensions.push(name.as_ptr());
                 }
-                // Without this the surface reports sRGB colour spaces only, so a
-                // wide-gamut pair cannot be seen at all — and the guest composites
-                // some surfaces in `RGBA16Float`, which sRGB cannot carry. Enabling
-                // it only lengthens the surface-format query; which pair the
-                // swapchain takes is decided explicitly at that site.
-                if has_instance_extension(ash::ext::swapchain_colorspace::NAME) {
-                    instance_extensions.push(ash::ext::swapchain_colorspace::NAME.as_ptr());
-                }
             }
         }
         let mut ici = vk::InstanceCreateInfo::default()

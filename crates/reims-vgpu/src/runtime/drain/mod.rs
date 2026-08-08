@@ -2162,7 +2162,6 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
         (DISPLAY_MODE1_W, DISPLAY_MODE1_H),
         (DISPLAY_MODE2_W, DISPLAY_MODE2_H),
         (DISPLAY_MODE3_W, DISPLAY_MODE3_H),
-        (DISPLAY_MODE4_W, DISPLAY_MODE4_H),
     ];
     shared_w16(
         host,
