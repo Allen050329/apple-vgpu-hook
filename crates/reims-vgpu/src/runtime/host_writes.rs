@@ -65,7 +65,7 @@
 use std::collections::BTreeSet;
 
 /// What one host write touched.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Wrote {
     /// Every page of a mapping, as its page list stood at `map_generation`.
     ///
@@ -130,6 +130,32 @@ impl HostWriteVerdict {
     }
 }
 
+/// One retained write, with the digest that lets [`HostWrites::push`] find an
+/// identical earlier one without comparing every page list it holds.
+#[derive(Debug)]
+struct Recent {
+    epoch: u64,
+    digest: u64,
+    what: Wrote,
+}
+
+/// A cheap equality filter over [`Wrote`]. Not a hash of anything persisted, so
+/// its only requirement is that equal values agree — inequality is confirmed by
+/// the full comparison beside it.
+fn digest_of(what: &Wrote) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match what {
+        Wrote::Mapping {
+            mid,
+            map_generation,
+        } => (0u8, mid, map_generation).hash(&mut h),
+        Wrote::Pages(pages) => (1u8, pages).hash(&mut h),
+        Wrote::Unknown => 2u8.hash(&mut h),
+    }
+    h.finish()
+}
+
 /// Recent host writes into guest RAM, newest last.
 #[derive(Default, Debug)]
 pub struct HostWrites {
@@ -137,7 +163,7 @@ pub struct HostWrites {
     /// asks later whether anything newer touched its pages. Never 0 once any
     /// write has happened, so 0 is usable as "never looked".
     epoch: u64,
-    recent: std::collections::VecDeque<(u64, Wrote)>,
+    recent: std::collections::VecDeque<Recent>,
     /// Oldest mark the ring can still answer for.
     ///
     /// A reader with mark `s` asks about writes with epoch **greater than** `s`,
@@ -168,13 +194,28 @@ pub struct HostWrites {
 /// measures; under compositing the write rate between two binds of one window
 /// exceeds this.
 ///
-/// **Do not simply raise the number.** What is wanted is the distribution of
-/// `epoch - since` at the moment a reader asks, and nothing measures it yet: a
-/// reach that is usually 70 and a reach that is usually 7000 both produce the
-/// reading above, and only one of them is fixed by a bigger ring. The other is
-/// fixed by writers that name their pages, since a `Pages` entry rules itself
-/// out of windows it never touched and an aged-out one cannot. Band the reach
-/// first.
+/// # The reach was banded, and the answer was not "make it bigger"
+///
+/// [`reach_band`] took that distribution on a driven drag. Of 5 666 asks,
+/// 1 362 were inside the ring and **4 294 sat in `hw_reach_le16x`** — reach
+/// between 4x and 16x this bound. Three asks in the whole boot reached further.
+///
+/// A 16x ring would answer them and would be the wrong repair, because the scan
+/// is the reach: `wrote_any_since` walks back to the reader's mark, and a
+/// `Pages` entry for a 1920x1080 frame holds ~2 000 addresses to test. Sixteen
+/// times the bound is sixteen times the walk on exactly the asks that reach
+/// furthest, which is the asks that matter.
+///
+/// The reading says something more useful than a size. A compositor re-Stores
+/// the **same page set** every frame, so those 256-to-1024-deep reaches are a
+/// handful of distinct surfaces written over and over — and an older write to a
+/// page set a newer write already covers rules out nothing the newer one does
+/// not. So [`HostWrites::push`] supersedes: an incoming write equal to one the
+/// ring holds replaces it in place instead of appending, and this bound counts
+/// **distinct** writes rather than write events. A drag's live surfaces fit,
+/// and `answers_from` stops moving.
+///
+/// That is why the number did not change. What changed is what it counts.
 const RING: usize = 64;
 
 /// Census route banding how far back one ask reaches, in ring entries.
@@ -230,15 +271,38 @@ impl HostWrites {
 
     fn push(&mut self, what: Wrote) {
         self.epoch = self.epoch.wrapping_add(1);
-        self.recent.push_back((self.epoch, what));
-        while self.recent.len() > RING {
-            self.recent.pop_front();
-        }
-        self.answers_from = self
+        // Supersede an identical write rather than appending beside it. An older
+        // write to a page set this one repeats rules out nothing the newer one
+        // does not — for any mark `s`, the newer entry answers every reader the
+        // older would have — so dropping it costs no precision and stops a
+        // compositor's per-frame re-Store of one surface from spending the whole
+        // bound. This is what makes [`RING`] a count of distinct writes.
+        //
+        // The digest is only a filter: equal digests still compare in full, so a
+        // collision costs a `Vec` comparison and never merges two page sets that
+        // differ.
+        let digest = digest_of(&what);
+        if let Some(at) = self
             .recent
-            .front()
-            .map(|(epoch, _)| epoch.saturating_sub(1))
-            .unwrap_or(self.epoch);
+            .iter()
+            .position(|e| e.digest == digest && e.what == what)
+        {
+            self.recent.remove(at);
+        }
+        self.recent.push_back(Recent {
+            epoch: self.epoch,
+            digest,
+            what,
+        });
+        // An eviction is the only thing that really loses a write, so it is the
+        // only thing that may move `answers_from`. Taking it from the evicted
+        // entry rather than from the new front is what keeps a superseded entry
+        // — which leaves a gap in the retained epochs — from reading as a drop.
+        while self.recent.len() > RING {
+            if let Some(dropped) = self.recent.pop_front() {
+                self.answers_from = self.answers_from.max(dropped.epoch);
+            }
+        }
     }
 
     /// Has this device written any of `pages` since `since`, and if so on what
@@ -261,7 +325,7 @@ impl HostWrites {
             return HostWriteVerdict::Aged;
         }
         let mut asked: Option<BTreeSet<u64>> = None;
-        for (epoch, what) in self.recent.iter().rev() {
+        for Recent { epoch, what, .. } in self.recent.iter().rev() {
             if *epoch <= since {
                 break;
             }
@@ -372,6 +436,74 @@ mod tests {
         assert_eq!(
             w.wrote_any_since(&state, fresh, &[3 * P]),
             HostWriteVerdict::Quiet
+        );
+    }
+
+    /// A compositor re-Storing one surface every frame must not spend the bound,
+    /// and the repeat must still answer for itself.
+    ///
+    /// This is the reading the whole change is for: before superseding, the 4 097
+    /// repeats below pushed the first write out of the ring and every reader
+    /// older than the last [`RING`] frames read [`HostWriteVerdict::Aged`].
+    #[test]
+    fn a_write_repeated_every_frame_occupies_one_entry_and_never_ages() {
+        let state =
+            crate::model::DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let mut w = HostWrites::default();
+        let surface = vec![10 * P, 11 * P];
+        let stale = w.epoch();
+        for _ in 0..(RING as u64 * 64 + 1) {
+            w.note_pages(surface.clone());
+        }
+
+        assert_eq!(w.recent.len(), 1, "one distinct write, one entry");
+        assert_eq!(
+            w.wrote_any_since(&state, stale, &[999 * P]),
+            HostWriteVerdict::Quiet,
+            "a mark from before every one of those frames is still answerable"
+        );
+        // And the surviving entry answers for the whole run it stands in for, not
+        // only for the last frame — dropping the older repeats must lose no reach.
+        assert_eq!(
+            w.wrote_any_since(&state, stale, &[11 * P]),
+            HostWriteVerdict::Overlap
+        );
+
+        // A second distinct surface takes its own entry, so superseding merges
+        // repeats and not neighbours.
+        w.note_pages(vec![20 * P]);
+        assert_eq!(w.recent.len(), 2);
+        assert_eq!(
+            w.wrote_any_since(&state, stale, &[10 * P]),
+            HostWriteVerdict::Overlap,
+            "the first surface is still named after another was written"
+        );
+    }
+
+    /// Superseding leaves gaps in the retained epochs, so `answers_from` may only
+    /// move when an entry is really evicted. Taken from the *new front* instead,
+    /// it would jump to the newest superseded epoch and refuse readers the ring
+    /// can still answer — the failure that reads as "aging got worse".
+    #[test]
+    fn superseding_does_not_move_the_mark_the_ring_answers_from() {
+        let state =
+            crate::model::DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let mut w = HostWrites::default();
+        let stale = w.epoch();
+        w.note_pages(vec![P]);
+        // Repeats of a *later* set, each superseding the previous, so the front
+        // stays the epoch-1 entry while the epochs behind it become sparse.
+        for _ in 0..(RING as u64 * 4) {
+            w.note_pages(vec![2 * P]);
+        }
+        assert_eq!(w.recent.len(), 2);
+        assert_eq!(
+            w.wrote_any_since(&state, stale, &[3 * P]),
+            HostWriteVerdict::Quiet
+        );
+        assert_eq!(
+            w.wrote_any_since(&state, stale, &[P]),
+            HostWriteVerdict::Overlap
         );
     }
 
