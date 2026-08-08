@@ -207,6 +207,20 @@ pub(crate) struct ResourcePools {
     /// racing itself: nothing tells it when either draw runs. Copying twice does
     /// not make that guest correct, it only makes this device slower.
     ///
+    /// Same probe after the move, busiest census second:
+    ///
+    /// ```text
+    /// buffer_guest_gathers       19 372 ->  11 894
+    /// buffer_guest_gather_bytes    4.46 GB ->   2.71 GB
+    /// buffer_bind_reuses                -    23 947
+    /// batch_flush_draws           3 913 ->   4 635
+    /// ```
+    ///
+    /// Two binds in three are served from a copy this command buffer already
+    /// holds. Bus traffic per draw — this, plus the surface writeback going the
+    /// other way — went 2.25 MB to 1.69 MB while the drag ran 18 % more draws a
+    /// second, and its peak present rate went 68 Hz to 76 Hz.
+    ///
     /// # What ends an entry's life
     ///
     /// The slots named here live in `staging_live` / `gather_live`, so the map
