@@ -1002,6 +1002,40 @@ impl DeviceContext {
 /// `None` where the host has no such family, which is most integrated parts.
 /// That is the arrangement rather than a degraded one, and the caller keeps
 /// every copy on the graphics queue.
+///
+/// # What a boot found, and what it is worth
+///
+/// This was added without ever being read on a live device. It has been now, on
+/// the x86/Vulkan pathway against an RTX 5080 Laptop:
+///
+/// ```text
+/// vk_queues families=6 graphics_family=0 compute_capable=true transfer_family=1
+/// ```
+///
+/// So the copy engine is there, and every byte this device moves is still going
+/// to family 0 with the draws. The size of that is measurable rather than
+/// arguable, because the guest-page writeback carries its own GPU timestamps: a
+/// driven Safari-drag second reports `gpu_us=167437` over `gpu=836` copies —
+/// **167 ms of GPU time per second at ~200 us a copy**, which for a 3.33 MB
+/// copy is a healthy ~16 GB/s and not a slow rail. Scaling the buffer gather by
+/// its share of the bytes (2.74 GB/s against the writeback's 5.19) puts total
+/// copy occupancy near 255 ms/s.
+///
+/// In the same second `draw_phase`'s `slot_us` is 245 ms/s — the drain worker
+/// blocked in `begin_entry` on a ring slot whose fence the GPU has not signalled.
+/// Those two numbers being within 5 % of each other is the reason to look here:
+/// the CPU's wait for the GPU is about the size of the GPU's copy work, and that
+/// work is serialised against the rendering only because it shares a queue.
+///
+/// It is a correspondence, not a proof — neither number is a measurement of the
+/// other, and a copy engine is not free. Anything built on it has to answer
+/// three costs the shared queue does not pay: a cross-queue dependency needs a
+/// semaphore rather than a pipeline barrier, an image read by one family and
+/// written by another needs an ownership transfer or `CONCURRENT` sharing, and
+/// splitting a copy out of the batch it is currently appended to restores the
+/// second submission that appending it removed. The writeback is the better
+/// candidate of the two rails despite being the larger: nothing waits on it but
+/// the completion stamp, whereas a draw waits on its own gather.
 fn dedicated_transfer_family(families: &[vk::QueueFamilyProperties]) -> Option<u32> {
     families
         .iter()
