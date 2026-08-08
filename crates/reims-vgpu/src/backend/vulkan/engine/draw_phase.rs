@@ -288,6 +288,29 @@ pub(crate) enum Phase {
     /// and 18 000 of four hundred read identically, and only the second says the
     /// ring is the cap. The comment at the claim site has promised a
     /// `retire_wait_us` for a long time; this is it.
+    ///
+    /// # It was all of it
+    ///
+    /// First reading, driven Safari drag: `prep_us` **2 525 us/s** against
+    /// `slot_us` **314 491 us/s** over 3 845 draws. So the 111 -> 306 ms/s rise
+    /// in `prep_us` that followed the resident rungs was not preparation getting
+    /// slower by any amount — preparation is free, and the whole column is this
+    /// wait. With `ring_retire_blocks` at 17 863 that is roughly **425 us per
+    /// block**, which is not the jitter a deeper ring absorbs.
+    ///
+    /// What that says about `RING_DEPTH` is: probably not the lever. Eight slots
+    /// against ~2 100 submissions a second (`batch_flushes` 53 451 over the
+    /// boot) gives each submission 3.8 ms to retire, and something is exceeding
+    /// it. Doubling the ring doubles that budget once; halving the submissions
+    /// would do the same and keep the latency.
+    ///
+    /// The submission count is the more promising end, and the next thing to
+    /// measure is why: `batch_joins` 41 453 of `batch_flush_draws` 94 904 means
+    /// **56 % of draws force a fresh command buffer**. `joins` is a six-term
+    /// rule, one term of which is `!samples_own_target` — and a draw sampling
+    /// the target it renders into is exactly what
+    /// `draw::vulkan::try_gva_resident_sample` now makes common. Split that
+    /// predicate by refusing term before assuming which one binds.
     Slot = 1,
     Pipeline = 2,
     Stage = 3,
