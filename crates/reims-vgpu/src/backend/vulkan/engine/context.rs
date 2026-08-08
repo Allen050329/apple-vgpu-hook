@@ -1086,9 +1086,26 @@ impl DeviceContext {
 /// 5. The **next draw into that image** records the matching acquire, and its
 ///    submission must wait the second semaphore.
 ///
-/// Step 5 is the invasive one and the reason this is not a small change: it
-/// makes a graphics submission's wait list depend on which images the draws
-/// inside it touch, which nothing in the submission ring models today.
+/// Step 5 reads as the invasive one, because a per-image wait would make a
+/// graphics submission's wait list depend on which images the draws inside it
+/// touch, and nothing in the submission ring models that.
+///
+/// **A timeline semaphore removes that objection.** `timelineSemaphore` is core
+/// in Vulkan 1.2, which is this device's baseline, so it needs no capability
+/// gate. Keep one timeline for the transfer queue, incremented once per
+/// writeback submission. Capture its current value when a graphics command
+/// buffer *begins recording*, and have that submission wait the timeline at the
+/// captured value. Any image the draws touch that was released to `tq` was
+/// released by a transfer whose value is at or below what was captured, so the
+/// wait is sufficient for every one of them at once — one wait per submission,
+/// no per-image bookkeeping, and no stall in the ordinary case because those
+/// transfers were submitted before this command buffer was even recorded.
+///
+/// That turns step 5 from a redesign of the submission ring into a single extra
+/// wait value carried on the submit, and leaves the acquire itself as an extra
+/// pair of family indices on a barrier the draw path already emits — the
+/// registry tracks last access per image (`ResidentAccess`), so "released to the
+/// transfer family" is one more state there rather than a new mechanism.
 ///
 /// `CONCURRENT` sharing across the two families removes steps 1, 3 and 5 and is
 /// the tempting shortcut. It is a real trade rather than a free one — a
