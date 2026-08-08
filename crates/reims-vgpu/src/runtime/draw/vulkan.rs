@@ -2670,6 +2670,116 @@ fn load_buffer_content<M: HostMemory + HostOps>(
     Some(crate::backend::vulkan::engine::BufferContent::from(bytes))
 }
 
+/// Upper bound on the bytes this draw can read out of vertex buffer `index`,
+/// measured from the bind's own offset. `None` when the decoded contract does
+/// not bound it and the whole remaining allocation is the only safe answer.
+///
+/// This is a *bound*, not an estimate, and every approximation in it is taken in
+/// the widening direction: a per-instance step rate above 1 is ignored (fewer
+/// elements are actually fetched than counted here), and an attribute whose
+/// format or step function does not translate abandons the whole bind rather
+/// than contributing a narrower number than its neighbours.
+///
+/// The three ways the contract declines to bound a bind, all of which must stay
+/// `None`:
+///
+/// * **An indexed draw's per-vertex attributes.** The fetched element is the
+///   index buffer's value, which is an arbitrary `u16`/`u32` this function has
+///   not read. `vertex_count` counts *indices*, not the highest vertex they name.
+/// * **A `Constant` step function.** Those never reach the zero-copy rail —
+///   `constant_step_bufs` excludes them because the engine prepends a CPU
+///   base-instance prefix — so a bound here would describe a population that
+///   does not exist.
+/// * **No attribute naming this buffer index.** The buffer is bound but the
+///   vertex descriptor does not say how it is fetched, so nothing here knows
+///   the stride.
+fn vertex_bind_reach(
+    req: &DrawEncodeRequest,
+    attributes: &[crate::runtime::decode::resource::VertexAttribute],
+    index: u32,
+) -> Option<u64> {
+    let mut reach: Option<u64> = None;
+    for a in attributes.iter().filter(|a| a.buffer_index == index) {
+        if a.format == 0 {
+            continue;
+        }
+        let elements = match translate::vertex::step_function(a.declared_step_function).ok()? {
+            crate::backend::vulkan::engine::VertexStepFunction::PerVertex => {
+                if req.indexed.is_some() {
+                    return None;
+                }
+                u64::from(req.first_vertex) + u64::from(req.vertex_count)
+            }
+            crate::backend::vulkan::engine::VertexStepFunction::PerInstance => {
+                u64::from(req.base_instance) + u64::from(req.instance_count)
+            }
+            crate::backend::vulkan::engine::VertexStepFunction::Constant => return None,
+        };
+        if elements == 0 {
+            continue;
+        }
+        let format = translate::vertex::attribute_format(a.format).ok()?;
+        let element_end = u64::from(a.offset) + u64::from(translate::vertex::byte_size(format));
+        let this = u64::from(a.stride)
+            .saturating_mul(elements - 1)
+            .saturating_add(element_end);
+        reach = Some(reach.map_or(this, |r: u64| r.max(this)));
+    }
+    reach
+}
+
+/// Band a zero-copy vertex bind's *gathered* span against the reach the draw's
+/// own contract permits, into the `zcreach_*` route family.
+///
+/// The gather copies `size - offset` — everything from the bind offset to the
+/// end of the allocation — because that is the only span
+/// [`try_buffer_zero_copy_resolved`] has. On a driven boot that rail moves
+/// 2.74 GB/s at ~227 KB a gather, and nothing said how much of it a draw could
+/// read. AGENTS.md's rule for exactly this shape is to band the requested reach
+/// before narrowing anything, so this counts and does not act:
+///
+/// ```text
+/// zcreach_bounded / zcreach_unbounded      did the contract bound the bind
+/// zcreach_span_kb                          what the gather asks for
+/// zcreach_reach_kb                         what a bounded draw can read of it
+/// zcreach_le5 .. zcreach_full              the ratio, banded
+/// ```
+///
+/// `reach_kb / span_kb` over the bounded population is the number that says
+/// whether narrowing is worth its correctness risk. `unbounded_kb` is the half
+/// that cannot be narrowed at all, so a small `bounded` share caps the win no
+/// matter how favourable the ratio is.
+fn note_vertex_bind_reach(
+    req: &DrawEncodeRequest,
+    attributes: &[crate::runtime::decode::resource::VertexAttribute],
+    index: u32,
+    span: u64,
+) {
+    use crate::runtime::drain::{note_store_route, note_store_route_n};
+    if span == 0 {
+        return;
+    }
+    note_store_route_n("zcreach_span_kb", span / 1024);
+    // Clamped: a reach past the allocation is the guest's descriptor
+    // disagreeing with its own draw, and letting it exceed the span would make
+    // the ratio read above 100 % rather than saturating at "narrows nothing".
+    let Some(reach) = vertex_bind_reach(req, attributes, index).map(|r| r.min(span)) else {
+        note_store_route("zcreach_unbounded");
+        note_store_route_n("zcreach_unbounded_kb", span / 1024);
+        return;
+    };
+    note_store_route("zcreach_bounded");
+    note_store_route_n("zcreach_reach_kb", reach / 1024);
+    note_store_route(match reach.saturating_mul(100) / span {
+        0..=4 => "zcreach_le5",
+        5..=9 => "zcreach_le10",
+        10..=24 => "zcreach_le25",
+        25..=49 => "zcreach_le50",
+        50..=98 => "zcreach_le99",
+        _ => "zcreach_full",
+    });
+}
+
 /// Zero-copy linear sampled bind: resolve the texture's tight level-0 GVA
 /// window to packed-contiguous guest-RAM runs and hand the engine a
 /// [`SampledSource::GuestRuns`] — the GPU gathers the texels from imported
@@ -5028,6 +5138,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     },
                 ));
             };
+            // Only the zero-copy rail: `Bytes` was read by the CPU at the span
+            // the staging read chose, and banding it here would mix two
+            // populations under one ratio.
+            if let crate::backend::vulkan::engine::BufferContent::GuestRuns(ref src) = content {
+                note_vertex_bind_reach(req, &pd.vertex_attributes, b.index, src.total_len);
+            }
             vtx_storage.push((b.index, content));
         }
         drop(vertex_span);
@@ -7472,7 +7588,160 @@ fn gva_store_defer_eligible(req: &DrawEncodeRequest) -> bool {
 mod vulkan_split_tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
+    use crate::runtime::decode::resource::VertexAttribute;
     use crate::runtime::host::FakeHost;
+
+    /// `MTLVertexFormat.float2` — eight bytes, two 32-bit components. Named
+    /// rather than spelled `29` at four call sites below, and asserted against
+    /// the translate table so a renumbering fails here instead of silently
+    /// changing what the reach cases mean.
+    const FLOAT2: u32 = 29;
+    const FLOAT2_BYTES: u64 = 8;
+
+    fn attr(buffer_index: u32, offset: u32, stride: u32, step: Option<u32>) -> VertexAttribute {
+        VertexAttribute {
+            location: 0,
+            format: FLOAT2,
+            offset,
+            buffer_index,
+            stride,
+            declared_step_function: step,
+            ..VertexAttribute::default()
+        }
+    }
+
+    #[test]
+    fn the_float2_ordinal_this_files_reach_cases_use_is_still_float2() {
+        let f = translate::vertex::attribute_format(FLOAT2).expect("float2 must translate");
+        assert_eq!(
+            u64::from(translate::vertex::byte_size(f)),
+            FLOAT2_BYTES,
+            "the reach cases below are written against an eight-byte attribute"
+        );
+    }
+
+    /// A non-indexed per-vertex bind is bounded by `stride * (first + count)`,
+    /// which is the whole point: the gather asks for the rest of the allocation
+    /// and the draw can only reach this far into it.
+    #[test]
+    fn a_per_vertex_bind_reaches_exactly_its_last_elements_end() {
+        let req = DrawEncodeRequest {
+            vertex_count: 6,
+            first_vertex: 2,
+            instance_count: 1,
+            ..DrawEncodeRequest::default()
+        };
+        let attrs = [attr(0, 0, 16, Some(1))];
+        // Elements 0..=7 are fetchable (first_vertex is an offset into the
+        // stream, not a skip), so the last element starts at 7 * 16.
+        assert_eq!(
+            vertex_bind_reach(&req, &attrs, 0),
+            Some(7 * 16 + FLOAT2_BYTES)
+        );
+    }
+
+    /// The attribute's own offset inside the stride counts, and several
+    /// attributes on one interleaved buffer take the furthest of them.
+    #[test]
+    fn an_interleaved_bind_reaches_the_furthest_attributes_end() {
+        let req = DrawEncodeRequest {
+            vertex_count: 4,
+            instance_count: 1,
+            ..DrawEncodeRequest::default()
+        };
+        let attrs = [attr(0, 0, 32, Some(1)), attr(0, 24, 32, Some(1))];
+        assert_eq!(
+            vertex_bind_reach(&req, &attrs, 0),
+            Some(3 * 32 + 24 + FLOAT2_BYTES),
+            "the reach is the furthest attribute's end, not the first's"
+        );
+    }
+
+    /// An attribute on a *different* buffer index must not bound this one.
+    #[test]
+    fn a_bind_with_no_attribute_of_its_own_is_unbounded() {
+        let req = DrawEncodeRequest {
+            vertex_count: 4,
+            instance_count: 1,
+            ..DrawEncodeRequest::default()
+        };
+        let attrs = [attr(1, 0, 16, Some(1))];
+        assert_eq!(
+            vertex_bind_reach(&req, &attrs, 0),
+            None,
+            "nothing here knows buffer 0's stride"
+        );
+    }
+
+    /// The one that would lose guest work if it ever returned a number:
+    /// `vertex_count` counts indices, and the index values name arbitrary
+    /// vertices anywhere in the stream.
+    #[test]
+    fn an_indexed_draws_per_vertex_bind_is_unbounded() {
+        let req = DrawEncodeRequest {
+            vertex_count: 6,
+            instance_count: 1,
+            indexed: Some(IndexedDrawInfo::default()),
+            ..DrawEncodeRequest::default()
+        };
+        let attrs = [attr(0, 0, 16, Some(1))];
+        assert_eq!(
+            vertex_bind_reach(&req, &attrs, 0),
+            None,
+            "an index buffer can name any vertex in the stream"
+        );
+    }
+
+    /// A per-instance attribute is bounded by the instance range instead, and
+    /// an indexed draw does *not* unbound it — indices select vertices, not
+    /// instances.
+    #[test]
+    fn a_per_instance_bind_is_bounded_by_the_instance_range_even_when_indexed() {
+        let req = DrawEncodeRequest {
+            vertex_count: 999,
+            instance_count: 3,
+            base_instance: 1,
+            indexed: Some(IndexedDrawInfo::default()),
+            ..DrawEncodeRequest::default()
+        };
+        let attrs = [attr(0, 0, 64, Some(2))];
+        assert_eq!(
+            vertex_bind_reach(&req, &attrs, 0),
+            Some(3 * 64 + FLOAT2_BYTES)
+        );
+    }
+
+    /// A `Constant`-step attribute abandons the bind. The engine prepends a CPU
+    /// base-instance prefix to those, so the span the gather would narrow is not
+    /// the span the bind ends up using.
+    #[test]
+    fn a_constant_step_bind_is_unbounded() {
+        let req = DrawEncodeRequest {
+            vertex_count: 4,
+            instance_count: 1,
+            ..DrawEncodeRequest::default()
+        };
+        let attrs = [attr(0, 0, 16, Some(0))];
+        assert_eq!(vertex_bind_reach(&req, &attrs, 0), None);
+    }
+
+    /// An untranslatable step function abandons the whole bind rather than
+    /// letting its neighbour's narrower number stand for the bind.
+    #[test]
+    fn an_untranslatable_step_function_abandons_the_bind() {
+        let req = DrawEncodeRequest {
+            vertex_count: 4,
+            instance_count: 1,
+            ..DrawEncodeRequest::default()
+        };
+        // 3 is per-patch, which this device declines to translate.
+        let attrs = [attr(0, 0, 16, Some(1)), attr(0, 0, 16, Some(3))];
+        assert_eq!(
+            vertex_bind_reach(&req, &attrs, 0),
+            None,
+            "a bind is bounded by every attribute on it or by none"
+        );
+    }
 
     /// The blank-with-host-entry loss must be reported as a subset of a
     /// population, not as a bare count.
