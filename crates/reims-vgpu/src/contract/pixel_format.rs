@@ -144,6 +144,31 @@ impl TexelLayout {
     pub fn is_four_byte_color(self) -> bool {
         matches!(self, Self::Rgba8 | Self::Bgra8)
     }
+
+    /// Whether [`texel_to_rgba8`] carries an arm for this layout, so a rail
+    /// that declines has a CPU path to decline *to*.
+    ///
+    /// This is the question a performance threshold is really asking. A floor
+    /// that turns a small window away from a GPU gather is only a cost
+    /// decision when the CPU loader can serve it instead; for a layout with no
+    /// arm the same floor is a correctness gate wearing a threshold's clothes,
+    /// and the sample goes black or fail-visible rather than slow. The two
+    /// float layouts are colour-management LUTs, whose transfer curve unorm8
+    /// would quantize — which is why `texel_to_rgba8` deliberately has no arm
+    /// for them and why they must bypass any such floor.
+    ///
+    /// Spelled here rather than at the floors, because it is a property of the
+    /// layout and the loader, and a rail that re-lists the variants drifts the
+    /// first time one is added. It is deliberately **not** `is_four_byte_color`
+    /// even though the two agreed for as long as only four-byte colour reached
+    /// a floor: they answer different questions and diverge on `R8`/`Rg8`,
+    /// which have arms and are not four bytes.
+    pub fn has_cpu_loader_arm(self) -> bool {
+        match self {
+            Self::Rgba8 | Self::Bgra8 | Self::R8 | Self::Rg8 => true,
+            Self::R16Float | Self::R32Float => false,
+        }
+    }
 }
 
 #[repr(u8)]
@@ -1069,6 +1094,73 @@ pub fn convert_rgba8_to_row(format: u16, src_rgba: &[u8], pixels: u32, dst: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`TexelLayout::has_cpu_loader_arm`] answers for the loader it names.
+    ///
+    /// The two are separate spellings of one fact — a `match` over the layouts
+    /// and a `match` over the Metal formats — and nothing in the type system
+    /// holds them together, so this asks the loader directly rather than
+    /// re-listing the answer. A layout that gains a `texel_to_rgba8` arm, or
+    /// loses one, fails here instead of silently moving a zero-copy floor.
+    ///
+    /// The zero-copy sampled floor is the caller that cares: it may only turn a
+    /// window away when there is a CPU path to turn it away *to*, so a `true`
+    /// here that the loader does not honour is a black sample rather than a
+    /// slow one.
+    #[test]
+    fn the_cpu_loader_arm_predicate_agrees_with_the_loader() {
+        // One representative Metal format per layout, and a source buffer wide
+        // enough for the widest of them.
+        let cases = [
+            (TexelLayout::Rgba8, MTL_FORMAT_RGBA8_UNORM),
+            (TexelLayout::Bgra8, MTL_FORMAT_BGRA8_UNORM),
+            (TexelLayout::R8, MTL_FORMAT_R8_UNORM),
+            (TexelLayout::Rg8, MTL_FORMAT_RG8_UNORM),
+            (TexelLayout::R16Float, MTL_FORMAT_R16_FLOAT),
+            (TexelLayout::R32Float, MTL_FORMAT_R32_FLOAT),
+        ];
+        let src = [0u8; 8];
+        for (layout, mtl) in cases {
+            assert_eq!(
+                layout.has_cpu_loader_arm(),
+                texel_to_rgba8(mtl, &src).is_some(),
+                "{layout:?} ({mtl:#x}): the predicate and texel_to_rgba8 disagree"
+            );
+        }
+        // The case the predicate exists to separate: `Rg8` has an arm and is
+        // not four-byte colour, so the two questions genuinely differ. Without
+        // this the predicate could be `is_four_byte_color` and every assertion
+        // above would still pass on the layouts that reached a floor before.
+        assert!(TexelLayout::Rg8.has_cpu_loader_arm());
+        assert!(!TexelLayout::Rg8.is_four_byte_color());
+    }
+
+    /// `Rg8` guest bytes sample the same texel through the CPU loader and
+    /// through a native `R8G8_UNORM` image.
+    ///
+    /// This is the whole correctness argument for admitting `Rg8` to the
+    /// zero-copy linear gather, so it is asserted rather than described. The
+    /// CPU rail expands two guest bytes to `(r, g, 0, 255)`; Vulkan samples
+    /// `R8G8_UNORM` as `(r, g, 0, 1)`, which is that texel in unorm. Same for
+    /// `R8`. If the loader ever stopped writing an opaque alpha or started
+    /// filling blue, the gather and the fallback would paint differently
+    /// depending only on the window's size relative to the floor — the worst
+    /// shape a divergence can take, because it reproduces intermittently.
+    #[test]
+    fn the_two_byte_and_one_byte_layouts_sample_as_the_native_image_does() {
+        let rg = texel_to_rgba8(MTL_FORMAT_RG8_UNORM, &[0x11, 0x22]).expect("Rg8 has an arm");
+        assert_eq!(
+            rg,
+            [0x11, 0x22, UNORM8_MIN, UNORM8_MAX],
+            "R8G8_UNORM samples (r, g, 0, 1)"
+        );
+        let r = texel_to_rgba8(MTL_FORMAT_R8_UNORM, &[0x33]).expect("R8 has an arm");
+        assert_eq!(
+            r,
+            [0x33, UNORM8_MIN, UNORM8_MIN, UNORM8_MAX],
+            "R8_UNORM samples (r, 0, 0, 1)"
+        );
+    }
 
     /// Every byte of the buffer is the colour, at a geometry with no square
     /// root and no power of two, so an off-by-one in either axis shows.

@@ -2574,12 +2574,28 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // identical and the CPU loaders never decoded either. The qualifier is
     // still lost, so the census records it rather than letting the fold be
     // silent.
-    // Four-byte colour (BGRA8/RGBA8) or a single-channel float LUT: all sample
-    // byte-identically through the matching native Vulkan image. Other layouts
-    // (R8/Rg8 video planes) keep their existing CPU/type-5 rails. `R32_SFLOAT`
-    // additionally needs the optional linear-filter feature — LUTs are sampled
-    // with interpolation — so it is gated on the host capability and otherwise
-    // declines here, leaving the sample fail-visible (no CPU float loader arm).
+    // **Every layout `sampled_pixels` returns is admitted**, which is the same
+    // rule `try_type5_sample_zero_copy` states and applies: that function is
+    // the answer to "which guest bytes sample byte-identically through the
+    // matching Vulkan image", and a layout it hands back has already passed
+    // the identity-components test inside it. The engine creates the image
+    // with `vk_texel_layout(native)`, so the texel size and channel order come
+    // from the same answer and cannot disagree with it.
+    //
+    // This rail used to narrow that set again, to four-byte colour plus the
+    // single-channel floats, on the stated grounds that "R8/Rg8 video planes
+    // keep their existing CPU/type-5 rails". The premise was that R8 and Rg8
+    // only ever arrive as video; they do not. A Safari window drag with no
+    // video playing produced 37 704 `Rg8` binds, 49 % of every linear sampled
+    // bind in the boot, and each one fell to `load_linear_guest_memoized`'s
+    // full-span guest re-read plus memcmp. The narrowing was never a
+    // correctness rule — `texel_to_rgba8` expands `Rg8` to `(r, g, 0, 255)`
+    // and an `R8G8_UNORM` image samples `(r, g, 0, 1)`, which is the same
+    // texel — so what it bought was the CPU path on half the binds.
+    //
+    // `R32_SFLOAT` keeps its extra condition, and it is a host capability
+    // rather than a layout one: LUTs are sampled with interpolation and that
+    // format's linear-filter feature is optional (absent on Apple/MoltenVK).
     //
     // The two ways a format declines are separated, because they want opposite
     // fixes and a single count reads the same for both. `sampled_pixels`
@@ -2587,11 +2603,8 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // format at all — either it is undefined, or its Metal channels do not sit
     // identically on their Vulkan ones, which is a component mapping this rail
     // does not yet carry. Answering `Ok` with a layout this rail does not admit
-    // means the layout exists and the eligibility test below turned it down.
-    // The first is closed by teaching the table a format; the second by
-    // widening what the gather accepts. Both fall to
-    // `load_linear_guest_memoized`, so both cost the same and only the fix
-    // differs.
+    // now means only the `R32_SFLOAT` filter gate. The first is closed by
+    // teaching the table a format; the second by a host that can filter it.
     let native = match translate::pixel::sampled_pixels(declared_format) {
         // Deduped per declared format, which is a handful of values a boot
         // enumerates in a handful of lines. The number is the guest's own
@@ -2609,23 +2622,8 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             return None;
         }
         Ok((layout, decline)) => {
-            let eligible = layout.is_four_byte_color()
-                || layout == TexelLayout::R16Float
-                || (layout == TexelLayout::R32Float
-                    && engine::supports_sampled_r32f_linear_filter());
-            if !eligible {
-                crate::runtime::drain::note_store_route(match layout {
-                    TexelLayout::R8 => "zc_lin_format_r8",
-                    TexelLayout::Rg8 => "zc_lin_format_rg8",
-                    TexelLayout::R32Float => "zc_lin_format_r32f_unfilterable",
-                    // Admitted by `eligible` above, so reaching here would mean
-                    // the two rules had drifted apart. A healthy zero: a firing
-                    // is the bug, and it would otherwise be invisible because
-                    // the caller's fallback still paints the right pixels.
-                    TexelLayout::Rgba8 | TexelLayout::Bgra8 | TexelLayout::R16Float => {
-                        "zc_lin_format_eligible_but_refused"
-                    }
-                });
+            if layout == TexelLayout::R32Float && !engine::supports_sampled_r32f_linear_filter() {
+                crate::runtime::drain::note_store_route("zc_lin_format_r32f_unfilterable");
                 return None;
             }
             if decline.is_some() {
@@ -2653,12 +2651,21 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("zc_lin_unstrideable");
         return None;
     };
-    // The min-byte floor keeps small four-byte textures on the cheaper CPU
-    // memo/cache path. Single-channel float LUTs have no CPU loader arm
-    // (`texel_to_rgba8` returns `None`), so this native gather is their only
-    // correct rail — exempt them from the floor or a small display-profile LUT
-    // would fall through to a failed resolve.
-    if native.is_four_byte_color() && span < ZERO_COPY_SAMPLED_MIN_BYTES {
+    // The min-byte floor keeps small textures on the cheaper CPU memo/cache
+    // path. It applies to every layout that has somewhere to be turned away
+    // *to*: the single-channel float LUTs have no CPU loader arm
+    // (`texel_to_rgba8` returns `None` for them), so this native gather is
+    // their only correct rail and a floor over them would not be a cost
+    // decision at all — a small display-profile LUT would fall through to a
+    // failed resolve.
+    //
+    // Asked as `has_cpu_loader_arm` and not `is_four_byte_color`. The two
+    // agreed for as long as only four-byte colour could reach here, and they
+    // stop agreeing the moment `R8`/`Rg8` are admitted above: those have arms
+    // and are not four bytes, so the four-byte spelling would have waved every
+    // one of them past the floor — including the 3.6 KiB scroll glyphs the
+    // floor's own doc names as legitimately preferring the CPU byte path.
+    if native.has_cpu_loader_arm() && span < ZERO_COPY_SAMPLED_MIN_BYTES {
         // Banded, because the floor's own doc argues from where the workload's
         // spans cluster relative to it, and a bare count cannot re-check that
         // argument on a workload the doc was not tuned against. The bands are
