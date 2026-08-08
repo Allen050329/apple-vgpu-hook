@@ -704,17 +704,37 @@ impl WindowPresenter {
             .surface_loader
             .get_physical_device_surface_formats(ctx.pd, self.surface)
             .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowSurfaceFormats, error)))?;
+        // Prefer the scanout pair, then any sRGB pair, then whatever the surface
+        // has. The middle step is what keeps `VK_EXT_swapchain_colorspace` from
+        // changing the pick just by widening the list: a wide-gamut entry is only
+        // ever taken when nothing sRGB is offered at all.
         let format = formats
             .iter()
             .find(|format| {
                 format.format == translate::pixel::SCANOUT_FORMAT
                     && format.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
             })
+            .or_else(|| {
+                formats
+                    .iter()
+                    .find(|format| format.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR)
+            })
             .or_else(|| formats.first())
             .copied()
             .ok_or(DrawError::Unsupported(
                 super::reason::DrawReason::SwapchainNoSurfaceFormat,
             ))?;
+        // The guest composites some surfaces in `RGBA16Float`, which carries a
+        // wider gamut than the sRGB pair above can express, and the surface may
+        // offer a colour space that could. Naming both the pick and the menu is
+        // what makes that gap measurable instead of invisible.
+        crate::observe::off(format!(
+            "swapchain_surface_formats n={} chosen={:?}/{:?} offered=[{}]",
+            formats.len(),
+            format.format,
+            format.color_space,
+            surface_format_menu(&formats)
+        ));
         let extent = if caps.current_extent.width != u32::MAX {
             caps.current_extent
         } else {
@@ -1654,6 +1674,28 @@ unsafe fn blit_rect(
     );
 }
 
+/// The surface's `format/colour space` pairs as one bounded log field.
+///
+/// Capped at [`SURFACE_MENU_CAP`] pairs with a trailing `…`, because the count
+/// grows with every colour space the instance enables and a swapchain rebuild
+/// must not be able to emit an unbounded line.
+fn surface_format_menu(formats: &[vk::SurfaceFormatKHR]) -> String {
+    let mut menu = String::new();
+    for (i, format) in formats.iter().take(SURFACE_MENU_CAP).enumerate() {
+        if i > 0 {
+            menu.push(' ');
+        }
+        menu.push_str(&format!("{:?}/{:?}", format.format, format.color_space));
+    }
+    if formats.len() > SURFACE_MENU_CAP {
+        menu.push_str(" …");
+    }
+    menu
+}
+
+/// Pairs named individually by [`surface_format_menu`] before it elides the rest.
+const SURFACE_MENU_CAP: usize = 12;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1990,5 +2032,42 @@ mod tests {
         let capped = swapchain_plan(1, 2, &[fifo, mailbox]);
         assert_eq!(capped.present_mode, mailbox);
         assert_eq!(capped.image_count, 2);
+    }
+
+    /// The menu exists to show which colour spaces a host offers beyond sRGB, so
+    /// it has to name a wide-gamut pair rather than summarise it, and it has to
+    /// stay one bounded line however many the instance turns on.
+    #[test]
+    fn the_surface_menu_names_wide_gamut_pairs_and_stays_bounded() {
+        let pair = |format, color_space| vk::SurfaceFormatKHR {
+            format,
+            color_space,
+        };
+        let offered = [
+            pair(
+                vk::Format::B8G8R8A8_UNORM,
+                vk::ColorSpaceKHR::SRGB_NONLINEAR,
+            ),
+            pair(
+                vk::Format::R16G16B16A16_SFLOAT,
+                vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT,
+            ),
+        ];
+        let menu = surface_format_menu(&offered);
+        assert!(menu.contains("B8G8R8A8_UNORM"), "{menu}");
+        assert!(menu.contains("R16G16B16A16_SFLOAT"), "{menu}");
+        assert!(!menu.contains('…'), "nothing to elide at two pairs: {menu}");
+
+        let crowded = vec![
+            pair(
+                vk::Format::B8G8R8A8_UNORM,
+                vk::ColorSpaceKHR::SRGB_NONLINEAR
+            );
+            SURFACE_MENU_CAP + 1
+        ];
+        assert!(
+            surface_format_menu(&crowded).ends_with('…'),
+            "a crowded surface must elide rather than grow the line"
+        );
     }
 }

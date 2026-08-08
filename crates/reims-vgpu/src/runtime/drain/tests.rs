@@ -318,32 +318,45 @@ fn the_snapshot_rule_reads_the_same_for_both_rings() {
 }
 
 #[test]
-fn display_descriptor_advertises_four_modes_incl_4k() {
+fn display_descriptor_advertises_every_mode_with_1080p_first() {
     let mut host = FakeHost::new();
     let gpa = 0x7a000000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
     fill_display_descriptor(&mut host, gpa, 0, PAGE_SIZE_ARM64E);
+
+    // Element 0 is the preferred mode and the one the guest boots at, so it stays
+    // 1920x1080 however many are appended after it. Stride 0x10 from base 0x210;
+    // each element is width, height, then a 16.16 refresh.
+    const EXPECTED: &[(u16, u16)] = &[
+        (1920, 1080),
+        (1440, 1080),
+        (1280, 1024),
+        (3840, 2160),
+        (3440, 1440),
+    ];
+
     let mut count = [0u8; 2];
     host.read_gpa(gpa + DISPLAY_DESC_TIMING_COUNT, &mut count)
         .unwrap();
-    assert_eq!(u16::from_le_bytes(count), 4);
+    assert_eq!(u16::from_le_bytes(count) as usize, EXPECTED.len());
+
     let read16 = |host: &mut FakeHost, off: u64| {
         let mut b = [0u8; 2];
         host.read_gpa(gpa + off, &mut b).unwrap();
         u16::from_le_bytes(b)
     };
-    // Element 0 (native/preferred) stays 1920×1080; 4K is appended last so
-    // boot resolution is unchanged. Stride 0x10 from base 0x210.
-    assert_eq!(read16(&mut host, 0x210), 1920);
-    assert_eq!(read16(&mut host, 0x212), 1080);
-    assert_eq!(read16(&mut host, 0x220), 1440);
-    assert_eq!(read16(&mut host, 0x230), 1280);
-    assert_eq!(read16(&mut host, 0x240), 3840);
-    assert_eq!(read16(&mut host, 0x242), 2160);
-    // Every element carries the same 120 Hz refresh (16.16 fixed-point).
-    let mut refresh = [0u8; 4];
-    host.read_gpa(gpa + 0x244, &mut refresh).unwrap();
-    assert_eq!(u32::from_le_bytes(refresh), DISPLAY_REFRESH_HZ << 16);
+    for (index, &(width, height)) in EXPECTED.iter().enumerate() {
+        let entry = 0x210 + 0x10 * index as u64;
+        assert_eq!(read16(&mut host, entry), width, "mode {index} width");
+        assert_eq!(read16(&mut host, entry + 2), height, "mode {index} height");
+        let mut refresh = [0u8; 4];
+        host.read_gpa(gpa + entry + 4, &mut refresh).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(refresh),
+            DISPLAY_REFRESH_HZ << 16,
+            "mode {index} refresh"
+        );
+    }
 }
 
 #[test]
