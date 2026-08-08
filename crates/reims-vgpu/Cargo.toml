@@ -2,7 +2,7 @@
 name = "reims-vgpu"
 version = "0.1.0"
 edition = "2021"
-description = "Reims vGPU host path: protocol, device, QEMU C ABI, Metal/Vulkan backends"
+description = "Apple vGPU Hook host path: protocol, device, QEMU C ABI, Metal/Vulkan backends"
 license = "GPL-2.0-or-later"
 
 [lints.rust]

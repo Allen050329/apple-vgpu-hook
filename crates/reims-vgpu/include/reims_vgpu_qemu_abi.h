@@ -204,7 +204,7 @@ typedef struct ReimsVgpuGuestRamRegion {
  *                       -> qemu_input_event_send_key_linux (QEMU owns evdev->qcode).
  * INPUT_POINTER_MOVE:   a0 = x px, a1 = y px, a2 = surface width, a3 = height.
  *                       Absolute (usb-tablet); shim scales via qemu_input_queue_abs.
- * INPUT_POINTER_BUTTON: a0 = neutral Reims VGPU button code (ReimsVgpuButton), a1 = 1/0.
+ * INPUT_POINTER_BUTTON: a0 = neutral Apple vGPU Hook button code (ReimsVgpuButton), a1 = 1/0.
  *                       Wheel notches arrive as a down+up pair; shim maps the
  *                       code to QEMU InputButton.
  */

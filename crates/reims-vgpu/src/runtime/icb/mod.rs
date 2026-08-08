@@ -10,7 +10,7 @@
 //!
 //! ## Command fills — buffer-backed, not stream opcodes
 //!
-//! There is **no** Reims VGPU compute-stream opcode for
+//! There is **no** Apple vGPU Hook compute-stream opcode for
 //! `indirectComputeCommandAtIndex` fills. Guest CPU
 //! writes into an ICB backing buffer via
 //! `PGSerializerIndirectComputeCommand` (setPSO / setKernelBuffer /

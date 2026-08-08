@@ -100,7 +100,7 @@ macOS 13 Ventura is the recommended guest release for bring-up.
    # Console only (mainstream OSX-KVM-style VGA) while you debug the host stack
    vm/boot-x86.sh --testing --device vmware-svga
 
-   # Product Reims VGPU device (needs in-tree QEMU + reims-vgpu Vulkan)
+   # Product Apple vGPU Hook device (needs in-tree QEMU + reims-vgpu Vulkan)
    REIMS_VGPU_BACKEND=vulkan scripts/qemu-build/qemu-build.sh --target x86_64
    vm/boot-x86.sh --testing --device reims-vgpu-pci
 

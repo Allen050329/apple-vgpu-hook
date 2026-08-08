@@ -4,7 +4,7 @@
 #
 # Display is selected by --device (primary VGA):
 #   vmware-svga      default console (OSX-KVM mainstream)
-#   reims-vgpu-pci   product Reims VGPU (thin C → reims-vgpu); -vga none + secondary bus
+#   reims-vgpu-pci   product Apple vGPU Hook (thin C → reims-vgpu); -vga none + secondary bus
 #
 # SNAPSHOT-REVERT (same model as vm/boot-arm64.sh): snapshots form an IMMUTABLE
 # HISTORY under `vm/disks/snapshots/<label>/{macos.img,OpenCore.qcow2,OVMF_VARS.fd}`
@@ -90,10 +90,10 @@ usage() {
 usage: vm/boot-x86.sh [--device reims-vgpu-pci|vmware-svga] [--testing|--interactive|--snapshot]
 
   --device NAME          primary VGA (default: reims-vgpu-pci)
-                         reims-vgpu-pci   product Reims VGPU (PCI thin shim → reims-vgpu),
+                         reims-vgpu-pci   product Apple vGPU Hook (PCI thin shim → reims-vgpu),
                                             host-owned Vulkan window (present + input)
                          vmware-svga         legacy OSX-KVM console (QEMU gtk window;
-                                            no GPU output once the guest uses Reims vGPU)
+                                            no GPU output once the guest uses Apple vGPU Hook)
   --testing              agent boot (default): GUI, ${TESTING_TIMEOUT}s hard kill, reverts
   --interactive          human/GUI boot, no time limit, reverts
   --snapshot             boot writable; a clean guest shutdown CAPTURES a new snapshot
@@ -304,7 +304,7 @@ case "$NET" in
   *) die "unknown NET: $NET (user | none)" ;;
 esac
 
-# Product Reims VGPU: Tahoe x86 kext path is sensitive to high SMP (StorageNode::init).
+# Product Apple vGPU Hook: Tahoe x86 kext path is sensitive to high SMP (StorageNode::init).
 if [ "$GFX_DEVICE" = "reims-vgpu-pci" ]; then
   if [ "${CPU_THREADS}" -gt 8 ] 2>/dev/null; then
     echo "boot-x86.sh: reims-vgpu-pci — capping SMP at 8 (was threads=$CPU_THREADS cores=$CPU_CORES)"

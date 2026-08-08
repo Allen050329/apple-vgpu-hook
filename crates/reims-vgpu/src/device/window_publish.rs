@@ -147,7 +147,7 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         }
     });
     let cfg = WindowConfig {
-        title: "Reims vGPU".to_string(),
+        title: "Apple vGPU Hook".to_string(),
         width: if width == 0 {
             crate::model::EFI_BOOT_WIDTH
         } else {

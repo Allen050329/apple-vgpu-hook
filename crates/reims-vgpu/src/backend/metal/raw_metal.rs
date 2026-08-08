@@ -569,9 +569,9 @@ pub fn set_imageblock_width_height(
 // These selectors are present on Apple Silicon MTLComputeCommandEncoder
 // (AGX*FamilyComputeContext) but are not in the public Metal.framework headers
 // that metal-0.33 wraps. Verified by runtime respondsToSelector + smoke encode.
-// Wire contract: Reims VGPU compute 0xdc..0xe2 / 0xe4..0xe5 (compute-surface-manifest).
+// Wire contract: Apple vGPU Hook compute 0xdc..0xe2 / 0xe4..0xe5 (compute-surface-manifest).
 //
-// Condition `comparison` is the Reims VGPU/MetalSerializer enum passed through as-is
+// Condition `comparison` is the Apple vGPU Hook/MetalSerializer enum passed through as-is
 // (NOT MTLCompareFunction): host probe shows Equal=0 (buffer==reference),
 // Less=1, Always=7 among others. Product must not remap wire values.
 // ---------------------------------------------------------------------------

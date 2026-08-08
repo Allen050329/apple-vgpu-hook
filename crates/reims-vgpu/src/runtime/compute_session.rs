@@ -1305,7 +1305,7 @@ mod tests {
         write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &data_bytes);
 
         // Phase B: if wraps nested dispatch. Concurrent encoder is the intended
-        // SPI host for encodeStartIf. Wire comparison is the Reims VGPU encoder's enum
+        // SPI host for encodeStartIf. Wire comparison is the Apple vGPU Hook encoder's enum
         // (not MTLCompareFunction): Equal=0 for buffer==reference (probed).
         let mut session = ComputeSession::open(1).expect("session");
         let start = ComputeCommand {

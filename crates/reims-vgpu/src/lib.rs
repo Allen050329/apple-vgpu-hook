@@ -1,4 +1,4 @@
-//! Reims vGPU host path — single crate.
+//! Apple vGPU Hook host path — single crate.
 //!
 //! | Module | Role |
 //! | --- | --- |

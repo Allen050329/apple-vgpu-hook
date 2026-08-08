@@ -29,7 +29,7 @@ SCRIPT_NAME="screenshot-when-kde-plasma-host"
 # common case needs no selector at all -- asking the caller to pass a string the
 # tree already knows is what --match used to do, and it could not disambiguate
 # two VMs anyway (both windows carry this same caption; use --window for that).
-DEFAULT_TITLE="Reims vGPU"
+DEFAULT_TITLE="Apple vGPU Hook"
 
 usage() {
   cat <<'EOF'

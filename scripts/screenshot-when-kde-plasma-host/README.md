@@ -37,7 +37,7 @@ anything about present correctness.
 ## Default selector
 
 With no selector the script now selects the window whose caption contains
-**`Reims vGPU`** — the title `device_window_start` gives the winit window in
+**`Apple vGPU Hook`** — the title `device_window_start` gives the winit window in
 `crates/reims-vgpu`. It is a constant in our own tree, so making the caller
 supply it is unnecessary.
 

@@ -2599,7 +2599,7 @@ fn texture_view_ranged_form() {
 fn decodes_opcode9_buffer_texture_live_blobs() {
     // Two real 64-byte opcode-9 descriptors captured from a live x86
     // reims-vgpu-pci boot (Notification Center widget-tile sampled inputs,
-    // pipe=51/53). See journal 2026-07-17 Reims VGPU-VIEW-RESOLVE-OPCODE9.
+    // pipe=51/53). See journal 2026-07-17 Apple vGPU Hook-VIEW-RESOLVE-OPCODE9.
     let b1 = hex_to_bytes(
         "0900000040000000090000000800000000000000000000000005000000000000\
          421150001c0100001c0100000100000001000100010010000000000000000000",

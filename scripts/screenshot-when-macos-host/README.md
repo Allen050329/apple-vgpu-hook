@@ -1,6 +1,6 @@
-# Reims vGPU screenshot (macOS)
+# Apple vGPU Hook screenshot (macOS)
 
-`screenshot-when-macos-host.sh` captures the exact host window titled `Reims vGPU`
+`screenshot-when-macos-host.sh` captures the exact host window titled `Apple vGPU Hook`
 on a macOS host. It resolves the window through ScreenCaptureKit and uses a
 desktop-independent window filter, so the capture includes compositor-owned
 Metal content while the window is inactive or covered and after the guest

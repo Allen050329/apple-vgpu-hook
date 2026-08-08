@@ -1432,7 +1432,7 @@ mod tests {
         assert_eq!(back[3], 255);
     }
 
-    /// Metal color-renderable 8-bit + f16 set used as Reims VGPU pass attachments.
+    /// Metal color-renderable 8-bit + f16 set used as Apple vGPU Hook pass attachments.
     /// Bring-up only admitted BGRA8/RGBA16F (compositor FBs); apps use RGBA8.
     #[test]
     fn color_renderable_formats_admit_app_rts() {

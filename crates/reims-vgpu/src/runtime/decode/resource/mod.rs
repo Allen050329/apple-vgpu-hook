@@ -1650,7 +1650,7 @@ pub enum Descriptor {
     IndirectCommandBuffer(IndirectCommandBufferDescriptor),
 }
 
-/// Live Reims VGPU object-list entry size (kb + reims-vgpu-resource-format).
+/// Live Apple vGPU Hook object-list entry size (kb + reims-vgpu-resource-format).
 pub const OBJECT_LIST_ENTRY_LEN: usize = 12;
 pub const OBJECT_LIST_ENTRY_HEADER: usize = 0;
 pub const OBJECT_LIST_ENTRY_DESC_GVA: usize = 4;
@@ -1665,7 +1665,7 @@ pub struct ListObjectEntry {
     pub descriptor_gva: u64,
 }
 
-/// Decode one 12-byte object-list entry (live arm Reims VGPU contract).
+/// Decode one 12-byte object-list entry (live arm Apple vGPU Hook contract).
 pub fn decode_list_object_entry(bytes: &[u8]) -> Result<ListObjectEntry, DecodeStatus> {
     if bytes.len() < OBJECT_LIST_ENTRY_LEN {
         return Err(DecodeStatus::ErrShort("res_list_entry_short"));

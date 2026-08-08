@@ -5,7 +5,7 @@
 # Display is selected by --device (machine property gfx-device):
 #   apple-gfx-mmio     Apple ParavirtualizedGraphics.framework (reference, default)
 #   reims-vgpu-mmio    product thin C → crates/reims-vgpu Rust staticlib
-# The vmapple machine creates exactly one device at the fixed Reims vGPU GFX/IOSFC
+# The vmapple machine creates exactly one device at the fixed Apple vGPU Hook GFX/IOSFC
 # addresses — do not add a second display via -device.
 #
 # Snapshot revert: snapshots form an
@@ -62,7 +62,7 @@ usage() {
   cat <<EOF
 usage: vm/boot-arm64.sh [--device apple-gfx-mmio|reims-vgpu-mmio] [--testing|--interactive|--snapshot]
 
-  --device NAME          Reims vGPU slot backend (default: apple-gfx-mmio)
+  --device NAME          Apple vGPU Hook slot backend (default: apple-gfx-mmio)
                          apple-gfx-mmio  Apple PVG framework (reference)
                          reims-vgpu-mmio    product (reims-vgpu Rust path)
   --testing              agent boot (default): GUI, ${TESTING_TIMEOUT}s hard kill, reverts

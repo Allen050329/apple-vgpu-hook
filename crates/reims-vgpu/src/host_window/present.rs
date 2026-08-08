@@ -115,7 +115,7 @@ pub struct WindowConfig {
 impl Default for WindowConfig {
     fn default() -> Self {
         Self {
-            title: "Reims vGPU".to_string(),
+            title: "Apple vGPU Hook".to_string(),
             width: 1280,
             height: 800,
         }

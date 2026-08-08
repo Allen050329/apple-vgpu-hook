@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
-# Capture a screenshot of the "Reims vGPU" window on macOS.
+# Capture a screenshot of the "Apple vGPU Hook" window on macOS.
 #
 # Usage:
 #   ./screenshot-when-macos-host.sh [output-path]
 #
 # If no output path is given, saves to /tmp as:
-#   /tmp/Reims-vGPU-YYYYMMDD-HHMMSS.png
+#   /tmp/apple-vgpu-hook-YYYYMMDD-HHMMSS.png
 #
 # Requires Screen & System Audio Recording permission for Terminal (or the app
 # running this script).
 
 set -euo pipefail
 
-WINDOW_NAME="Reims vGPU"
+WINDOW_NAME="Apple vGPU Hook"
 # Optional process name hint (QEMU guest display). Exact title still wins.
 PROCESS_HINT="${REIMS_PROCESS_HINT:-qemu-system}"
 OUTPUT="${1:-}"
 
 if [[ -z "$OUTPUT" ]]; then
   timestamp="$(date +%Y%m%d-%H%M%S)"
-  OUTPUT="/tmp/Reims-vGPU-${timestamp}.png"
+  OUTPUT="/tmp/apple-vgpu-hook-${timestamp}.png"
 fi
 
 # Resolve absolute path for clearer messaging.

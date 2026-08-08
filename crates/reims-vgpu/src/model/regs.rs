@@ -1,4 +1,4 @@
-//! Register-window and FIFO wire constants from the live Reims VGPU contract.
+//! Register-window and FIFO wire constants from the live Apple vGPU Hook contract.
 //!
 //! Sources: `apple-pv-gpu.h`, `reims_vgpu_fifo_format.h`.
 //! Values are protocol constants — not content heuristics.

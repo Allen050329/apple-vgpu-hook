@@ -2772,7 +2772,7 @@ fn view_swizzle_remaps_rgba8_pixels() {
     // pathway replaced with a component mapping, and an unreported
     // invocation is a texture that silently lost its zero-copy crossing.
     crate::runtime::census::view_swizzle_census::reset_for_tests();
-    // Reims VGPU selectors: 0=zero 1=one 2=R 3=G 4=B 5=A → BGRA order + forced alpha one.
+    // Apple vGPU Hook selectors: 0=zero 1=one 2=R 3=G 4=B 5=A → BGRA order + forced alpha one.
     let plan = pixel_format::swizzle_plan(&[4, 3, 2, 1]).unwrap();
     let mut rgba = vec![10u8, 20, 30, 40, 50, 60, 70, 80];
     apply_view_swizzle_rgba8(&mut rgba, Some(&plan), 1).unwrap();
