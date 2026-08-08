@@ -50,6 +50,10 @@
 //! | `gw_refused_host_write` | this device wrote pages of this window |
 //! | `gw_unarmed` | no token, or a generation not yet readable — no answer |
 //! | `gw_rearm` | the window's page set changed, so nothing to compare against |
+//! | `gw_audit_seed` | first fold of this window — expected, and not the alarm |
+//! | `gw_audit_restart` | the stride came due and the baseline had been dropped: **the audit declining to compare** |
+//! | `gw_audit_ok` | folded under a live baseline and the bytes agreed |
+//! | `gw_audit_unsound` | folded under a live baseline and the bytes had moved |
 //!
 //! # The half that refuses is `gw_refused_host_write`, by 368 to 1
 //!
@@ -68,7 +72,34 @@
 //! side is what refuses them, and each refusal costs the next bind a full
 //! re-gather — 68 % of that rail's misses on the same boot, against 32 % that
 //! were a retained image the cache had dropped. So the cache is not the lever.
-//! `gw_audit_unsound` at 0 says the witness stayed sound throughout.
+//!
+//! That reading used to end "`gw_audit_unsound` at 0 says the witness stayed
+//! sound throughout." **It says no such thing**, and the next section is why.
+//!
+//! # The audit has never once compared, and its zero is not a measurement
+//!
+//! [`ContentAudit`] is the alarm for a writer that escapes both halves. To
+//! reach a comparison it needs a fold taken under a vouch and still valid at
+//! the next stride bind — and `fold_valid` is dropped by **any single refused
+//! bind**, correctly, because a refusal means the bytes were free to move. So
+//! a comparison needs [`AUDIT_STRIDE`] *consecutive* vouched binds of one
+//! window.
+//!
+//! At the refusal rates every driven boot of this device measures — of the
+//! order of 4 700 refusals against 7 300 vouches — a run of 64 is a coincidence
+//! this workload does not produce. Three consecutive driven boots read
+//! `gw_audit_ok` **0** against `gw_audit_seed` 163-175: every audit bind was a
+//! first fold and the fold was never once checked against a previous one.
+//!
+//! `gw_audit_unsound` is therefore 0 because the comparison never ran, not
+//! because it ran and agreed. A real escaping writer went unnoticed behind that
+//! zero on this branch — the GPU-direct GVA Store wrote guest pages without
+//! recording them, and the audit was structurally incapable of noticing.
+//!
+//! **Read `gw_audit_restart` beside it.** While that dominates `gw_audit_ok`,
+//! the alarm is not running. The repair is to re-seed the fold on the *refused*
+//! binds, where the gather reads those bytes anyway, so a baseline survives to
+//! meet the next vouch; it is not done here.
 //!
 //! # It was the ring, not the writes: `gw_hw_aged` 4275 against `gw_hw_overlap` 5
 //!
@@ -278,6 +309,14 @@ struct Entry {
     /// run is a stronger one. A bind the witness refused may have changed the
     /// bytes with nothing reading them, and clears it.
     fold_valid: bool,
+    /// Whether this window has ever been folded, latched on the first audit.
+    ///
+    /// Separate from [`Self::fold_valid`], which answers whether the stored
+    /// fold is still a *baseline*. Together they separate the two ways an audit
+    /// can find nothing to compare against — never folded, or folded and then
+    /// invalidated — which read identically without this and are
+    /// [`ContentAudit::Seeded`] and [`ContentAudit::Restarted`] with it.
+    fold_seeded: bool,
     /// Binds of this window since its last audit, against [`AUDIT_STRIDE`].
     ///
     /// Per window rather than device-wide: a global stride would audit whichever
@@ -375,6 +414,7 @@ impl GatherWitness {
                 gen: 0,
                 fold: 0,
                 fold_valid: false,
+                fold_seeded: false,
                 binds_since_fold: 0,
                 pages_epoch: 0,
                 last_seen: 0,
@@ -528,9 +568,27 @@ pub enum GatherVerdict {
 pub enum ContentAudit {
     /// Not due this bind: no byte of the window was read.
     Skipped,
-    /// Folded, but with no fold to compare against that a run of vouches
-    /// vouches for. This bind only records one.
+    /// Folded for the first time on this window. There was nothing to compare
+    /// against; this bind only records one.
     Seeded,
+    /// The stride came due and there *was* a fold, but a refused bind since it
+    /// was taken invalidated it, so this bind could only record a new one.
+    ///
+    /// Split out from [`Self::Seeded`] because the two say opposite things
+    /// about whether the alarm is running. A seed is a window being met for
+    /// the first time and is expected. This is the audit **declining to
+    /// compare**, and where it dominates, [`Self::Disagreed`] reading zero says
+    /// nothing at all — which is exactly how it read while a writer that
+    /// escaped both halves went unnoticed.
+    ///
+    /// It is common by construction rather than by accident: the baseline is
+    /// dropped by any single refusal, so reaching a comparison needs
+    /// [`AUDIT_STRIDE`] consecutive vouched binds of one window. At the
+    /// refusal rates a driven boot measures — 4 669 refusals against 7 347
+    /// vouches — that is a run this workload never produces, and the fix is to
+    /// re-seed the fold on the refused binds, where the gather reads the bytes
+    /// anyway.
+    Restarted,
     /// Folded under a vouch, and the bytes are where the vouch said they were.
     Agreed,
     /// Folded under a vouch, and the bytes had moved. Some writer reaches these
@@ -693,6 +751,10 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     match seen.audit {
         ContentAudit::Skipped => {}
         ContentAudit::Seeded => note_store_route("gw_audit_seed"),
+        // The denominator `gw_audit_unsound` never had. Read the two together:
+        // while this dominates `gw_audit_ok`, the alarm is not running and a
+        // zero from it is not a measurement.
+        ContentAudit::Restarted => note_store_route("gw_audit_restart"),
         ContentAudit::Agreed => note_store_route("gw_audit_ok"),
         ContentAudit::Disagreed => {
             note_store_route("gw_audit_unsound");
@@ -828,6 +890,7 @@ fn observe<M: crate::runtime::host::HostOps>(
                 // there is any vouch for it to check.
                 fold: 0,
                 fold_valid: false,
+                fold_seeded: false,
                 binds_since_fold: 0,
                 pages_epoch,
                 last_seen: witness.binds,
@@ -882,11 +945,20 @@ fn observe<M: crate::runtime::host::HostOps>(
         // resolved by the same producer in the same call and name the same
         // pages, which the entry's page set is checked against above.
         let fold = unsafe { fold_runs(runs, span) };
+        // `fold_valid` is the question "does the stored fold still describe
+        // this window", and it is false for two reasons that read identically
+        // here and do not mean the same thing: this window has never been
+        // folded, or a refusal since the last fold dropped the baseline. The
+        // second is the audit declining to compare, and counting it as a seed
+        // is what let `gw_audit_unsound=0` read as a clean sweep of a
+        // population the fold never looked at.
         let audit = match (vouched && entry.fold_valid, fold == entry.fold) {
+            (false, _) if entry.fold_seeded => ContentAudit::Restarted,
             (false, _) => ContentAudit::Seeded,
             (true, true) => ContentAudit::Agreed,
             (true, false) => ContentAudit::Disagreed,
         };
+        entry.fold_seeded = true;
         entry.fold = fold;
         entry.fold_valid = true;
         entry.binds_since_fold = 0;
@@ -1188,6 +1260,74 @@ mod tests {
         assert_eq!(checked.audit, ContentAudit::Agreed);
     }
 
+    /// A refusal inside a stride leaves the next audit unable to compare, and it
+    /// must say so rather than reading as a first fold.
+    ///
+    /// This is the difference between an alarm that is armed and one that is
+    /// not, and until `Restarted` existed the two were one counter. Every
+    /// driven boot of this device reports `gw_audit_ok` 0 against
+    /// `gw_audit_seed` in the hundreds — because refusals are roughly two in
+    /// five binds, and a comparison needs `AUDIT_STRIDE` consecutive vouches of
+    /// one window. So `gw_audit_unsound` reading 0 was a check that never ran,
+    /// and it read exactly like one that ran and agreed. A real writer escaping
+    /// both halves hid behind that zero.
+    ///
+    /// The test drives one refusal into an otherwise quiet run, which is the
+    /// smallest thing that puts the audit in the state the whole workload is
+    /// permanently in.
+    #[test]
+    fn a_refusal_inside_a_stride_makes_the_next_audit_say_it_could_not_compare() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut w = GatherWitness::default();
+        let buf = vec![0x5au8; PAGE];
+        let runs = [run_over(&buf)];
+        // Rearm, then take a first fold so the window has a baseline at all.
+        bind_quietly(&mut w, &mut host, &GPAS, &runs, 1);
+        assert_eq!(
+            bind_to_next_audit(&mut w, &mut host, &GPAS, &runs).audit,
+            ContentAudit::Seeded,
+            "the first fold of a window is a seed"
+        );
+        // With nothing disturbing it, the next audit does compare — this is the
+        // case the existing tests live in and the workload never reaches.
+        assert_eq!(
+            bind_to_next_audit(&mut w, &mut host, &GPAS, &runs).audit,
+            ContentAudit::Agreed
+        );
+
+        // One refused bind: this device wrote a page of the window. Nothing
+        // about the bytes changed, so an audit that still compared would agree
+        // — the point is that it is no longer *entitled* to.
+        let refused = observe(
+            &mut w,
+            &mut host,
+            KEY,
+            one_page(&GPAS, &runs),
+            HostWriteCounts {
+                pages_epoch: 2,
+                pages_wrote: Some(crate::runtime::host_writes::HostWriteVerdict::Overlap),
+            },
+            next_gen(),
+        );
+        assert!(
+            matches!(
+                refused.verdict,
+                GatherVerdict::Refused {
+                    host_wrote_pages: true,
+                    ..
+                }
+            ),
+            "the fixture must actually refuse, or the rest proves nothing"
+        );
+
+        assert_eq!(
+            bind_to_next_audit(&mut w, &mut host, &GPAS, &runs).audit,
+            ContentAudit::Restarted,
+            "a dropped baseline must not report as a window being met for the \
+             first time — that is the reading that made a dead alarm look clean"
+        );
+    }
+
     /// The unsound case, produced deliberately: bytes changed under pages neither
     /// half of the witness saw written. This is the shape a host-side writer into
     /// guest RAM makes, and it is what the audit exists to catch — so if a driven
@@ -1331,7 +1471,7 @@ mod tests {
         let next = bind_to_next_audit(&mut w, &mut host, &GPAS, &runs);
         assert_eq!(
             next.audit,
-            ContentAudit::Seeded,
+            ContentAudit::Restarted,
             "the audit compared against a fold from before a repaint it knew about"
         );
     }
