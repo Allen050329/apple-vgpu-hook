@@ -806,7 +806,7 @@ pub struct MappingEntry {
     pub render_flush: RenderFlushWitness,
     /// Bumped whenever the guest page list / map lifetime changes (MAP, UNMAP,
     /// ReplacePhysical, MappingInternal reattach, page-table refresh that
-    /// changes PFNs). Used as [`TargetIdentity`] generation for resident
+    /// changes PFNs). Used as `TargetIdentity` generation for resident
     /// import-present so a recycled mid never reuses a stale GPU target, and
     /// as a fail-closed check before zero-copy DMA into contig views.
     pub map_generation: u32,

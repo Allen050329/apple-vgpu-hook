@@ -7313,7 +7313,9 @@ pub(crate) fn gva_chain_identity(
 /// Channel order the resident behind a GVA render target must hold: the one the
 /// guest declared for that attachment.
 ///
-/// This is [`TargetIdentity::is_bgra`]'s rule applied to the one namespace that
+/// This is `is_bgra`'s rule, on
+/// [`crate::backend::vulkan::engine::TargetIdentity`], applied to the one
+/// namespace that
 /// has a declaration to follow, and it is a function rather than an expression
 /// at each producer because the two producers key *the same registry slot*. A
 /// primary and a secondary attachment that spelled it differently would render
@@ -7335,30 +7337,36 @@ fn gva_resident_bgra(format: u16) -> bool {
 /// land its pixels. Every failure is fail-visible; the guest keeps its pre-pass
 /// bytes on loss.
 ///
-/// # This is the device's largest single blocking cost, not an abandon path
+/// # Every caller is now a refusal path
 ///
-/// The name and the comment below both used to say "abandoned", and the caller
-/// list is why that reads as rare: `writeback_chain_rgba` and a GVA arm-refusal
-/// fallback are both exceptional. The third caller is not. `M2vDrawSpan::
-/// ResidentGvaStore` — the ordinary Store of a GVA-targeted render — comes
-/// straight here, and on a driven Safari-drag boot that is **13 653 reads, 59 %
-/// of every render Store in the boot** against 9 870 on the GPU-direct surface
-/// rail.
+/// This used to be the ordinary Store of a GVA-targeted render, and the doc here
+/// used to say so — 13 653 reads on a driven boot, 59 % of every render Store,
+/// each one submitting and then blocking on a fence. That is no longer the
+/// shape, and reading it as the hot path sends the next reader at a premise that
+/// has already been fixed.
 ///
-/// Each one submits and then blocks on a fence. `readback_split`'s `fence`
-/// count matches `target_reads` exactly, and at ~750 us apiece these are most
-/// of the 18 s a boot spends waiting — more than twice the entire sampled
-/// resolve. Do not read a change here as touching a cold path.
+/// Both Store rails write the guest's pages from the GPU now. `ResidentGvaStore`
+/// goes to `render_writeback::store_gva_frame` and `ResidentSurfaceStore` to
+/// `store_surface_resident`; this function is what each falls back to when its
+/// arm declines, plus `writeback_chain_rgba`. A driven Safari-drag boot puts
+/// `gva_store_sync` at **3 for the whole boot** against `gva_flush_gpu_direct`
+/// and `render_flush_gpu_direct` carrying the rail. `draw_phase`'s `wait_us` and
+/// `readback_us` are both flat zero across the drag.
 ///
-/// The reason it cannot simply become `copy_target_to_guest_pages` like the
-/// surface rail is format, not plumbing: a buffer→image copy converts nothing,
-/// a GVA resident is RGBA (`TargetIdentity::is_bgra` is true only for
-/// `Surface`), and only 8 of those 13 653 Stores declared a destination format
-/// byte-identical to it — the rest go through `write_gva_rgba8_within`'s
-/// per-row `convert_rgba8_to_row`. The premise worth attacking is that the
-/// resident's format is derived from the identity's *kind* rather than from
-/// what the guest declared for that render target; see `TargetIdentity::is_bgra`
-/// for why that is keyed where it is, and what a change there has to keep true.
+/// So this is genuinely the abandon path, and it is a cost rather than a lost
+/// frame — but it is the expensive one, and the reason to keep it narrow: it
+/// reads the whole framebuffer back across the bus and blocks on a fence to do
+/// it. A change that pushes traffic back onto it will not show up as a refusal,
+/// only as `slot_us` and the fail-visible decline that sent it here.
+///
+/// What made the GPU-direct arm reachable was format. A buffer→image copy
+/// converts nothing, so the resident has to already hold the bytes its
+/// destination stores; the order used to be derived from the identity's *kind*,
+/// which made every GVA resident RGBA and every Store a per-row conversion.
+/// `TargetIdentity::Gva` now carries the order the guest declared for that
+/// render target — see `is_bgra` on
+/// [`crate::backend::vulkan::engine::TargetIdentity`] for why it is keyed on the
+/// identity and what a change there has to keep true.
 pub(crate) fn read_resident_chain(state: &DeviceState, req: &DrawEncodeRequest) -> Option<Vec<u8>> {
     let identity = render_chain_identity(state, req)?;
     match crate::backend::vulkan::engine::read_target(&identity) {
