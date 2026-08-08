@@ -4397,7 +4397,10 @@ fn guest_runs_decline_on_unstable_host_mappings() {
     let gva = 8u64;
 
     // A task whose page table really does resolve `[gva, gva+16)` onto `data0`.
-    let walkable = |stable: bool| -> Option<Vec<crate::backend::vulkan::engine::GuestRun>> {
+    let walkable = |stable: bool| -> Result<
+        Vec<crate::backend::vulkan::engine::GuestRun>,
+        super::vulkan::WindowRefusal,
+    > {
         let mut host = FakeHost::new();
         host.strict_linux_map = true;
         host.stable_map_pages = stable;
@@ -4420,13 +4423,86 @@ fn guest_runs_decline_on_unstable_host_mappings() {
     };
 
     assert!(
-        walkable(true).is_some_and(|runs| !runs.is_empty()),
+        walkable(true).is_ok_and(|runs| !runs.is_empty()),
         "control: a host promising a stable alias resolves this span"
     );
-    assert!(
-        walkable(false).is_none(),
+    // Named, not merely absent: this refusal is now counted, and it must land
+    // in the route that says the host would not promise the alias rather than
+    // in one of the two that report a page table the guest wrote.
+    assert_eq!(
+        walkable(false).err(),
+        Some(super::vulkan::WindowRefusal::NoAlias),
         "the same span must yield no runs when the host will not promise the \
          alias outlives the submission that gathers from it"
+    );
+}
+
+/// The window refusals name **which** check refused, because the census that
+/// ranks them turns on telling two of them apart.
+///
+/// `span_unmapped` is a page the guest never mapped, which a mapped-range
+/// record could answer without walking at all. `untileable` is a walk that
+/// finished and still could not bind, which no record upstream of the walk
+/// would have saved. Both used to be one silent `None`, and a reading that
+/// merged them would argue for machinery against a population that is not
+/// there — so the discrimination is the measurement, not a tidiness.
+#[test]
+#[cfg(feature = "backend-vulkan")]
+fn a_window_refusal_names_which_check_refused() {
+    use crate::contract::endian::st32;
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use super::vulkan::WindowRefusal;
+
+    let page_shift = crate::model::PAGE_SHIFT_X86;
+    let page = 1u64 << page_shift;
+
+    // GVA page 0 maps to `leaf_pfn`; GVA page 1 is left unmapped. `back_leaf`
+    // decides whether the host has RAM behind the frame the PTE names, which is
+    // what separates a walk that fails from an import that does.
+    let build = |leaf_pfn: u32, back_leaf: bool| {
+        let mut host = FakeHost::new();
+        host.strict_linux_map = true;
+        host.stable_map_pages = true;
+        let (dir_gpa, root_gpa) = (2u64 << page_shift, 3u64 << page_shift);
+        host.map_range(dir_gpa, page as usize, 0);
+        host.map_range(root_gpa, page as usize, 0);
+        if back_leaf {
+            host.map_range((leaf_pfn as u64) << page_shift, page as usize, 0);
+        }
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        let mut pte = [0u8; 4];
+        st32(&mut pte, leaf_pfn);
+        host.write_gpa(root_gpa, &pte).unwrap();
+        let mut state = DeviceState::new(DeviceId(1), page_shift);
+        state.define_task(1, page, 2);
+        (host, state)
+    };
+
+    // Control: wholly inside the mapped page, with RAM behind it.
+    let (mut host, state) = build(4, true);
+    assert!(
+        task_gva_guest_run_window(&state, &mut host, 1, 8, 16).is_ok(),
+        "control: this span resolves and binds"
+    );
+
+    // The same start, but the span reaches into the page the guest never mapped.
+    let (mut host, state) = build(4, true);
+    assert_eq!(
+        task_gva_guest_run_window(&state, &mut host, 1, 8, page).err(),
+        Some(WindowRefusal::SpanUnmapped),
+        "a page absent from the task's own table"
+    );
+
+    // Every page of the span resolves — the PTE is there — but no host range
+    // backs the frame, so the walk finishes and the import is what refuses.
+    let (mut host, state) = build(9, false);
+    assert_eq!(
+        task_gva_guest_run_window(&state, &mut host, 1, 8, 16).err(),
+        Some(WindowRefusal::Untileable),
+        "a walk that finished and still could not bind"
     );
 }
 

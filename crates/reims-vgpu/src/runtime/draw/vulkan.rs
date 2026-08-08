@@ -2117,18 +2117,54 @@ pub(super) fn task_gva_guest_run_window<M: HostMemory + HostOps>(
     task_id: u32,
     gva: u64,
     span: u64,
-) -> Option<(Vec<u64>, Vec<crate::backend::vulkan::engine::GuestRun>)> {
+) -> Result<(Vec<u64>, Vec<crate::backend::vulkan::engine::GuestRun>), WindowRefusal> {
     if !guest_run_alias_available(host) {
-        return None;
+        return Err(WindowRefusal::NoAlias);
     }
     let page = state.page_size();
     let gpas =
         gva_mem::task_gva_page_gpas(host, &state.tasks, task_id, gva, span, state.page_shift);
-    if gpas.len() as u64 != gva_mem::pages_spanned(gva, span, page) {
-        return None;
+    let wanted = gva_mem::pages_spanned(gva, span, page);
+    if gpas.len() as u64 != wanted {
+        return Err(WindowRefusal::SpanUnmapped);
     }
-    let runs = coalesce_pages_to_runs(host, &gpas, page, gva % page, span)?;
-    Some((gpas, runs))
+    let runs =
+        coalesce_pages_to_runs(host, &gpas, page, gva % page, span).ok_or(WindowRefusal::Untileable)?;
+    Ok((gpas, runs))
+}
+
+/// Why a guest-page window could not be built.
+///
+/// Typed rather than a bare `None` because these are **degradations that
+/// repeat**. A bind that lands here is not cached — only resolutions are held
+/// (see [`crate::runtime::bound_buffers`]) — so the same reference re-walks the
+/// task page table and re-pays the CPU staging read on every draw for as long
+/// as the guest keeps binding it. That is the part of the per-draw cost the
+/// held-resolution registry does not reach, and until these were counted there
+/// was no way to say how large it is: the two silent `None`s this replaces were
+/// the only unnamed exits in a rail whose every other outcome has a route.
+///
+/// Each caller maps these onto its own route prefix rather than counting them
+/// here. The buffer rail and the linear sampled rail differ by two orders of
+/// magnitude in volume, and one shared counter would report their sum as though
+/// it were either — the same conflation [`band_runs`] already carries and says
+/// so about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WindowRefusal {
+    /// The host will not promise a stable page alias, so no rail here can run.
+    ///
+    /// Latched once per process by [`guest_run_alias_available`], which names
+    /// it on the failure channel; the per-caller route is what gives it a rate.
+    NoAlias,
+    /// Some page of the span does not resolve under the task's page table.
+    ///
+    /// The one a mapped-range record could answer without walking.
+    SpanUnmapped,
+    /// Every page resolved, but a GPA-contiguous stretch would not import.
+    ///
+    /// A walk that finished and still could not bind, so no range record would
+    /// have saved it.
+    Untileable,
 }
 
 /// The bounded guest-memory references behind a set of runs, one per maximal
@@ -2365,14 +2401,20 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
 ) -> Option<crate::runtime::bound_buffers::BoundBuffer> {
     let (gva, size) = (backing.gva, backing.size);
     if offset >= size {
+        // The guest bound past the end of the allocation it named. Counted
+        // rather than dropped: it is the guest disagreeing with its own
+        // descriptor, and it is the one route here that is not about paging.
+        crate::runtime::drain::note_store_route("zc_buffer_offset_past_end");
         return None;
     }
-    let span = host_alloc_len(size - offset).filter(|&n| n > 0)? as u64;
+    let Some(span) = host_alloc_len(size - offset).filter(|&n| n > 0).map(|n| n as u64) else {
+        // A declared length this process cannot address. `offset < size` above
+        // makes the `n > 0` arm unreachable, so this is the width check alone.
+        crate::runtime::drain::note_store_route("zc_buffer_span_unusable");
+        return None;
+    };
     if span < ZERO_COPY_BUFFER_MIN_BYTES {
         crate::runtime::drain::note_store_route("zc_buffer_below_floor");
-        return None;
-    }
-    if !guest_run_alias_available(host) {
         return None;
     }
     // Same coherence rule as the CPU read: land any resident-authoritative
@@ -2383,7 +2425,17 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     // the bind would translate every page of the allocation to serve one bind,
     // and would refuse a bind whose allocation has an unmapped tail page even
     // though the bind itself resolves.
-    let (gpas, runs) = task_gva_guest_run_window(state, host, task_id, gva + offset, span)?;
+    let (gpas, runs) = match task_gva_guest_run_window(state, host, task_id, gva + offset, span) {
+        Ok(window) => window,
+        Err(refusal) => {
+            crate::runtime::drain::note_store_route(match refusal {
+                WindowRefusal::NoAlias => "zc_buffer_no_alias",
+                WindowRefusal::SpanUnmapped => "zc_buffer_span_unmapped",
+                WindowRefusal::Untileable => "zc_buffer_untileable",
+            });
+            return None;
+        }
+    };
     let page = state.page_size();
     let pages = guest_page_window(host, gpas, page, (gva + offset) % page, span);
     crate::runtime::drain::note_store_route(if pages.is_some() {
@@ -2419,6 +2471,33 @@ fn bound_buffer_content(
 /// eligible, else the CPU staging read. `allow_zero_copy` is false for
 /// buffers feeding Constant-step attributes (the engine prepends a CPU
 /// base-instance prefix to those).
+///
+/// # The `zc_buffer_*` route family, and what it is for
+///
+/// Every bind that reaches here with `allow_zero_copy` and a resolvable
+/// backing takes **exactly one** route, so the family sums to the attempts:
+///
+/// ```text
+/// held                                    the registry answered
+/// offset_past_end + span_unusable         the descriptor disagrees with itself
+/// below_floor                             too small to be worth the rail
+/// no_alias + span_unmapped + untileable   the rail was tried and refused
+/// imported + gathered                     the rail ran
+/// ```
+///
+/// The split exists to answer one question the held-resolution registry cannot:
+/// **how much of the per-draw cost is being paid over and over.** A resolution
+/// is cached; a refusal is not. So a reference in the last-but-one group
+/// re-walks the task page table *and* re-pays the CPU staging read on every
+/// draw the guest binds it, for as long as it keeps binding it — and before
+/// these routes existed, that path was the only outcome in this function with
+/// no name at all. A steady rate there is repeats, because the guest's live
+/// reference set is bounded and the bind rate is not.
+///
+/// Only `span_unmapped` is a refusal a mapped-range record could answer without
+/// walking. `untileable` walked successfully and still could not bind, so
+/// nothing upstream of the walk would have saved it — which is why the two are
+/// counted apart rather than as one "the window failed".
 fn load_buffer_content<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2519,9 +2598,6 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     if native.is_four_byte_color() && span < ZERO_COPY_SAMPLED_MIN_BYTES {
         return None;
     }
-    if !guest_run_alias_available(host) {
-        return None;
-    }
     if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
         return None;
     }
@@ -2530,7 +2606,17 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // flush completes before this draw's submit).
     crate::runtime::render_writeback::settle_guest_writes();
     // Fixed per-texture window: the walk covers exactly the bound span.
-    let (gpas, runs) = task_gva_guest_run_window(state, host, task_id, gva, span)?;
+    let (gpas, runs) = match task_gva_guest_run_window(state, host, task_id, gva, span) {
+        Ok(window) => window,
+        Err(refusal) => {
+            crate::runtime::drain::note_store_route(match refusal {
+                WindowRefusal::NoAlias => "zc_lin_no_alias",
+                WindowRefusal::SpanUnmapped => "zc_lin_span_unmapped",
+                WindowRefusal::Untileable => "zc_lin_untileable",
+            });
+            return None;
+        }
+    };
     let page = state.page_size() as usize;
     let seen = crate::runtime::gather_witness::note_gather(
         state,
