@@ -1749,6 +1749,12 @@ pub struct DeviceState {
     /// [`crate::runtime::gather_witness`] — it selects no behaviour.
     #[cfg(feature = "backend-vulkan")]
     pub gather_witness: crate::runtime::gather_witness::GatherWitness,
+    /// The GVA render targets a Store has stamped, and what the two write
+    /// witnesses said at the time. The GVA half of the type-11 witness that
+    /// licenses the attachment LOAD elision — see
+    /// [`crate::runtime::gva_store_witness`].
+    #[cfg(feature = "backend-vulkan")]
+    pub gva_store_witness: crate::runtime::gva_store_witness::GvaStoreWitness,
     /// Draw-time buffer binds resolved once per reference and held. Reached
     /// only through [`DeviceState::retire_bound_buffers_for_task`] and
     /// [`DeviceState::retire_bound_buffers_in_range`] from the packet handlers,
@@ -1975,6 +1981,8 @@ impl DeviceState {
             page_shift,
             gfx: GfxRegs::default(),
             iosfc: IosfcRegs::default(),
+            #[cfg(feature = "backend-vulkan")]
+            gva_store_witness: Default::default(),
             active_child_mask: 0,
             translation_deferred_mask: 0,
             stamp_deferred_mask: 0,
@@ -2089,6 +2097,8 @@ impl DeviceState {
         // them armed on the host forever.
         #[cfg(feature = "backend-vulkan")]
         tokens.extend(self.gather_witness.take_tokens());
+        #[cfg(feature = "backend-vulkan")]
+        tokens.extend(self.gva_store_witness.take_tokens());
         // Back onto the retired list rather than out through the return value:
         // the caller's contract is "invalidate backend aliases, then release
         // views", and a token release is neither. `flush_retired_views` drains

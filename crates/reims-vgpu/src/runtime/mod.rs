@@ -40,6 +40,11 @@ pub mod fence_exec;
 /// zero-copy sampled gathers? Measurement, not policy.
 #[cfg(feature = "backend-vulkan")]
 pub mod gather_witness;
+/// Gated with the `GuestWriteVerdict` it reuses and the `TargetIdentity` it
+/// keys on, both of which are Vulkan-side; the type-11 twin this mirrors
+/// (`mapper::mapping_guest_write_verdict`) carries the same gate.
+#[cfg(feature = "backend-vulkan")]
+pub mod gva_store_witness;
 /// Guest-physical control-plane writes via HostOps map_pages.
 pub mod gpa_map;
 /// The bound on every GPU reference to guest RAM — one import per RAMBlock,

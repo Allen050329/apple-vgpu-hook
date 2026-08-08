@@ -672,6 +672,26 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     // exist, so the reclaim paths may take it — the same handover
     // `store_render_frame` performs in `finish`.
     crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
+    // Arm the GVA write witness over the pages this Store just published, the
+    // twin of `mapper::stamp_guest_write_gen` on the type-11 rail. It is what
+    // lets a later reader ask whether these pages still hold this frame without
+    // reading them — see `crate::runtime::gva_store_witness`.
+    //
+    // After the submit, not before it: a stamp taken ahead of a copy that then
+    // declines would claim the guest's pages hold a frame that never reached
+    // them. And after `note_host_wrote_pages` above, because the epoch the
+    // witness records is compared against that same ring — capturing it first
+    // would have every target permanently invalidated by its own Store.
+    //
+    // Only this rail stamps. The copying arm (`gva_store_sync`) leaves no
+    // witness, so its targets never read quiet and never take the shortcut this
+    // arms. That is safe and deliberate rather than an oversight: it is the arm
+    // a host without the guest-RAM import takes, and it already pays a blocking
+    // readback per Store, so the shortcut is worth less there and the rails stay
+    // easier to tell apart.
+    if let Some(key) = crate::runtime::gva_store_witness::GvaTargetKey::of(identity) {
+        crate::runtime::gva_store_witness::note_store(state, host, key, gpas);
+    }
     Ok(extent)
 }
 

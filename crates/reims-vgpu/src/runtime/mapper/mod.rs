@@ -1619,7 +1619,7 @@ pub fn stamp_guest_write_gen<M: HostMemory + HostOps>(
 /// surface every frame" are the same refusal and completely different findings.
 #[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum GuestWriteVerdict {
+pub enum GuestWriteVerdict {
     /// The host has observed no write to these pages since the stamp.
     Clean,
     /// No mapping under this id.
