@@ -47,14 +47,14 @@ their unit of work is on.
 - Wire layouts: `crates/reims-vgpu-wire` (derived serializer views/parsers; decode uses these as the layout authority for covered records)
 - Vulkan translator dependency: public `steelbrain/metal2vulkan` Git crate. On macOS, the Vulkan
   host backend runs through MoltenVK.
-- VM lifecycle: `vm/` (snapshot-revert; arm and x86 guest boot scripts)
+- VM lifecycle: `vm/` (arm and x86 guest boot scripts)
 
 ## Getting started
 
 This tree ships **boot scripts and the device**, not a ready-made macOS disk image. Guest disks,
 firmware vars, and OpenCore blobs are private/gitignored under `vm/`. Pick a pathway, provision a
-guest once, freeze a golden snapshot, then use the snapshot-revert boots for day-to-day work.
-macOS 13 Ventura is the recommended guest release for bring-up.
+guest once, then boot it for day-to-day work. macOS 13 Ventura is the recommended guest release
+for bring-up.
 
 ### x86_64 guest on Linux (KVM)
 
@@ -82,17 +82,9 @@ macOS 13 Ventura is the recommended guest release for bring-up.
    Finish install in the guest: enable Remote Login, install your SSH key, turn off sleep/screensaver
    as you like. Host SSH is typically `localhost:2222` → guest `:22` (see `vm/boot-x86.sh`).
 
-4. **Capture the first immutable snapshot.** From a clean guest state (logged in, network/SSH
-   known-good), shut down cleanly while booting in snapshot-capture mode:
-
-   ```bash
-   vm/boot-x86.sh --snapshot --device vmware-svga
-   # clean shutdown from inside the guest → new label under vm/disks/snapshots/
-   # and snapshots/current points at it
-   ```
-
-   Every later boot clones `snapshots/current` (COW when possible) and **throws the clone away** on
-   exit, so wedges and hard kills never poison the golden image.
+4. **Back the disk up.** x86 boots write straight through to `vm/disks/macos.img`, so a wedge or a
+   hard kill lands on the real image. Take your own copy of a known-good guest before anything
+   risky — the boot script keeps none.
 
 5. **Day-to-day boots.**
 
@@ -138,11 +130,12 @@ Arm bring-up is **in-tree**: Virtualization.framework via Homebrew **`macosvm`**
 
    Optional **performance ceiling** reference: the same guest under native VZ via `macosvm --gui`.
 
-### After the first snapshot
+### Day to day
 
-- Prefer **`--testing`** for agent/measurement boots (time-bounded, always reverts).
-- Use **`--interactive`** when you need an open-ended GUI session (still reverts unless you are in
-  `--snapshot` capture mode).
+- Prefer **`--testing`** for agent/measurement boots (time-bounded).
+- Use **`--interactive`** when you need an open-ended GUI session.
+- On x86 both persist what the guest writes. arm64 still reverts to `vm/guest/snapshots/current`
+  on every boot; `vm/boot-arm64.sh --snapshot` is what captures a new one there.
 - Never commit disks, IPSWs, or OpenCore/OVMF runtime under `vm/`.
 - Device/backend work lives in `crates/reims-vgpu` + the thin shims in `vendor/qemu`; rebuild QEMU after
   product changes before claiming a live boot result.

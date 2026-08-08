@@ -49,7 +49,8 @@ measure them.
   emission helpers, and gates.
 - `crates/reims-vgpu-wire` - derived wire-format views, with their own `AGENTS.md`. Where that file
   is stricter than this one, it wins.
-- `vm/` - snapshot-revert boot scripts for arm64 and x86 guests.
+- `vm/` - guest boot scripts. arm64 reverts to a snapshot each boot; x86 writes through to the
+  disk, so an x86 boot keeps what the guest changed.
 
 Start with the owning source modules and nearby tests when changing device, decode, present, or
 backend behavior. Keep durable design facts in code comments close to the behavior they explain.

@@ -6,22 +6,18 @@
 #   vmware-svga      default console (OSX-KVM mainstream)
 #   reims-vgpu-pci   product Apple vGPU Hook (thin C → reims-vgpu); -vga none + secondary bus
 #
-# SNAPSHOT-REVERT (same model as vm/boot-arm64.sh): snapshots form an IMMUTABLE
-# HISTORY under `vm/disks/snapshots/<label>/{macos.img,OpenCore.qcow2,OVMF_VARS.fd}`
-# (each read-only, never overwritten). `vm/disks/snapshots/current` is a symlink
-# naming the active one. EVERY boot starts from a byte-identical COW clone of
-# `current` (btrfs reflink when available) and discards that clone on exit, so a
-# harsh kill or a wedge costs nothing and poisons nothing. A snapshot is never
-# booted directly.
+# PERSISTENT DISK: every boot writes straight through to `$DISK_MASTER`,
+# `$OPENCORE_MASTER` and the varstore, so what the guest changes is still there
+# next boot. Back the disk up yourself before anything risky — nothing here does.
+#
+# Two boots at once would write the same image. QEMU's own image lock catches
+# that and the second one dies with "Failed to get write lock" before it opens
+# anything, so the failure is loud rather than silent corruption.
 #
 # Boot classes:
 #   --testing      agent-driven measurement (default): GUI + serial-to-file,
-#                  SSH-driven, 7-minute hard kill + capture-then-revert. Reverts.
-#   --interactive  human/GUI boot, no time limit. Reverts (nothing persists).
-#   --snapshot     boot writable to CAPTURE A NEW snapshot: on a clean guest
-#                  shutdown the modified disk/OpenCore/OVMF_VARS are saved as a
-#                  NEW immutable snapshot and `current` is repointed to it.
-#                  Existing snapshots (incl. the base) are never touched.
+#                  SSH-driven, 7-minute hard kill.
+#   --interactive  human/GUI boot, no time limit.
 #
 # Launch configuration is CLI flags / env here (this is the boot script, not
 # device/backend code) — never an env sniff inside the device.
@@ -35,7 +31,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # --- Configuration (override via env or flags) ----------------------------------
 DISKS_DIR="${DISKS_DIR:-$SCRIPT_DIR/disks}"
 OVMF_DIR="${OVMF_DIR:-$SCRIPT_DIR/ovmf}"
-SNAPSHOTS_DIR="${SNAPSHOTS_DIR:-$DISKS_DIR/snapshots}"
 RUN_DIR="${RUN_DIR:-$DISKS_DIR/run}"
 
 # In-tree QEMU is rebuilt every boot unless QEMU_BIN is overridden. The boot
@@ -59,7 +54,13 @@ QEMU_BIN_DEFAULT="$REPO_ROOT/vendor/qemu/build/qemu-system-x86_64"
 QEMU_BIN="${QEMU_BIN:-$QEMU_BIN_DEFAULT}"
 REIMS_VGPU_EFI_ROM_SCRIPT="$REPO_ROOT/crates/reims-vgpu-efi/scripts/reims-vgpu-efi-rom/reims-vgpu-efi-rom.sh"
 OVMF_CODE="${OVMF_CODE:-$OVMF_DIR/OVMF_CODE_4M.fd}"
+# Seed for the live varstore, used once and then never read again. It carries
+# the GOP mode the guest firmware comes up in, which is why it is a checked-in
+# file rather than an empty template.
 OVMF_VARS_MASTER="${OVMF_VARS_MASTER:-$OVMF_DIR/OVMF_VARS-1920x1080.fd}"
+# The varstore the guest actually writes: boot entries and firmware settings
+# live here across boots, beside the disk images they belong with.
+OVMF_VARS="${OVMF_VARS:-$DISKS_DIR/OVMF_VARS.fd}"
 OPENCORE_MASTER="${OPENCORE_MASTER:-$DISKS_DIR/OpenCore.qcow2}"
 DISK_MASTER="${DISK_MASTER:-$DISKS_DIR/macos.img}"
 
@@ -75,11 +76,11 @@ GUEST_MAC="${GUEST_MAC:-52:54:00:c9:18:27}"
 CPU_MODEL="${CPU_MODEL:-Skylake-Client}"
 CPU_OPTIONS="${CPU_OPTIONS:-+ssse3,+sse4.2,+popcnt,+avx,+avx2,+aes,+xsave,+xsaveopt,check}"
 
-BOOT_CLASS="testing"          # testing | interactive | snapshot
+BOOT_CLASS="testing"          # testing | interactive
 # Default to the product device: it is the whole point of this tree, and its
 # host-owned Vulkan window (REIMS_VGPU_WINDOW=1, present + input) is what a human
 # expects to see. The legacy vmware-svga console is opt-in via --device — a bare
-# `--snapshot`/`--interactive` under vmware-svga shows QEMU's gtk window with NO
+# `--interactive` under vmware-svga shows QEMU's gtk window with NO
 # GPU output (the guest renders only through reims-vgpu-pci), which reads as a dead
 # window. Agents pass --device explicitly anyway, so this only fixes the bare
 # human invocation.
@@ -87,23 +88,19 @@ GFX_DEVICE="reims-vgpu-pci"  # reims-vgpu-pci | vmware-svga
 
 usage() {
   cat <<EOF
-usage: vm/boot-x86.sh [--device reims-vgpu-pci|vmware-svga] [--testing|--interactive|--snapshot]
+usage: vm/boot-x86.sh [--device reims-vgpu-pci|vmware-svga] [--testing|--interactive]
 
   --device NAME          primary VGA (default: reims-vgpu-pci)
                          reims-vgpu-pci   product Apple vGPU Hook (PCI thin shim → reims-vgpu),
                                             host-owned Vulkan window (present + input)
                          vmware-svga         legacy OSX-KVM console (QEMU gtk window;
                                             no GPU output once the guest uses Apple vGPU Hook)
-  --testing              agent boot (default): GUI, ${TESTING_TIMEOUT}s hard kill, reverts
-  --interactive          human/GUI boot, no time limit, reverts
-  --snapshot             boot writable; a clean guest shutdown CAPTURES a new snapshot
-                         (also bootstraps the first snapshot on a fresh guest)
+  --testing              agent boot (default): GUI, ${TESTING_TIMEOUT}s hard kill
+  --interactive          human/GUI boot, no time limit
 
-Every boot reverts to the current snapshot:
-  $SNAPSHOTS_DIR/current -> <label>/{macos.img,OpenCore.qcow2,OVMF_VARS.fd}
-Always builds reims-vgpu-efi and reims-vgpu before boot. In-tree QEMU is rebuilt
+Both write through to the disk; guest changes persist. Always builds reims-vgpu-efi and reims-vgpu before boot. In-tree QEMU is rebuilt
 unless QEMU_BIN is set to something other than the default path.
-Env: DISKS_DIR OVMF_DIR SNAPSHOTS_DIR RUN_DIR QEMU_BIN OVMF_CODE OVMF_VARS_MASTER
+Env: DISKS_DIR OVMF_DIR RUN_DIR QEMU_BIN OVMF_CODE OVMF_VARS OVMF_VARS_MASTER
      OPENCORE_MASTER DISK_MASTER RAM CPU_SOCKETS CPU_CORES CPU_THREADS CPU_MODEL
      CPU_OPTIONS SSH_PORT TESTING_TIMEOUT QMP_DUMP_TIMEOUT GUEST_MAC REIMS_VGPU_BACKEND
      (metal|vulkan for qemu-build)
@@ -142,7 +139,6 @@ while [ "$#" -gt 0 ]; do
       ;;
     --testing) BOOT_CLASS="testing"; shift ;;
     --interactive) BOOT_CLASS="interactive"; shift ;;
-    --snapshot) BOOT_CLASS="snapshot"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "boot-x86.sh: unknown arg: $1" >&2; usage >&2; exit 64 ;;
   esac
@@ -161,7 +157,8 @@ require_shader_toolchain() {
     "spirv-val not found in PATH (ships in SPIRV-Tools, not LLVM: apt install spirv-tools)"
 }
 
-clone_file() {
+# Copy that takes a btrfs reflink where the filesystem offers one.
+copy_file() {
   local src="$1" dst="$2"
   if cp --reflink=auto -f "$src" "$dst" 2>/dev/null; then
     return 0
@@ -227,26 +224,17 @@ fi
 [ -f "$OVMF_CODE" ] || die "OVMF_CODE not found: $OVMF_CODE"
 [ -r /dev/kvm ] || die "KVM not available (/dev/kvm); is kvm loaded and are you in the kvm group?"
 
-CURRENT="$SNAPSHOTS_DIR/current"
-HAVE_SNAPSHOT=0
-if [ -e "$CURRENT" ] && \
-   [ -f "$CURRENT/macos.img" ] && \
-   [ -f "$CURRENT/OpenCore.qcow2" ] && \
-   [ -f "$CURRENT/OVMF_VARS.fd" ]; then
-  HAVE_SNAPSHOT=1
-fi
-if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
-  [ "$BOOT_CLASS" = "snapshot" ] || die \
-    "no snapshot yet — bootstrap it with:  vm/boot-x86.sh --snapshot
-(boots the provisioned disk/OpenCore/OVMF_VARS writable for Setup Assistant + config; a clean
-guest shutdown then captures the first immutable snapshot. --testing/--interactive need a
-snapshot to revert to.)"
-  [ -f "$DISK_MASTER" ] || die "no provisioned disk at $DISK_MASTER"
-  [ -f "$OPENCORE_MASTER" ] || die "no OpenCore image at $OPENCORE_MASTER"
-  [ -f "$OVMF_VARS_MASTER" ] || die "no OVMF_VARS master at $OVMF_VARS_MASTER"
+[ -f "$DISK_MASTER" ] || die "no provisioned disk at $DISK_MASTER"
+[ -f "$OPENCORE_MASTER" ] || die "no OpenCore image at $OPENCORE_MASTER"
+# Seeded once. After that the guest owns it, so re-seeding would throw away the
+# boot entries it wrote.
+if [ ! -f "$OVMF_VARS" ]; then
+  [ -f "$OVMF_VARS_MASTER" ] || die "no OVMF_VARS to seed from at $OVMF_VARS_MASTER"
+  echo "boot-x86.sh: seeding varstore $OVMF_VARS from $OVMF_VARS_MASTER ..."
+  copy_file "$OVMF_VARS_MASTER" "$OVMF_VARS"
+  chmod u+w "$OVMF_VARS"
 fi
 
-# --- Choose the boot disk: revert-clone, or bootstrap write-through -------------
 mkdir -p "$RUN_DIR"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 SERIAL_LOG="$RUN_DIR/serial-$STAMP.log"
@@ -273,25 +261,11 @@ if [ "$TRACE" = "1" ]; then
   fi
 fi
 
-if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
-  DISK="$DISK_MASTER"
-  OPENCORE="$OPENCORE_MASTER"
-  OVMF_VARS="$OVMF_VARS_MASTER"
-  IS_CLONE=0
-  echo "boot-x86.sh: bootstrap — booting provisioned masters write-through (no snapshot yet) ..."
-else
-  DISK="$RUN_DIR/macos-$STAMP.img"
-  OPENCORE="$RUN_DIR/OpenCore-$STAMP.qcow2"
-  OVMF_VARS="$RUN_DIR/OVMF_VARS-$STAMP.fd"
-  IS_CLONE=1
-  echo "boot-x86.sh: reverting to snapshot '$(readlink "$CURRENT" 2>/dev/null || echo current)' ..."
-  clone_file "$CURRENT/macos.img" "$DISK"
-  clone_file "$CURRENT/OpenCore.qcow2" "$OPENCORE"
-  clone_file "$CURRENT/OVMF_VARS.fd" "$OVMF_VARS"
-  chmod u+w "$DISK" "$OPENCORE" "$OVMF_VARS"
-fi
+DISK="$DISK_MASTER"
+OPENCORE="$OPENCORE_MASTER"
+echo "boot-x86.sh: writing through to $DISK (guest changes persist)"
 
-# Probed after the clone, so the format describes the file QEMU is actually handed.
+# `-drive format=` has to be told, and the paths here are usually symlinks.
 DISK_FORMAT="${DISK_FORMAT:-$(image_format "$DISK")}"
 OPENCORE_FORMAT="${OPENCORE_FORMAT:-$(image_format "$OPENCORE")}"
 
@@ -410,10 +384,7 @@ echo "boot-x86.sh: device=$GFX_DEVICE class=$BOOT_CLASS cpu=$CPU_MODEL smp=${CPU
 echo "boot-x86.sh: ssh → localhost:$SSH_PORT   serial → $SERIAL_LOG   qmp → $QMP_SOCK"
 [ -n "$TRACE_LOG" ] && echo "boot-x86.sh: trace → $TRACE_LOG ($TRACE_SPEC)"
 
-discard_clone() {
-  if [ "${IS_CLONE:-1}" -eq 1 ]; then
-    rm -f "$DISK" "$OPENCORE" "$OVMF_VARS"
-  fi
+release_run_sockets() {
   rm -f "$QMP_SOCK"
   # `qmp.sock` is the shared name every driver script resolves, and it is
   # re-pointed by whichever boot started last. A boot shutting down must only
@@ -426,26 +397,7 @@ discard_clone() {
   fi
 }
 
-promote_to_snapshot() {
-  local label new_dir
-  if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
-    label="$(date +%Y-%m-%d-%H%M%S)-base"
-  else
-    label="$(date +%Y-%m-%d-%H%M%S)-snap"
-  fi
-  new_dir="$SNAPSHOTS_DIR/$label"
-  echo "boot-x86.sh: capturing new immutable snapshot '$label' ..."
-  mkdir -p "$new_dir"
-  clone_file "$DISK" "$new_dir/macos.img"
-  clone_file "$OPENCORE" "$new_dir/OpenCore.qcow2"
-  clone_file "$OVMF_VARS" "$new_dir/OVMF_VARS.fd"
-  chmod 444 "$new_dir/macos.img" "$new_dir/OpenCore.qcow2" "$new_dir/OVMF_VARS.fd"
-  ln -sfn "$label" "$CURRENT"
-  discard_clone
-  echo "boot-x86.sh: snapshot '$label' captured; current -> $label"
-}
-
-# --- Interactive / snapshot: foreground GUI, no time limit ----------------------
+# --- Interactive: foreground GUI, no time limit ---------------------------------
 # Display backend: the supported reims-vgpu-pci path is the custom Rust host
 # window (REIMS_VGPU_WINDOW=1), so QEMU defaults to `-display none` and owns no UI
 # window. The older QEMU `gtk,gl=on` display path is deprecated for product work;
@@ -522,22 +474,16 @@ else
   REIMS_VGPU_DISPLAY="${REIMS_VGPU_DISPLAY:-gtk}"
 fi
 
-if [ "$BOOT_CLASS" = "interactive" ] || [ "$BOOT_CLASS" = "snapshot" ]; then
+if [ "$BOOT_CLASS" = "interactive" ]; then
   # gtk display + serial multiplexed with the monitor on stdio (Apple EB logs on console).
   QEMU_ARGS+=(-display "$REIMS_VGPU_DISPLAY" -serial mon:stdio)
   rc=0
   "$QEMU_BIN" "${QEMU_ARGS[@]}" || rc=$?
-  if [ "$BOOT_CLASS" = "snapshot" ] && [ "$rc" -eq 0 ]; then
-    # mon:stdio does not fill SERIAL_LOG; promote on clean QEMU exit.
-    promote_to_snapshot
-  else
-    [ "$BOOT_CLASS" = "snapshot" ] && echo "boot-x86.sh: qemu exited rc=$rc (not clean) — snapshot NOT updated"
-    discard_clone
-  fi
+  release_run_sockets
   exit "$rc"
 fi
 
-# --- Testing: background GUI + hard kill + capture-then-revert -------------------
+# --- Testing: background GUI + hard kill ----------------------------------------
 QEMU_ARGS+=(-display "$REIMS_VGPU_DISPLAY" -serial "file:$SERIAL_LOG")
 
 # Best-effort QMP register dump. Must never block hard-kill more than
@@ -596,19 +542,20 @@ kill_qemu() {
   wait "$QEMU_PID" 2>/dev/null || true
 }
 
-capture_then_revert() {
+stop_and_capture() {
   local reason="$1"
-  echo "boot-x86.sh: capture-then-revert ($reason)"
+  echo "boot-x86.sh: stopping ($reason)"
   # Dump first (bounded), then always kill — never gate kill on QMP success.
   qmp_dump_registers
   kill_qemu
-  discard_clone
-  echo "boot-x86.sh: reverted (clone discarded); evidence in $RUN_DIR (serial-$STAMP.log)"
+  release_run_sockets
+  echo "boot-x86.sh: stopped; evidence in $RUN_DIR (serial-$STAMP.log). The guest disk"
+  echo "boot-x86.sh: keeps whatever it had written, including a half-finished write."
 }
 
 "$QEMU_BIN" "${QEMU_ARGS[@]}" &
 QEMU_PID=$!
-trap 'capture_then_revert signal; exit 130' INT TERM
+trap 'stop_and_capture signal; exit 130' INT TERM
 
 # A boot that boot.efi aborted is not a wedge, and it must not be scored as one.
 #
@@ -660,14 +607,14 @@ PANIC_KEEP_DIR="${PANIC_KEEP_DIR:-/tmp/reims-vgpu-panics}"
 elapsed=0
 while kill -0 "$QEMU_PID" 2>/dev/null; do
   if [ "$elapsed" -ge "$TESTING_TIMEOUT" ]; then
-    capture_then_revert "timeout ${TESTING_TIMEOUT}s — wedge verdict"
+    stop_and_capture "timeout ${TESTING_TIMEOUT}s — wedge verdict"
     exit 124
   fi
   if [ -s "$SERIAL_LOG" ] && grep -qE "$BOOT_ABORT_RE" "$SERIAL_LOG" 2>/dev/null; then
     echo "boot-x86.sh: GUEST FIRMWARE ABORTED THE BOOT — the kernel never loaded."
     grep -E "$BOOT_ABORT_RE|EB\.MM\.AKMR|EB\.B\.MN" "$SERIAL_LOG" 2>/dev/null | tail -5
     echo "boot-x86.sh: no measurement from this boot is about the device. Retry it."
-    capture_then_revert "boot.efi aborted — firmware boot failure, not a device wedge"
+    stop_and_capture "boot.efi aborted — firmware boot failure, not a device wedge"
     exit 125
   fi
   if [ -s "$SERIAL_LOG" ] && grep -qF "$PANIC_RE" "$SERIAL_LOG" 2>/dev/null; then
@@ -676,7 +623,7 @@ while kill -0 "$QEMU_PID" 2>/dev/null; do
     mkdir -p "$PANIC_KEEP_DIR"
     cp -f "$SERIAL_LOG" "$PANIC_KEEP_DIR/$(basename "$SERIAL_LOG")" 2>/dev/null || true
     echo "boot-x86.sh: serial log kept at $PANIC_KEEP_DIR/$(basename "$SERIAL_LOG")"
-    capture_then_revert "guest kernel panic"
+    stop_and_capture "guest kernel panic"
     exit 126
   fi
   sleep 5
@@ -693,7 +640,7 @@ if [ -s "$SERIAL_LOG" ] && grep -qF "$PANIC_RE" "$SERIAL_LOG" 2>/dev/null; then
   mkdir -p "$PANIC_KEEP_DIR"
   cp -f "$SERIAL_LOG" "$PANIC_KEEP_DIR/$(basename "$SERIAL_LOG")" 2>/dev/null || true
   echo "boot-x86.sh: serial log kept at $PANIC_KEEP_DIR/$(basename "$SERIAL_LOG")"
-  capture_then_revert "guest kernel panic"
+  stop_and_capture "guest kernel panic"
   exit 126
 fi
-capture_then_revert "qemu exited"
+stop_and_capture "qemu exited"
