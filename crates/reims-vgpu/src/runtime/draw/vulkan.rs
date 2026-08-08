@@ -6767,9 +6767,34 @@ pub(crate) fn gva_chain_identity(
     })
 }
 
-/// Read an abandoned resident render-pass chain so the exec loop can land the
-/// last good record's pixels (`writeback_chain_rgba`). Every failure is
-/// fail-visible; the guest keeps its pre-pass bytes on loss.
+/// Read a resident render-pass chain back to host memory so the exec loop can
+/// land its pixels. Every failure is fail-visible; the guest keeps its pre-pass
+/// bytes on loss.
+///
+/// # This is the device's largest single blocking cost, not an abandon path
+///
+/// The name and the comment below both used to say "abandoned", and the caller
+/// list is why that reads as rare: `writeback_chain_rgba` and a GVA arm-refusal
+/// fallback are both exceptional. The third caller is not. `M2vDrawSpan::
+/// ResidentGvaStore` — the ordinary Store of a GVA-targeted render — comes
+/// straight here, and on a driven Safari-drag boot that is **13 653 reads, 59 %
+/// of every render Store in the boot** against 9 870 on the GPU-direct surface
+/// rail.
+///
+/// Each one submits and then blocks on a fence. `readback_split`'s `fence`
+/// count matches `target_reads` exactly, and at ~750 us apiece these are most
+/// of the 18 s a boot spends waiting — more than twice the entire sampled
+/// resolve. Do not read a change here as touching a cold path.
+///
+/// The reason it cannot simply become `copy_target_to_guest_pages` like the
+/// surface rail is format, not plumbing: a buffer→image copy converts nothing,
+/// a GVA resident is RGBA (`TargetIdentity::is_bgra` is true only for
+/// `Surface`), and only 8 of those 13 653 Stores declared a destination format
+/// byte-identical to it — the rest go through `write_gva_rgba8_within`'s
+/// per-row `convert_rgba8_to_row`. The premise worth attacking is that the
+/// resident's format is derived from the identity's *kind* rather than from
+/// what the guest declared for that render target; see `TargetIdentity::is_bgra`
+/// for why that is keyed where it is, and what a change there has to keep true.
 pub(crate) fn read_resident_chain(state: &DeviceState, req: &DrawEncodeRequest) -> Option<Vec<u8>> {
     let identity = render_chain_identity(state, req)?;
     match crate::backend::vulkan::engine::read_target(&identity) {
@@ -6778,8 +6803,9 @@ pub(crate) fn read_resident_chain(state: &DeviceState, req: &DrawEncodeRequest) 
         // here, once, rather than at three call sites that would each have to
         // remember which namespace they were reading. `into_rgba8` uses the order
         // the engine reports for the image it copied, so it is a no-op on the
-        // pooled and GVA residents and a single pass on a BGRA surface. Both are
-        // abandon paths, so neither is on a hot rail.
+        // pooled and GVA residents — which is what the hot caller brings — and a
+        // single whole-frame pass on a BGRA surface, which only the two abandon
+        // callers reach.
         Ok(rb) => Some(rb.into_rgba8()),
         Err(e) => {
             crate::observe::fail(format!(
