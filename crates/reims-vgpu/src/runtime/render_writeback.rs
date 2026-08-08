@@ -452,6 +452,20 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
         height: c0.height,
         bgra: want_bgra,
     };
+    // This device is about to write these guest pages, and the hypervisor's
+    // dirty bitmap is defined not to see it. Without this record a reader
+    // holding a gathered image over the same pages
+    // (`crate::runtime::gather_witness`) cannot tell "nobody wrote them" from
+    // "we wrote them ourselves", and vouches a retained image that no longer
+    // matches the pages — a wrong frame that then persists.
+    //
+    // The copying rail this stands in front of records the identical fact from
+    // inside `gva_view`, so the two rails leave the same witness behind and a
+    // decline is invisible to every reader. Before the submit and not after it,
+    // and over the whole walked span rather than the copy's extent: a spurious
+    // bump costs a re-read of bytes that did not change, and the opposite error
+    // hands out a stale copy.
+    state.note_host_wrote_pages(gpas.to_vec());
     crate::backend::vulkan::engine::copy_target_to_guest_pages(identity, &target)
         .map_err(|inner| GvaWritebackDecline::Engine { inner })?;
     // Nothing here leaves a host copy of the frame, so neither GVA-keyed cache
