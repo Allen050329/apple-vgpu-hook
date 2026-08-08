@@ -147,7 +147,7 @@
 //! the same thing from the other side: 3 796 disjointness checks a second, of
 //! which **six** found a read overlapping an outstanding write.
 //!
-//! # What a deferral has to answer, and the one thing that blocks it today
+//! # What a deferral has to answer, and where the seam is
 //!
 //! Arming instead of writing is the easy half, and a second Store into one
 //! mapping should *replace* the armed copy rather than refuse it — the later
@@ -158,13 +158,36 @@
 //! already decoded — `clear_host_valid` means the guest wrote those bytes, so an
 //! armed copy for that mapping must be **dropped**, not landed.
 //!
-//! **The blocker is plumbing, and it is worth knowing before starting.**
-//! [`settle_guest_writes`] takes a [`SettleSite`] and nothing else — no
-//! `DeviceState`, no `HostMemory` — so it can wait for submitted copies but
-//! cannot submit an armed one. Its sixteen call sites are exactly the choke
-//! points a deferral needs to land at, and every one of them would have to carry
-//! state and host to get there. That threading is the bulk of the work, not the
-//! ledger.
+//! **The stamp is not a land point, and that is a contract statement rather than
+//! a risk taken.** A completion stamp says the submission is done; it does not
+//! say the guest may read the resource's bytes. What says that is the host-valid
+//! flag the guest itself sets and clears, and the synchronize it issues before a
+//! CPU read. Landing at the stamp is what makes coalescing unreachable, and the
+//! contract does not ask for it.
+//!
+//! **The seam is the plan, not the call graph.** The obvious shape — land from
+//! [`settle_guest_writes`] — does not fit: that function takes a [`SettleSite`]
+//! and nothing else, no `DeviceState` and no `HostMemory`, and threading both
+//! through its sixteen call sites would be the bulk of the work. It does not have
+//! to. Split [`crate::backend::vulkan::engine::copy_target_to_guest_pages`] at
+//! the point where it stops needing the guest's page tables: everything up to and
+//! including `references_for_runs` is `DeviceState`/`HostMemory` work and stays at
+//! the Store, and what is left — acquire a scratch, plan the regions, record,
+//! submit — needs only the engine, which is a process-global behind its own lock.
+//!
+//! So a Store resolves its plan and parks it; a settle records and submits every
+//! parked plan before it waits. `settle_guest_writes` can reach that with the
+//! signature it already has. The per-Store `vouch` and `resolve` cost (12 and
+//! 17 ms/s) is unchanged, which is fine — they are not what the ablation
+//! measured. The ~5 GB/s is, and it is entirely on the other side of the seam.
+//!
+//! Two consequences to keep in view while building it. Parking a plan holds
+//! resolved host pointers into guest RAM, so [`crate::runtime::guest_ram`]'s bound
+//! and the PTE guard have to be armed at the *arm*, not at the record — earlier
+//! than today, which is the safe direction. And the pin that keeps the resident
+//! alive until the copy executes has to be taken at the arm too, because between
+//! arm and land the reclaim paths would otherwise be free to take the image the
+//! parked plan reads from.
 //!
 //! One caveat for whoever reads the witness this rail feeds:
 //! `MappingEntry::render_flush`'s doc quotes `render_flush_age_sub_ms` /
