@@ -69,7 +69,7 @@ macro_rules! settle_sites {
         /// writeback has executed on the GPU, and on a driven boot that block is
         /// the largest single item in the drain worker's wall clock — a
         /// Safari-drag boot spent 15.6 of the worker's 24.7 busy seconds inside
-        /// it. It has eighteen call sites and, until this enum, one flag and one
+        /// it. It has seventeen call sites and, until this enum, one flag and one
         /// `fence_us` total served all of them, so no boot could say which site
         /// paid it. A fix aimed at that number was aimed by guess.
         ///
@@ -134,9 +134,6 @@ settle_sites! {
     RootStamp => "settle_root_stamp",
     /// `drain::process_child_packet` — a child packet's completion stamp.
     ChildStamp => "settle_child_stamp",
-    /// `mapping_write::write_bgra8_from_resident_gpu` — the GPU-direct type-11
-    /// Store, before it re-points the guest's pages.
-    MappingGpuStore => "settle_mapping_gpu_store",
     /// `mapping_write::write_bgra8_inner` — the copying type-11 Store.
     MappingBgra8Write => "settle_mapping_bgra8_write",
     /// `mapping_write::write_rgba8_image_changed`.

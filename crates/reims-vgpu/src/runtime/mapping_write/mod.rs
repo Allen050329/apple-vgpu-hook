@@ -912,18 +912,27 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
             format,
         });
     };
-    // Deferred-writeback flush-on-access, before the vouch and before the page
-    // list is read: this can invalidate the mapping — that is exactly what its
-    // own drift check does — and every value taken after it is taken against
-    // whatever it left behind.
-    crate::runtime::render_writeback::settle_guest_writes(
-        crate::runtime::render_writeback::SettleSite::MappingGpuStore,
-    );
+    // No settle here, and the twin rail is why. `render_writeback::store_gva_frame`
+    // does exactly this for a GVA-addressed destination — vouch, resolve runs,
+    // submit a buffer copy — and takes no settle at all, because nothing between
+    // here and the submit reads the pixel bytes a pending writeback would land
+    // in: the page list comes from `page_entries` (device state), the vouch
+    // walks the guest's page tables, and `references_for_runs` resolves host
+    // pointers. The copy itself is a GPU command on the same single queue as
+    // any outstanding writeback, so queue order already puts the older write
+    // ahead of this one and a CPU fence buys an ordering that holds without it.
+    // That is the same argument `try_linear_sample_zero_copy` states for its own
+    // gather.
+    //
+    // What used to stand here was the deferred rail's flush-on-access, whose
+    // justification was that landing a pending window "can invalidate the
+    // mapping". There are no windows: a type-11 render Store lands its frame at
+    // the Store (see `render_writeback`'s module doc). Measured at **5 204
+    // settles and 7.29 s blocked** on a driven Safari-drag boot — 42 % of every
+    // wait in the device — for an ordering the queue already had.
+    //
     // Nothing below can land a frame on a host whose GPU cannot import guest
-    // RAM, so the walks below are skipped rather than run and discarded. Asked
-    // *after* `flush_intersecting` and not before it: that call is a side effect
-    // this rail owes whether or not it goes on to write anything, and the
-    // copying arm that takes over from this decline expects the state it leaves.
+    // RAM, so the walks below are skipped rather than run and discarded.
     //
     // Not a second gate — it is the *same* gate, asked earlier.
     // `references_for_runs` below opens with the identical question and would
