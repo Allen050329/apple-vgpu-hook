@@ -6297,22 +6297,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 .as_ref()
                                 .map(|d| (d.clear_depth as f32, d.load_action))
                                 .unwrap_or((1.0, MTL_LOAD_ACTION_CLEAR));
-                            // The transient depth buffer supports CLEAR only; a
-                            // guest depth LOAD needs a persistent depth resident
-                            // (deferred). Degrade to CLEAR, fail-visible.
-                            if load_action == MTL_LOAD_ACTION_LOAD
-                                && degrade_log_first(
-                                    req.pipeline_ref,
-                                    "depth_load_unsupported_transient",
-                                )
-                            {
-                                crate::observe::fail(format!(
-                                    "shader_state_degraded reason=depth_load_unsupported_transient \
-                                     pipe={} ds_ref={} {}x{} \
-                                     (transient depth clears; multi-pass depth LOAD not yet resident)",
-                                    req.pipeline_ref, req.depth_stencil_ref, w, h
-                                ));
-                            }
+                            // `MTLLoadActionLoad` is carried through as the
+                            // guest wrote it. Whether it can be *honoured* is
+                            // not decidable here — it needs the depth resident's
+                            // own content state, which only the engine holds —
+                            // so the engine makes that call and names the
+                            // degradation when it cannot. See
+                            // `pools::registry_mark_depth_ready`.
                             // Stencil test: engaged when either face is enabled.
                             // A face that is *not* enabled maps to Metal's
                             // documented `MTLStencilDescriptor` default (compare
@@ -6413,8 +6404,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 write_enable: ds.depth_write_enabled,
                                 compare,
                                 clear_value,
-                                // Transient buffer: always CLEAR (see above).
-                                load: false,
+                                load: load_action == MTL_LOAD_ACTION_LOAD,
                                 stencil,
                             });
                         }
@@ -6710,17 +6700,34 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
 ///
 /// Every other identity carries a generation because its resident holds content
 /// that must not survive the guest reusing the key — a surface's
-/// `map_generation` is the worked example. A depth resident in this rail holds
-/// no such content: the pass always CLEARs it (`DepthState::load` is `false`
-/// here), so the pixels a recreated texture would inherit are overwritten before
-/// anything reads them. Geometry and format changes still recreate the image,
-/// through `ResidentTargetSlot::reusable_for`.
+/// `map_generation` is the worked example. This one carries none, and the
+/// argument is no longer the one an earlier version of this doc gave.
 ///
-/// **That argument is exactly as strong as the CLEAR, and no stronger.** Wiring
-/// depth LOAD — which is what `depth_load_unsupported_transient` asks for —
-/// makes the contents load-bearing and needs a real per-texture generation
-/// first, or a guest that deletes and re-creates a ref at the same geometry
-/// inherits a stranger's depth.
+/// That version said the contents did not matter because the pass always
+/// CLEARed, and that enabling depth LOAD would need a real per-texture
+/// generation first. The first half was true and is now false: LOAD is honoured
+/// (`DepthState::load` carries the guest's `loadAction`), so the contents are
+/// load-bearing. The second half does not follow, and the reason is Metal's own
+/// contract rather than anything this device arranges.
+///
+/// A texture ref names one live texture. The only way a resident can outlive
+/// what it was created for is the guest destroying that texture and creating
+/// another at the same ref, the same geometry and the same aspect — and a
+/// **newly created `MTLTexture`'s contents are undefined until something writes
+/// them**. So a pass that loads from one is reading undefined data by the
+/// guest's own choice, and handing it a previous texture's depth is a
+/// conformant answer to it. There is no case where a generation would turn a
+/// wrong frame into a right one; it would only replace one undefined value with
+/// a different undefined value.
+///
+/// **What this does not license is extending the same reasoning to colour.** A
+/// colour target's contents are read back to guest pages and presented, so a
+/// stale one is a wrong frame the guest can see rather than a value it declared
+/// it did not care about. That is why the surface rail has a generation and this
+/// one does not, and the difference is the readback, not the depth.
+///
+/// Geometry and aspect changes still recreate the image, through
+/// `ResidentTargetSlot::reusable_for` and the `stencil` field of the key.
 pub(super) fn depth_chain_identity(
     req: &DrawEncodeRequest,
     with_stencil: bool,
