@@ -1063,6 +1063,39 @@ impl DeviceContext {
 /// second submission that appending it removed. The writeback is the better
 /// candidate of the two rails despite being the larger: nothing waits on it but
 /// the completion stamp, whereas a draw waits on its own gather.
+///
+/// # What moving the writeback actually requires
+///
+/// Written down because the shape is not obvious from the size of the prize, and
+/// the naive version — create a queue, submit the copy to it — is undefined
+/// behaviour rather than a slow rail. Resident images are `EXCLUSIVE`, so an
+/// image the graphics family wrote has undefined contents when read by the
+/// transfer family with no ownership transfer between them. The round trip per
+/// writeback is:
+///
+/// 1. In the graphics batch, after the draws: the existing layout transition to
+///    `TRANSFER_SRC_OPTIMAL`, plus a **release** barrier carrying
+///    `srcQueueFamilyIndex = gq`, `dstQueueFamilyIndex = tq`.
+/// 2. Flush that batch signalling a semaphore.
+/// 3. In a transfer command buffer: the matching **acquire** barrier, the copy
+///    commands, the `TRANSFER_WRITE -> HOST_READ` barrier, then a **release**
+///    back to `gq`.
+/// 4. Submit it waiting the first semaphore and signalling a second, plus its
+///    own fence — which `quiesce_guest_writes` must then wait, and today that
+///    walks the graphics ring alone.
+/// 5. The **next draw into that image** records the matching acquire, and its
+///    submission must wait the second semaphore.
+///
+/// Step 5 is the invasive one and the reason this is not a small change: it
+/// makes a graphics submission's wait list depend on which images the draws
+/// inside it touch, which nothing in the submission ring models today.
+///
+/// `CONCURRENT` sharing across the two families removes steps 1, 3 and 5 and is
+/// the tempting shortcut. It is a real trade rather than a free one — a
+/// concurrently-shared image gives up lossless framebuffer compression on
+/// several vendors, taxing every draw to speed up the copy — so it has to be
+/// measured against the exclusive form on this workload rather than assumed
+/// cheaper. Gate whichever wins on the capability, never on a device name.
 fn dedicated_transfer_family(families: &[vk::QueueFamilyProperties]) -> Option<u32> {
     families
         .iter()
