@@ -84,9 +84,18 @@ macro_rules! settle_sites {
         /// The per-site microseconds and the `readback_split` `fence_us` total
         /// are the same wait attributed twice, and that is the identity worth
         /// checking: every settle in the device comes through here, so
-        /// `sum(settle_*_us)` and `fence_us` must agree to within the sampling
+        /// `sum(settle_*_us)` and `fence_us` agree to within the sampling
         /// window. Their diverging means a new caller reached
         /// `engine::quiesce_guest_writes` directly.
+        ///
+        /// **The identity holds only where the host-pointer import works**, and
+        /// a boot that forgets that will read a huge unattributed remainder as
+        /// a missing caller. On the copying arm — a host without the extension,
+        /// or `REIMS_VGPU_GUEST_IMPORT=off` — no writeback is ever submitted
+        /// without waiting, so every site here reads zero while `fence_us` is
+        /// the copying rail's own blocking readback, reported as the same
+        /// `ReadbackPhase::Fence`. One measured import-off boot: `fence_us`
+        /// 8.38 s against zero settles at every site.
         #[derive(Clone, Copy, PartialEq, Eq, Debug)]
         pub enum SettleSite {
             $($(#[$doc])* $variant,)*
