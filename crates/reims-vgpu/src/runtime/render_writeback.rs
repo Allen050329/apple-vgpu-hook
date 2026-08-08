@@ -144,12 +144,26 @@ settle_sites! {
     LinearTextureLoad => "settle_linear_texture_load",
     /// The same leaf, reached from `draw::seed_color_load` — the colour LOAD
     /// seed reading the attachment's own guest pages to seed a
-    /// `MTLLoadActionLoad`. Split out because it and the sampled arm below want
-    /// opposite repairs: this one is elided by proving the pass is about to
-    /// overwrite what it is seeding, and that one by not reading at all.
+    /// `MTLLoadActionLoad`.
+    ///
+    /// **This is the whole of it.** The split was taken to divide 4 438 waits
+    /// between this arm and the sampled one below, and a driven Safari drag put
+    /// **4 701 here against 0 there**, 4 692 of them genuine overlaps. So the
+    /// device's largest remaining wait is one thing and not two: a colour LOAD
+    /// blocking on the render Store that published the pages it is seeding
+    /// from. The repair is elision — proving the resident still holds what the
+    /// Store put in those pages, which is what
+    /// [`crate::runtime::gva_store_witness`] answers — and not narrowing, which
+    /// an overlap rate of 99.8 % cannot be improved by.
     LinearTextureSeed => "settle_linear_texture_seed",
     /// The same leaf, reached from `draw::vulkan::resolve_sampled_source`'s
     /// last-resort arm, after every rung above it declined.
+    ///
+    /// Reads **zero** on a driven drag, and that is a real answer rather than a
+    /// gap: the arms above it — the GVA resident rung, the zero-copy gather,
+    /// the host caches and the memo — take every sampled bind that gets this
+    /// far, so nothing reaches the last resort. A non-zero reading here means a
+    /// rung above stopped serving.
     LinearTextureSampled => "settle_linear_texture_sampled",
     /// `draw::vulkan::load_linear_guest_memoized` — the memoized full-span CPU
     /// re-read behind every linear sampled bind the gather rail declines.
