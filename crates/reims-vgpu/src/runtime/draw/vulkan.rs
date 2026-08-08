@@ -2452,10 +2452,12 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("zc_buffer_below_floor");
         return None;
     }
-    // Same coherence rule as the CPU read: land any resident-authoritative
-    // writeback aliasing the span before the GPU reads the pages (the CPU
-    // flush completes before this draw's submit).
-    crate::runtime::render_writeback::settle_guest_writes();
+    // No settle here, for the reason `try_linear_sample_zero_copy` states at
+    // length: this rail hands the engine guest-RAM runs and the *GPU* reads them
+    // when the draw's command buffer executes, so a guest-page writeback — a GPU
+    // command already on the same single queue — is ordered ahead of it by
+    // submission order. Only the CPU readers, which touch the pages with this
+    // thread, owe the block.
     // Walk exactly the bound range. Resolving the whole backing and slicing out
     // the bind would translate every page of the allocation to serve one bind,
     // and would refuse a bind whose allocation has an unmapped tail page even
