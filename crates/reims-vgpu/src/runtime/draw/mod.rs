@@ -740,6 +740,23 @@ pub struct DrawEncodeRequest {
     /// content from the engine target instead of a CPU seed. Set by the exec
     /// chain loop (Vulkan rail only); default false.
     pub chain_from_resident: bool,
+    /// This pass's colour0 is a GVA target whose `MTLLoadActionLoad` was **not**
+    /// seeded, because the engine still holds what the render Store published
+    /// into its guest pages. Set by `mrt_draw_request` from
+    /// `draw::vulkan::gva_resident_if_current`; Vulkan rail only.
+    ///
+    /// Distinct from [`Self::chain_from_resident`], which is about records 2+ of
+    /// one pass and is read by two other rails besides the Load gate. This says
+    /// only "the seed is deliberately absent, chain instead" and nothing else
+    /// keys off it.
+    ///
+    /// **A `true` here obliges the encode side to produce content one way or the
+    /// other.** `colors[0].target_seed_rgba` is `None` and the attachment still
+    /// says LOAD, so an encode that neither chains nor re-seeds hands the pass an
+    /// undefined attachment. The re-seed is not theoretical: the generation this
+    /// was decided on is recomputed after the request is built, and a page set
+    /// that moved in between names a different target.
+    pub gva_load_from_resident: bool,
     /// Out-flag: this record kept chain content on the engine-resident
     /// target (no CPU pixels, no guest Store). The exec chain loop arms
     /// `chain_from_resident` for the next record when set.
@@ -4004,6 +4021,9 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
     let mut colors = Vec::new();
     let mut base_w = 0u32;
     let mut base_h = 0u32;
+    // Colour0's LOAD seed was skipped in favour of the engine resident. Declared
+    // out here because it belongs to the request, not to the slot that set it.
+    let mut gva_load_from_resident = false;
     for &(slot, att) in color_slots {
         if att.texture_ref == 0 {
             // An empty colour slot is the guest declining to attach one, not a
@@ -4109,8 +4129,14 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                 // is the one a resident rung would replace, and a probe placed
                 // downstream of here measures an empty population by
                 // construction — see `note_gva_load_seed_probe`.
+                // Before the read, not after it. The engine may still hold
+                // exactly what the render Store published into these pages, in
+                // which case reading them back costs a full-frame CPU walk and a
+                // block on that same Store's writeback — the device's largest
+                // remaining wait. See `draw::vulkan::gva_resident_if_current`;
+                // the encode side honours the flag or re-seeds.
                 #[cfg(feature = "backend-vulkan")]
-                vulkan::note_gva_load_seed_probe(
+                let elided = vulkan::gva_load_seed_elidable(
                     state,
                     host,
                     task_id,
@@ -4122,12 +4148,24 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                         format: mfmt,
                     },
                 );
-                seed = seed_color_load(state, host, task_id, att.texture_ref, gva, mw, mh);
-                if seed.is_none() {
-                    crate::observe::fail(format!(
-                        "color LOAD seed miss ref={} {}x{} fmt={:#x} gva={:#x} (archive: still encode)",
-                        att.texture_ref, mw, mh, mfmt, gva
-                    ));
+                #[cfg(not(feature = "backend-vulkan"))]
+                let elided = false;
+                // Only colour0. `gva_chain_identity` names the first attachment
+                // and the chain rail carries that one, so a second slot whose
+                // seed was skipped would reach the pass with nothing to load.
+                // `colors.is_empty()` is "this push becomes `colors[0]`", taken
+                // from the vector the identity will read rather than from the
+                // slot number, which is the guest's and need not start at zero.
+                let elided = elided && colors.is_empty();
+                gva_load_from_resident = elided;
+                if !elided {
+                    seed = seed_color_load(state, host, task_id, att.texture_ref, gva, mw, mh);
+                    if seed.is_none() {
+                        crate::observe::fail(format!(
+                            "color LOAD seed miss ref={} {}x{} fmt={:#x} gva={:#x} (archive: still encode)",
+                            att.texture_ref, mw, mh, mfmt, gva
+                        ));
+                    }
                 }
             }
         }
@@ -4158,6 +4196,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         first_vertex: draw.first_vertex,
         base_instance: draw.base_instance,
         colors,
+        gva_load_from_resident,
         ..Default::default()
     })
 }
