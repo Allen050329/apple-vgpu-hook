@@ -1,6 +1,6 @@
 # reims-vgpu
 
-[![License: LGPL-3.0-or-later](https://img.shields.io/badge/License-LGPL%203.0%20or%20later-blue.svg)](LICENSE)
+[![License: LGPL-3.0-or-later](https://img.shields.io/badge/License-LGPL%203.0%20or%20later-blue.svg)](LICENSE) [![Discord](https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/D2AM9mrDgs)
 
 > **Alpha.** This project is early and under active development. The QEMU device ABI, boot scripts,
 > crate layout, backend behavior, and supported host/guest pathways may change without a stable
