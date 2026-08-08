@@ -440,6 +440,17 @@ pub const CHILD_OP_DELETE_RESOURCE: u16 = 0x25;
 ///
 /// Distinct from [`CHILD_OP_DELETE_RESOURCE`] (`0x25`) — the guest's shared
 /// object allocator emits this one, and the resource layer emits that one.
+///
+/// The payload is a `u32` task id followed by a variable-length serialized
+/// argument record, which is why no fixed length is declared here: the guest
+/// writes the id into four bytes of command space and then copies the record in
+/// after it. A driven x86 Safari-drag boot sends **1 931** of these in about
+/// forty seconds — which is what makes this device's not acting on the command
+/// a leak worth naming rather than a curiosity. Only the first was printed (the
+/// record latches; the rate lives in the `store_routes` counter of the same
+/// name), and that one carried 16 bytes, so the argument record was 12. Nothing
+/// says the record is fixed-length, and the emitter cannot tell you: the other
+/// 1 930 were counted, not read.
 pub const CHILD_OP_DELETE_OBJECT: u16 = 0x28;
 pub const CHILD_OP_SET_OBJECT_LIST: u16 = 0x33;
 /// PVG `CmdInvalidateResources`: `{u32 task_id, u32 count}` then `count`
