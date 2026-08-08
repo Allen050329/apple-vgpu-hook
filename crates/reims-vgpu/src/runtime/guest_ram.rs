@@ -55,12 +55,18 @@
 //!
 //! # One import per RAMBlock, for the lifetime of the VM
 //!
-//! GPA → HVA is linear *within* a RAMBlock, so one import covers every guest
-//! page in it and a resource becomes an `(offset, len)` pair rather than a page
-//! list somebody has to export. That is what makes [`GuestRamImport::slice`](crate::runtime::guest_ram::GuestRamImport::slice)
+//! GPA → HVA is linear *within* a RAMBlock, so one [`GuestRamImport`](crate::runtime::guest_ram::GuestRamImport) addresses every
+//! guest page in it and a resource becomes an `(offset, len)` pair rather than a
+//! page list somebody has to export. That is what makes [`GuestRamImport::slice`](crate::runtime::guest_ram::GuestRamImport::slice)
 //! free — no ioctl, no allocation, no cache, no kernel reference per page — and
 //! it is why a scattered surface is not un-importable: it is N slices over one
 //! import.
+//!
+//! What a backend hands the driver is a bounded span of that block rather than
+//! all of it, because registering a range costs the driver work proportional to
+//! its size on every submission — see [`ImportWindow`](crate::runtime::guest_ram::ImportWindow) for the measurement. The
+//! addressing above is unchanged by that: a window is derived from a
+//! [`BoundRange`](crate::runtime::guest_ram::BoundRange) and checked against the same import.
 //!
 //! **Do not import per resource.** The extension does not guarantee that
 //! importing the same host allocation twice into one device works, and
@@ -188,6 +194,10 @@ pub enum GuestRamError {
     /// A guest physical address that this RAMBlock does not back. Includes a GPA
     /// inside the untrimmed block but below the granularity-aligned base.
     GpaOutsideImport { gpa: u64, gpa_base: u64, len: u64 },
+    /// A backend asked for a window grain that is zero or not a power of two.
+    /// [`GuestRamImport::window`] masks with `grain - 1` to find the bucket, and
+    /// a non-power-of-two mask names arbitrary bytes rather than refusing.
+    WindowGrainNotPowerOfTwo { grain: u64 },
 }
 
 impl Decline for GuestRamError {
@@ -204,6 +214,7 @@ impl Decline for GuestRamError {
             Self::SliceAlignedEndPastImport { .. } => "guest_ram_slice_aligned_end_past_import",
             Self::SliceForeignImport { .. } => "guest_ram_slice_foreign_import",
             Self::GpaOutsideImport { .. } => "guest_ram_gpa_outside_import",
+            Self::WindowGrainNotPowerOfTwo { .. } => "guest_ram_window_grain_not_power_of_two",
         }
     }
 
@@ -240,6 +251,7 @@ impl Decline for GuestRamError {
                 ("gpa_base", format!("{gpa_base:#x}")),
                 ("len", len.to_string()),
             ],
+            Self::WindowGrainNotPowerOfTwo { grain } => vec![("grain", grain.to_string())],
         }
     }
 }
@@ -268,13 +280,14 @@ impl GuestRamError {
 
 /// One RAMBlock, imported once, and the only thing that can name a byte in it.
 ///
-/// Created at device init and held for the VM's lifetime. Not per draw, not per
-/// window, not per resource — see the module doc for why re-importing is both
-/// unsupported and expensive.
+/// Created at device init and held for the VM's lifetime. Not per draw and not
+/// per resource — see the module doc for why re-importing is both unsupported
+/// and expensive.
 ///
-/// The backend's handle for the import (a `VkDeviceMemory` and its whole-region
-/// `VkBuffer`, or an `MTLBuffer`) lives beside this in the backend, keyed by
-/// [`Self::id`]. This type is deliberately backend-free: the bound is pure
+/// The backend's device handles (a `VkDeviceMemory` and the `VkBuffer` bound
+/// over it, or an `MTLBuffer`) live beside this in the backend, one per
+/// [`ImportWindow`] it has taken out of this import. This type is deliberately
+/// backend-free: the bound is pure
 /// arithmetic, and keeping it out of a backend-gated module is what lets its
 /// tests run on the Metal arm's build as well as the Vulkan one. On a Linux host
 /// nothing under `backend/metal/` runs its tests at all.
@@ -390,12 +403,13 @@ impl GuestRamImport {
         self.align
     }
 
-    /// The host address to import, for the backend's import call and nothing
-    /// else.
+    /// The host address of the first byte covered.
     ///
-    /// There is deliberately no `host_ptr_for(slice)`. The whole region is what
-    /// gets imported, once; a per-slice host pointer is the raw-offset-plus-base
-    /// arithmetic this module exists to make unwritable.
+    /// There is deliberately no `host_ptr_for(slice)`: a per-slice host pointer
+    /// is the raw-offset-plus-base arithmetic this module exists to make
+    /// unwritable. A backend that needs an address to import asks
+    /// [`Self::window`] for one, which does the same arithmetic under the same
+    /// bound.
     pub fn host_base(&self) -> usize {
         self.host_base
     }
@@ -505,6 +519,152 @@ impl GuestRamImport {
             offset: slice.offset,
             len: slice.len,
         })
+    }
+
+    /// The window a backend must import in order to bind `range`.
+    ///
+    /// `grain` is the backend's window size: the bucket the window base is
+    /// aligned to, and the window's length whenever the range fits inside one
+    /// bucket. A range straddling a bucket edge extends the window forward to
+    /// cover it, so the answer always holds the whole range and no backend has
+    /// to bind one span across two buffers. A range longer than `grain`
+    /// therefore yields a window as long as the range: `grain` bounds the slack
+    /// around a span, not the span.
+    ///
+    /// `grain` is raised to this import's granularity where it is smaller, so a
+    /// backend naming a grain finer than its own driver's alignment gets an
+    /// importable window rather than a refusal.
+    ///
+    /// The result never leaves the import, so a backend that imports it and then
+    /// binds [`ImportWindow::offset_of`] reaches only bytes the RAMBlock backs.
+    pub fn window(&self, range: BoundRange, grain: u64) -> Result<ImportWindow, GuestRamError> {
+        if grain == 0 || !grain.is_power_of_two() {
+            return Err(GuestRamError::WindowGrainNotPowerOfTwo { grain }.report());
+        }
+        if range.len == 0 {
+            return Err(GuestRamError::SliceEmpty.report());
+        }
+        let overflow = GuestRamError::SliceOverflow {
+            offset: range.offset,
+            len: range.len,
+        };
+        let end = range
+            .offset
+            .checked_add(range.len)
+            .ok_or(overflow)
+            .map_err(GuestRamError::report)?;
+        if end > self.len {
+            return Err(GuestRamError::SliceEndPastImport {
+                end,
+                import_len: self.len,
+            }
+            .report());
+        }
+
+        // Both are powers of two, so the larger is the coarser mask and every
+        // multiple of it is also a multiple of the import granularity.
+        let grain = grain.max(self.align);
+        let offset = range.offset & !(grain - 1);
+        // Forward to the bucket edge, out to the range's end where the range
+        // crosses that edge, then back to the import's own end. Each of the
+        // three is a multiple of the granularity, and so is the result.
+        let reach = align_up_u64(offset.saturating_add(grain).max(end), self.align)
+            .ok_or(overflow)
+            .map_err(GuestRamError::report)?;
+        let win_end = reach.min(self.len);
+        let host_ptr = usize::try_from(offset)
+            .ok()
+            .and_then(|off| self.host_base.checked_add(off))
+            .ok_or(overflow)
+            .map_err(GuestRamError::report)?;
+
+        Ok(ImportWindow {
+            import: self.id,
+            host_ptr,
+            offset,
+            len: win_end - offset,
+        })
+    }
+}
+
+/// A granularity-aligned span of one import that a backend may hand to a driver
+/// as a host pointer.
+///
+/// # Why a window and not the whole RAMBlock
+///
+/// Importing registers a host address range for GPU DMA. On Linux the DRM
+/// driver holds it as a userptr allocation and re-walks the whole range through
+/// `hmm_range_fault` whenever an MMU notifier fires over it — which, for a VMA
+/// a running guest writes continuously, is most submissions. The walk costs
+/// time proportional to the range, so importing a whole RAMBlock makes every
+/// submission pay for every guest page: a kernel-inclusive profile of the x86
+/// pathway put `hmm_vma_walk_pmd` and `vm_normal_page` at 47% of the drain
+/// thread's cycles over a 1 GiB range, with the guest's screen static.
+///
+/// Bounding what gets registered is also what keeps the host's locked memory
+/// bounded, and that half holds on every host rather than only the ones with an
+/// MMU notifier.
+///
+/// # Why it is a type
+///
+/// A window is `host_base + offset`, which is precisely the arithmetic the
+/// module doc says no call site may write. So no call site writes it: a backend
+/// names a grain, presents a [`BoundRange`], and receives this. [`Self::offset_of`]
+/// is the only route back to a position inside one, and it re-checks the
+/// import identity before the containment, for the same reason
+/// [`GuestRamImport::resolve`] does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportWindow {
+    import: ImportId,
+    host_ptr: usize,
+    offset: u64,
+    len: u64,
+}
+
+impl ImportWindow {
+    /// Which import these bytes belong to.
+    pub fn import(&self) -> ImportId {
+        self.import
+    }
+
+    /// The host address to import, for the backend's import call and nothing
+    /// else.
+    pub fn host_ptr(&self) -> usize {
+        self.host_ptr
+    }
+
+    /// Bytes to import, a multiple of the import granularity.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Never true: [`GuestRamImport::window`] refuses an empty range, and a
+    /// non-empty one it covers.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Where this window starts inside its import, for log fields only.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Byte offset of `range` inside this window, or `None` when this window
+    /// does not hold all of it.
+    ///
+    /// `None` is how a backend asks "does the window I already have serve this
+    /// range?", so a miss is expected control flow rather than a refusal, and
+    /// nothing is logged. A range from another import misses for the same
+    /// reason it cannot resolve: its offset means nothing here.
+    pub fn offset_of(&self, import: ImportId, range: BoundRange) -> Option<u64> {
+        if import != self.import {
+            return None;
+        }
+        let end = range.offset.checked_add(range.len)?;
+        if range.offset < self.offset || end > self.offset.checked_add(self.len)? {
+            return None;
+        }
+        Some(range.offset - self.offset)
     }
 }
 
@@ -981,5 +1141,210 @@ mod tests {
                 "{slug}"
             );
         }
+    }
+
+    /// A 4 KiB grain over a 1 MiB import, and the range a caller asks for
+    /// inside it. Every window test below shares this shape so the numbers a
+    /// failure prints are comparable across them.
+    fn window_of(offset: u64, len: u64, grain: u64) -> (GuestRamImport, ImportWindow) {
+        let import = import(1 << 20, 0x1000);
+        let slice = import.slice(offset, len).expect("range fits the import");
+        let range = import.resolve(&slice).expect("its own slice resolves");
+        let window = import.window(range, grain).expect("grain is a power of two");
+        (import, window)
+    }
+
+    /// A window holds every byte of the range it was opened for, wherever that
+    /// range sits relative to the bucket grid. The offsets walk one bucket from
+    /// its first byte to past its last, which is the only way the straddling
+    /// case gets covered without naming it.
+    #[test]
+    fn a_window_holds_the_range_it_was_opened_for() {
+        const GRAIN: u64 = 0x1_0000;
+        for offset in [0, 0x1000, GRAIN - 0x1000, GRAIN, GRAIN + 0x8000] {
+            for len in [1u64, 0x1000, GRAIN / 2, GRAIN, GRAIN + 0x4000] {
+                let (import, window) = window_of(offset, len, GRAIN);
+                let slice = import.slice(offset, len).expect("range fits");
+                let range = import.resolve(&slice).expect("resolves");
+                let at = window
+                    .offset_of(import.id(), range)
+                    .unwrap_or_else(|| panic!("window misses {offset:#x}+{len:#x}"));
+                assert!(
+                    at + range.len <= window.len(),
+                    "{offset:#x}+{len:#x} runs off the window"
+                );
+                assert_eq!(
+                    window.host_ptr() + at as usize,
+                    import.host_base() + range.offset as usize,
+                    "the window's own address must name the same byte"
+                );
+            }
+        }
+    }
+
+    /// The grain bounds the slack around a range, so a window is never more than
+    /// one grain longer than what was asked for. This is the property the whole
+    /// rail exists for: the driver re-walks a registered range whenever an MMU
+    /// notifier fires over it, and an unbounded window makes that walk the size
+    /// of guest RAM.
+    #[test]
+    fn a_window_is_bounded_by_its_grain() {
+        const GRAIN: u64 = 0x1_0000;
+        for offset in [0, 0x3000, GRAIN + 0x1000, (1 << 20) - GRAIN] {
+            for len in [0x1000u64, GRAIN, GRAIN * 3] {
+                if offset + len > (1 << 20) {
+                    continue;
+                }
+                let (_, window) = window_of(offset, len, GRAIN);
+                assert!(
+                    window.len() <= GRAIN + len,
+                    "{offset:#x}+{len:#x} pulled {:#x}",
+                    window.len()
+                );
+            }
+        }
+    }
+
+    /// A window never names a byte the import does not cover — the bound the
+    /// whole module exists for, restated at the one place that hands an address
+    /// to a driver.
+    #[test]
+    fn a_window_stays_inside_its_import() {
+        const GRAIN: u64 = 0x1_0000;
+        let import = import(1 << 20, 0x1000);
+        // The last byte of the block is where a window would run off it, and the
+        // clamp is the only thing stopping it.
+        for offset in [0, (1 << 20) - 0x1000, (1 << 20) - GRAIN] {
+            let slice = import.slice(offset, 0x1000).expect("range fits");
+            let range = import.resolve(&slice).expect("resolves");
+            let window = import.window(range, GRAIN).expect("grain is fine");
+            assert!(window.offset() + window.len() <= import.len());
+            assert!(window.host_ptr() >= import.host_base());
+            assert!(
+                window.host_ptr() + window.len() as usize
+                    <= import.host_base() + import.len() as usize
+            );
+        }
+    }
+
+    /// Base and length stay multiples of the import granularity, which is a
+    /// requirement of the import call rather than a preference: a driver refuses
+    /// a host pointer that does not meet `minImportedHostPointerAlignment`.
+    #[test]
+    fn a_window_meets_the_import_granularity() {
+        for align in [0x1000u64, 0x4000, 0x1_0000] {
+            let import = import(1 << 20, align);
+            let slice = import.slice(align * 3 + 1, align * 2).expect("fits");
+            let range = import.resolve(&slice).expect("resolves");
+            let window = import.window(range, 0x1_0000).expect("grain is fine");
+            assert_eq!(window.offset() % align, 0, "align {align:#x}");
+            assert_eq!(window.len() % align, 0, "align {align:#x}");
+            assert_eq!(window.host_ptr() as u64 % align, 0, "align {align:#x}");
+        }
+    }
+
+    /// A grain finer than the import granularity is raised to it rather than
+    /// refused. A backend naming a grain it measured elsewhere still gets an
+    /// importable window, instead of one the driver would reject.
+    #[test]
+    fn a_grain_below_the_granularity_is_raised_to_it() {
+        let import = import(1 << 20, 0x4000);
+        let slice = import.slice(0x9000, 0x1000).expect("fits");
+        let range = import.resolve(&slice).expect("resolves");
+        let window = import.window(range, 0x1000).expect("power of two");
+        assert_eq!(window.len(), 0x4000);
+        assert_eq!(window.offset(), 0x8000);
+    }
+
+    /// An import shorter than one grain is taken whole — the small-RAMBlock case,
+    /// where bucketing would leave the same bytes in one window anyway.
+    #[test]
+    fn an_import_under_one_grain_is_one_window() {
+        let import = import(1 << 16, 0x1000);
+        let slice = import.slice(0x2000, 0x1000).expect("fits");
+        let range = import.resolve(&slice).expect("resolves");
+        let window = import.window(range, 1 << 20).expect("power of two");
+        assert_eq!(window.offset(), 0);
+        assert_eq!(window.len(), import.len());
+    }
+
+    /// A grain the bucket mask cannot use is refused. `grain - 1` is the mask,
+    /// and a non-power-of-two one names arbitrary bytes rather than a bucket.
+    #[test]
+    fn a_grain_that_is_not_a_power_of_two_is_refused() {
+        let import = import(1 << 20, 0x1000);
+        let slice = import.slice(0x1000, 0x1000).expect("fits");
+        let range = import.resolve(&slice).expect("resolves");
+        for grain in [0u64, 3, 0x1001, u64::MAX] {
+            assert_eq!(
+                import.window(range, grain),
+                Err(GuestRamError::WindowGrainNotPowerOfTwo { grain })
+            );
+        }
+    }
+
+    /// A window refuses a range from another import, for the same reason
+    /// `resolve` does: the offset is meaningful only against the import that
+    /// produced it, and against this one it is an arbitrary address.
+    #[test]
+    fn a_window_refuses_a_range_from_another_import() {
+        let (mine, window) = window_of(0x2000, 0x1000, 0x1_0000);
+        let theirs = import(1 << 20, 0x1000);
+        let slice = theirs.slice(0x2000, 0x1000).expect("fits");
+        let range = theirs.resolve(&slice).expect("resolves");
+        assert_eq!(window.offset_of(theirs.id(), range), None);
+        assert!(window.offset_of(mine.id(), range).is_some());
+    }
+
+    /// A window declines a range that runs off its end rather than admitting a
+    /// clamped one. `offset_of` is how a backend asks whether the window it
+    /// already has serves a reference, and a wrong yes binds bytes the buffer
+    /// does not span.
+    #[test]
+    fn a_window_declines_a_range_that_leaves_it() {
+        let (import, window) = window_of(0x1000, 0x1000, 0x1_0000);
+        let past = BoundRange {
+            offset: window.offset() + window.len(),
+            len: 0x1000,
+        };
+        assert_eq!(window.offset_of(import.id(), past), None);
+        let overhang = BoundRange {
+            offset: window.offset() + window.len() - 0x1000,
+            len: 0x2000,
+        };
+        assert_eq!(window.offset_of(import.id(), overhang), None);
+    }
+
+    /// An empty range has no window. Admitting one would make a zero-length
+    /// import a legal thing to hand a driver.
+    #[test]
+    fn an_empty_range_has_no_window() {
+        let import = import(1 << 20, 0x1000);
+        let empty = BoundRange { offset: 0, len: 0 };
+        assert_eq!(import.window(empty, 0x1000), Err(GuestRamError::SliceEmpty));
+    }
+
+    /// A range past the end of the import is refused before any address is
+    /// computed. `BoundRange` has public fields, so a caller can present one the
+    /// import never produced, and this is the check that catches it.
+    #[test]
+    fn a_range_past_the_import_has_no_window() {
+        let import = import(1 << 20, 0x1000);
+        let past = BoundRange {
+            offset: (1 << 20) - 0x1000,
+            len: 0x2000,
+        };
+        assert!(matches!(
+            import.window(past, 0x1_0000),
+            Err(GuestRamError::SliceEndPastImport { .. })
+        ));
+        let wraps = BoundRange {
+            offset: u64::MAX - 0xfff,
+            len: 0x2000,
+        };
+        assert!(matches!(
+            import.window(wraps, 0x1_0000),
+            Err(GuestRamError::SliceOverflow { .. })
+        ));
     }
 }

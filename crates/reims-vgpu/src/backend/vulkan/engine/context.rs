@@ -543,8 +543,8 @@ impl DeviceContext {
         // shader buffer access (index fetch, attachment access, and
         // encoder-level suspects remain open).
         let enabled = features.enabled_features();
-        // Whether guest RAM can reach this device as a host-pointer import over
-        // whole RAMBlocks, and at what granularity. Same shape as the query
+        // Whether guest RAM can reach this device as a host-pointer import, and
+        // at what granularity. Same shape as the query
         // above and for the same reason: the answer is the only producer of the
         // extension string it requires.
         let host_pointer =

@@ -2768,21 +2768,21 @@ unsafe fn publish_previous_writeback_timestamps(ctx: &context::DeviceContext) {
 }
 
 /// Guest memory the device can currently reach through host-pointer imports,
-/// and how many RAMBlocks that is.
+/// and how many import windows that is.
 ///
 /// # What the count is for
 ///
 /// It is the only thing in the tree that can answer "how much guest RAM can the
 /// device reach right now", and the *count* is the reading that says whether the
-/// one-import-per-RAMBlock model held: it should be one or two for a whole boot,
-/// and a count that tracks the workload is the per-resource import the model
-/// exists to avoid.
+/// windowed-import model held: both numbers settle once the workload's span of
+/// guest RAM is covered, and a count still climbing late in a boot is the
+/// per-resource import the model exists to avoid.
 ///
-/// Emitted every census window by `runtime::drain::census`'s
+/// Sampled every census tranche by `runtime::drain::census`'s
 /// `guest_import_levels`, which is where the polarity is documented: this is a
-/// level, flat is healthy, and a rise is the alarm. It is read every window
-/// rather than once at import time precisely because one line at import time
-/// cannot tell "imported once" from "imported once per window".
+/// level, flat is healthy, and a rise is the alarm. It is read repeatedly rather
+/// than once at import time precisely because one line at import time cannot
+/// tell a window opened once from one opened per frame.
 pub fn guest_import_census() -> (u64, usize) {
     let guard = lock_engine();
     let (count, bytes) = guard.pools.host_ram_import_census();

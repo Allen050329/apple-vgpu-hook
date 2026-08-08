@@ -19,7 +19,7 @@
 //! * [`device_features`] — which optional device features are queried and
 //!   enabled, in one place, so no site can ask about one it did not request.
 //! * [`host_pointer::HostPointerImport`] — whether guest RAM can reach the GPU
-//!   as a host-pointer import over a whole RAMBlock, and at what granularity.
+//!   as a host-pointer import, and at what granularity.
 //!   The one guest-memory rail on every host, because it is the only primitive
 //!   Linux, Windows and macOS all have — dma-buf is a Linux kernel object with
 //!   no equivalent on the other two. Same rule again: the
@@ -89,7 +89,7 @@ pub struct HostGpuCaps {
     pub memory: MemoryProfile,
     pub quirks: DriverQuirk,
     /// Whether guest RAM may be imported as `VkDeviceMemory` through a host
-    /// pointer over a whole RAMBlock, and at what granularity. Read by
+    /// pointer, and at what granularity. Read by
     /// `runtime::guest_ram_map` through the granularity latch, by the import
     /// site, and by nothing else.
     pub host_pointer: HostPointerCaps,

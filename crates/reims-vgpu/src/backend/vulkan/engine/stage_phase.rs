@@ -50,9 +50,10 @@
 //! The `runs` row's fix is therefore not "move fewer bytes" — the bytes are the
 //! guest's vertex data and every one of them is needed. It is to stop the *CPU*
 //! moving them, which is what `exec`'s `gather_guest_buffer_window` now does:
-//! the host-pointer import covers the whole RAMBlock, so a scattered window is
-//! one `vkCmdCopyBuffer` per stretch out of that import into a device-local
-//! destination, recorded ahead of the draw's own render pass.
+//! one host-pointer import covers every stretch of a scattered span that falls
+//! inside it, so the span is one `vkCmdCopyBuffer` per stretch out of that
+//! import into a device-local destination, recorded ahead of the draw's own
+//! render pass.
 //!
 //! What had kept every bind on this memcpy was the shape and not the mechanism:
 //! `GuestRunSource::pages` was a single `GuestRef`, so a window that is not one

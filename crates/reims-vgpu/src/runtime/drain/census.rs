@@ -1418,46 +1418,53 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
     }
 }
 
-/// How many RAMBlocks this device has imported, and how many bytes they cover,
-/// as **levels** rather than per-window deltas.
+/// How many import windows this device holds and how many bytes they cover,
+/// against the guest RAM the shim reported, as **levels** rather than
+/// per-tranche deltas.
 ///
-/// This is the reading that says whether the one-import-per-RAMBlock model held.
-/// The count should be one or two for a whole boot and flat across every window;
-/// a count that tracks the workload is the per-resource import the model exists
-/// to avoid, which `VK_EXT_external_memory_host` does not guarantee works twice
-/// over one allocation and which would pay the driver's page pinning thousands
-/// of times a second for an answer that never changes.
+/// This is the reading that says whether the windowed-import model held. Both
+/// numbers climb while the workload first reaches into each part of guest RAM
+/// and then go flat; a count still climbing late in a boot is the per-resource
+/// import the model exists to avoid, which `VK_EXT_external_memory_host` does
+/// not guarantee works twice over one allocation and which would pay the
+/// driver's page pinning thousands of times a second for an answer that never
+/// changes.
 ///
-/// Flat is therefore the healthy reading and a rise is the alarm — the opposite
-/// polarity to most lines here, which is why the count is emitted every window
-/// rather than once at import time. A single line at import time could not
-/// distinguish "imported once" from "imported once per window".
+/// Settling is therefore the healthy reading and a late rise is the alarm — the
+/// opposite polarity to most lines here, which is why the count is sampled every
+/// tranche rather than once at import time. A single line at import time could
+/// not distinguish a window opened once from one opened per frame.
 ///
 /// # Both terms, because the numerator alone is ambiguous
 ///
-/// A backend imports a span at its **first reference**, not at device init, so
-/// the imported count is bounded above by the number of spans the shim reported
-/// and starts below it. `ramblocks=1` alone cannot distinguish "this machine has
-/// one RAMBlock and it is imported" from "this machine has two and the workload
-/// has only ever touched one" — and the second is a workload fact, not a defect.
+/// A backend opens a window at a reference's **first miss**, not at device init,
+/// so the imported bytes start well below what the machine has and never reach
+/// it: [`crate::backend::vulkan::engine::host_ram`] caps the total, and past that
+/// cap further references take the copying rails instead. `mib=1024` alone
+/// cannot distinguish "the workload's whole span is covered" from "the cap is
+/// binding and every new reference is now a memcpy", which is what the
+/// denominator and the `host_ram_import_window_byte_cap` decline are for.
+///
 /// The denominator comes from [`crate::runtime::guest_ram_map::span_census`],
-/// which is the shim's answer, so the pair reads `imported/reported`.
+/// which is the shim's answer, so the pair reads `imported/reported`. Windows
+/// can overlap by up to a grain where a reference straddling a bucket edge
+/// opened one before a reference inside the next bucket did, so the numerator is
+/// an upper bound on distinct bytes rather than a count of them.
 ///
-/// This is not hypothetical on the x86 pathway. `vm/boot-x86.sh` boots `-m 16G`
-/// and a driven Safari boot measures `ramblocks=1/4 mib=14336/16399`: the shim
-/// reports four writable spans and the workload imports one, the 14 GiB half of
-/// `-m` above the PCI hole. The numerator alone reads as 2 GiB of guest RAM
-/// having gone missing against `-m 16G`, which is how it was first misread.
+/// # What the reported side is, on the x86 pathway
 ///
-/// The reported set is larger than `-m` — 16399 MiB against 16384 — because the
-/// shim walks the flat view rather than `-m`. `guest_ram_span` names each span
-/// at build time; on this boot they are:
+/// `vm/boot-x86.sh` boots `-m 16G` and the shim reports `16399` MiB across four
+/// writable spans — more than `-m`, because the shim walks the flat view. The
+/// numerator being far below that reads as guest RAM having gone missing, which
+/// is how it was first misread.
+///
+/// `guest_ram_span` names each span at build time; on that boot they are:
 ///
 /// ```text
 /// n=0/4 gpa=0x0          len=786432      (768 KiB, below the legacy VGA hole)
 /// n=1/4 gpa=0x100000     len=2146435072  (2047 MiB, 1 MiB up to the PCI hole)
 /// n=2/4 gpa=0x80000000   len=16777216    (16 MiB — this device's own BAR1)
-/// n=3/4 gpa=0x100000000  len=15032385536 (14336 MiB, above 4 GiB — imported)
+/// n=3/4 gpa=0x100000000  len=15032385536 (14336 MiB, above 4 GiB — referenced)
 /// ```
 ///
 /// Spans 0, 1 and 3 are the two halves of `-m 16G` either side of the PCI hole,
@@ -1486,15 +1493,16 @@ fn emit_guest_import_levels() {
     let (bytes, count) = crate::backend::vulkan::engine::guest_import_census();
     let (spans, span_bytes) = crate::runtime::guest_ram_map::span_census();
     // An engine that never imported emits nothing, so a host on a negative
-    // `host_pointer` rung — or a boot before the first guest window — costs no
-    // line, and a zero here always means the copying rails rather than silence.
+    // `host_pointer` rung — or a boot before the first reference into guest
+    // memory — costs no line, and a zero here always means the copying rails
+    // rather than silence.
     if count == 0 {
         return;
     }
     crate::observe::off(format!(
-        "guest_import_levels (levels, not per-interval) ramblocks={count}/{spans} \
-         mib={}/{} (imported/reported; a span is imported at first reference, \
-         so below is lazy and above is impossible)",
+        "guest_import_levels (levels, not per-interval) windows={count} spans={spans} \
+         mib={}/{} (imported/reported; a window opens at a reference's first miss, \
+         so below is lazy, and the cap holds it below what the machine has)",
         bytes / (1024 * 1024),
         span_bytes / (1024 * 1024),
     ));

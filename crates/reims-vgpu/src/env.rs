@@ -26,7 +26,8 @@
 //! Reading it is how a caller notices an operator asked for something the host
 //! cannot give and says so, rather than ignoring the request in silence.
 
-/// Guest RAM reaches the GPU as a host-pointer import over whole RAMBlocks.
+/// Guest RAM reaches the GPU as a host-pointer import over bounded windows of
+/// it.
 /// Setting this off makes the device take the copying rails on a host that
 /// could have imported — see
 /// [`crate::backend::vulkan::caps::host_pointer`].

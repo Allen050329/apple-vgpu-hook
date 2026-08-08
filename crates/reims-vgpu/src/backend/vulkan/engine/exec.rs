@@ -234,8 +234,8 @@ unsafe fn import_guest_buffer_window(
             return None;
         }
     };
-    // The imported buffer spans the whole RAMBlock, so the span's first byte is
-    // the bound range's start plus whatever widening it to the device's import
+    // Both are offsets into the imported buffer, so the span's first byte is the
+    // bound range's start plus whatever widening it to the device's import
     // granularity added at the front.
     let offset = bound.offset + bound.head;
     // Unlike the sampled rail's copy offset, this one is a *bind*: the device

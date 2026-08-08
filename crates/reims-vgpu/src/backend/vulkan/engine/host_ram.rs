@@ -1,5 +1,5 @@
-//! Import a RAMBlock's host mapping as `VkDeviceMemory` and bind a `VkBuffer`
-//! over all of it.
+//! Import a bounded span of a RAMBlock's host mapping as `VkDeviceMemory` and
+//! bind a `VkBuffer` over it.
 //!
 //! This is the one place guest memory becomes something the engine can bind.
 //! Which *bytes* a draw reaches is decided before it gets here and is carried by
@@ -8,24 +8,27 @@
 //! and [`super::super::caps::host_pointer`] for the capability that gates the
 //! whole rail.
 //!
-//! # One import per RAMBlock, and no cache
+//! # Windows, and why the whole block is not one of them
 //!
-//! The expensive step happens once per RAMBlock for the device's life, and the
-//! cheap step — naming a range inside it — is a bounds check. Nothing on the
-//! path a draw takes walks a page list, allocates, or takes a per-page kernel
-//! reference, so there is nothing left for a cache to amortise.
+//! A window is [`GUEST_IMPORT_WINDOW_BYTES`] of one import, and every reference
+//! the window holds binds against the one buffer it already made. The size is
+//! not an amortisation knob: registering a range makes the DRM driver re-walk
+//! all of it whenever an MMU notifier fires over it, so the recurring cost of a
+//! window is its size, on submissions that have nothing to do with the bytes
+//! that moved. [`crate::runtime::guest_ram::ImportWindow`] carries the profile
+//! that fixed the number. **Never widen a window to a whole RAMBlock**, which on
+//! this pathway is 16 GiB of that walk.
 //!
-//! So [`HostRamImports`] is a map with no eviction policy and no capacity. It
-//! holds at most one entry per span the shim reported, which on an ordinary
-//! machine is one or two. That is the whole prize of the model, and a future
-//! change that adds an eviction rule here has almost certainly misunderstood it:
-//! evicting an import does not free guest RAM, it only forces the next draw to
-//! pay `get_user_pages` again for a mapping that never moved.
+//! # Bounded, and never evicted
 //!
-//! **Do not import the same RAMBlock twice.** `VK_EXT_external_memory_host`
-//! does not guarantee that importing one host allocation twice into one device
-//! works, which is why the map is keyed on
-//! [`crate::runtime::guest_ram::ImportId`] and the key is never reused.
+//! [`HostRamImports`] grows to [`WINDOW_COUNT_CAP`] windows or
+//! [`WINDOW_TOTAL_BYTE_CAP`] bytes, whichever binds first, and then declines. It
+//! does not evict: a decline routes that reference through the copying rails,
+//! which land the same frame, whereas evicting a window a live submission still
+//! names would land undefined behavior in the driver. The caps are what keep the
+//! host's locked memory and the driver's walk bounded; the census in
+//! [`super::pools::ResourcePools::host_ram_import_census`] is where a boot says
+//! how close it came.
 //!
 //! # What the import does not promise
 //!
@@ -36,23 +39,43 @@
 //! in [`crate::runtime::guest_ram`]'s module doc and is not repeated as a
 //! guarantee here.
 
-use std::collections::HashMap;
-
 use ash::vk;
 
 use crate::observe::Decline;
-use crate::runtime::guest_ram::{GuestRamError, GuestRamImport, GuestRef};
+use crate::runtime::guest_ram::{GuestRamError, GuestRef, ImportWindow};
 
-/// One RAMBlock living on the GPU as a bindable buffer, with no copy between it
+/// Bytes of one import a single window covers, where the range it was opened
+/// for fits inside one bucket of that size.
+///
+/// 64 MiB is a ceiling on the driver's re-walk rather than a target for reuse:
+/// see [`ImportWindow`] for the profile, and the module doc for why growing it
+/// buys nothing. A full-screen frame at this device's largest advertised mode is
+/// well under it, so a scanout-sized reference costs one window.
+pub(crate) const GUEST_IMPORT_WINDOW_BYTES: u64 = 1 << 26;
+
+/// Windows that may be live at once, across every import.
+///
+/// The byte cap below binds first for windows of the usual size; this one bounds
+/// the small-RAMBlock case, where an import shorter than one bucket is taken
+/// whole and many of them would otherwise accumulate for very few bytes.
+const WINDOW_COUNT_CAP: usize = 64;
+
+/// Guest RAM this device may have registered for DMA at once.
+///
+/// The number the host pays in locked memory, and the ceiling on what one
+/// submission's revalidation can walk.
+const WINDOW_TOTAL_BYTE_CAP: u64 = 1 << 30;
+
+/// One window living on the GPU as a bindable buffer, with no copy between it
 /// and the guest's own view of those bytes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ImportedHostRam {
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
-    /// Bytes the import covers. The buffer spans all of it, so every
-    /// [`crate::runtime::guest_ram::BoundRange`] inside the import is a valid
-    /// offset into this one buffer.
-    pub size: vk::DeviceSize,
+    /// Which import, and which of its bytes, the buffer spans. The buffer covers
+    /// the whole window, so every range [`ImportWindow::offset_of`] admits is a
+    /// valid offset into it.
+    pub window: ImportWindow,
 }
 
 impl ImportedHostRam {
@@ -90,11 +113,11 @@ pub enum HostRamDecline {
     /// `vkGetMemoryHostPointerPropertiesEXT` declined the pointer, or no memory
     /// type it named also satisfies what this device wants for guest memory.
     NoImportableMemoryType { host_base: usize },
-    /// `vkCreateBuffer` over the whole span failed.
+    /// `vkCreateBuffer` over the whole window failed.
     CreateBuffer { result: vk::Result },
-    /// The buffer the driver made needs more bytes than the span has. The import
-    /// is sized to the RAMBlock exactly and may not be rounded up: the bytes past
-    /// the end are this process's own memory.
+    /// The buffer the driver made needs more bytes than the window has. A window
+    /// is sized to bytes the RAMBlock backs and may not be rounded up: past the
+    /// end of the last one lies this process's own memory.
     TooSmall { required: u64, available: u64 },
     /// `vkAllocateMemory` with the chained import failed. On most drivers this
     /// is the pointer being refused — not fd-backed, not aligned, or not a
@@ -105,6 +128,21 @@ pub enum HostRamDecline {
     /// The reference did not survive its own bound. Carries the check that
     /// refused, from [`crate::runtime::guest_ram`].
     Bound { inner: GuestRamError },
+    /// [`WINDOW_COUNT_CAP`] windows are already live. Expected only where the
+    /// shim reports many RAMBlocks shorter than one bucket, since a bucket-sized
+    /// window reaches [`Self::WindowByteCap`] long before this.
+    WindowCountCap { windows: usize },
+    /// A window of this size would take the total past
+    /// [`WINDOW_TOTAL_BYTE_CAP`]. The reference falls to the copying rails,
+    /// which land the same frame for a memcpy.
+    WindowByteCap { imported: u64, want: u64 },
+    /// A window that does not hold the range it was opened for.
+    ///
+    /// A healthy zero: [`crate::runtime::guest_ram::GuestRamImport::window`]
+    /// extends a window forward until it covers the range, so a firing means
+    /// that derivation broke. Checked before the import rather than after, so
+    /// the break costs arithmetic instead of a `get_user_pages` over the window.
+    WindowMissesRange { offset: u64, len: u64 },
 }
 
 impl Decline for HostRamDecline {
@@ -116,6 +154,9 @@ impl Decline for HostRamDecline {
             Self::TooSmall { .. } => "host_ram_import_too_small",
             Self::AllocateMemory { .. } => "host_ram_import_allocate_memory",
             Self::BindBuffer { .. } => "host_ram_import_bind_buffer",
+            Self::WindowCountCap { .. } => "host_ram_import_window_count_cap",
+            Self::WindowByteCap { .. } => "host_ram_import_window_byte_cap",
+            Self::WindowMissesRange { .. } => "host_ram_import_window_misses_range",
             // The inner check is the diagnosis. Forwarding rather than adding a
             // slug keeps one name per check across the two modules.
             Self::Bound { inner } => inner.slug(),
@@ -138,6 +179,19 @@ impl Decline for HostRamDecline {
                 ("required", required.to_string()),
                 ("available", available.to_string()),
             ],
+            Self::WindowCountCap { windows } => vec![
+                ("windows", windows.to_string()),
+                ("cap", WINDOW_COUNT_CAP.to_string()),
+            ],
+            Self::WindowByteCap { imported, want } => vec![
+                ("imported", imported.to_string()),
+                ("want", want.to_string()),
+                ("cap", WINDOW_TOTAL_BYTE_CAP.to_string()),
+            ],
+            Self::WindowMissesRange { offset, len } => vec![
+                ("offset", format!("{offset:#x}")),
+                ("len", len.to_string()),
+            ],
             Self::Bound { inner } => inner.fields(),
         }
     }
@@ -147,9 +201,9 @@ crate::observe::decline_display!(HostRamDecline);
 
 /// A guest-memory range the engine can bind right now.
 ///
-/// The buffer spans the whole RAMBlock, so `offset` and `len` are the only
-/// things that differ between two references into the same block. Both came out
-/// of [`GuestRamImport::resolve`], which is the only producer of either.
+/// `offset` is into `buffer`, which spans the window the range fell in rather
+/// than the whole RAMBlock, so it is not the range's offset in its import.
+/// Producing it is the one place the two are related.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BoundGuestRam {
     pub buffer: vk::Buffer,
@@ -161,15 +215,19 @@ pub(crate) struct BoundGuestRam {
     pub head: vk::DeviceSize,
 }
 
-/// Every RAMBlock this device has imported, keyed by import identity.
+/// Every window this device has imported.
+///
+/// A `Vec` because the lookup is containment rather than equality — a range is
+/// served by whichever live window holds it — and because the caps keep the scan
+/// short enough that its cost is below the bounds check that precedes it.
 #[derive(Default)]
 pub(crate) struct HostRamImports {
-    live: HashMap<u64, ImportedHostRam>,
+    live: Vec<ImportedHostRam>,
 }
 
 impl HostRamImports {
-    /// Resolve `guest_ref` to a bindable range, importing its RAMBlock if this
-    /// is the first reference into it.
+    /// Resolve `guest_ref` to a bindable range, opening a window over it if no
+    /// live window already holds those bytes.
     ///
     /// # Safety
     ///
@@ -187,55 +245,109 @@ impl HostRamImports {
             .bound()
             .map_err(|inner| HostRamDecline::Bound { inner })?;
         let import = guest_ref.import();
-        let key = import.id().get();
-        let live = match self.live.get(&key) {
-            Some(live) => *live,
-            None => {
-                let made = unsafe { import_ramblock(ctx, import) }?;
-                self.live.insert(key, made);
-                made
-            }
-        };
+        let id = import.id();
+        let head = guest_ref.head();
+
+        if let Some((buffer, offset)) = self
+            .live
+            .iter()
+            .find_map(|l| Some((l.buffer, l.window.offset_of(id, range)?)))
+        {
+            return Ok(BoundGuestRam {
+                buffer,
+                offset,
+                len: range.len,
+                head,
+            });
+        }
+
+        let window = import
+            .window(range, GUEST_IMPORT_WINDOW_BYTES)
+            .map_err(|inner| HostRamDecline::Bound { inner })?;
+        // Before the import, so a window that does not cover its own range costs
+        // arithmetic rather than a page walk over every byte of it.
+        let offset =
+            window
+                .offset_of(id, range)
+                .ok_or(HostRamDecline::WindowMissesRange {
+                    offset: range.offset,
+                    len: range.len,
+                })?;
+        self.affordable(window.len())?;
+
+        let made = unsafe { import_window(ctx, &window) }?;
+        self.live.push(made);
+        crate::observe::off(format!(
+            "host_ram_window import={id} offset={:#x} len={:#x} windows={} bytes={:#x}",
+            window.offset(),
+            window.len(),
+            self.live.len(),
+            self.imported_bytes(),
+        ));
         Ok(BoundGuestRam {
-            buffer: live.buffer,
-            offset: range.offset,
+            buffer: made.buffer,
+            offset,
             len: range.len,
-            head: guest_ref.head(),
+            head,
         })
     }
 
-    /// Release every import. Called on device teardown, before the device goes.
+    /// Whether one more window of `bytes` fits inside both caps.
+    ///
+    /// Separate refusals rather than one: a boot that stopped importing because
+    /// it ran out of window slots and one that stopped because it ran out of
+    /// bytes want different numbers changed.
+    fn affordable(&self, bytes: u64) -> Result<(), HostRamDecline> {
+        if self.live.len() >= WINDOW_COUNT_CAP {
+            return Err(HostRamDecline::WindowCountCap {
+                windows: self.live.len(),
+            });
+        }
+        let imported = self.imported_bytes();
+        if imported.saturating_add(bytes) > WINDOW_TOTAL_BYTE_CAP {
+            return Err(HostRamDecline::WindowByteCap {
+                imported,
+                want: bytes,
+            });
+        }
+        Ok(())
+    }
+
+    /// Release every window. Called on device teardown, before the device goes.
     ///
     /// # Safety
     ///
     /// No submission may still reference any imported buffer.
     pub(crate) unsafe fn destroy_all(&mut self, device: &ash::Device) {
-        for (_, live) in self.live.drain() {
+        for live in self.live.drain(..) {
             unsafe { live.destroy(device) };
         }
     }
 
-    /// Bytes of guest RAM this device currently has imported, for the census.
+    /// Bytes of guest RAM this device currently has registered for DMA, for the
+    /// census. Bounded by [`WINDOW_TOTAL_BYTE_CAP`].
     pub(crate) fn imported_bytes(&self) -> u64 {
-        self.live.values().map(|l| l.size).sum()
+        self.live.iter().map(|l| l.window.len()).sum()
     }
 
-    /// How many RAMBlocks are imported. One or two on an ordinary machine, and
-    /// the number that must not grow with the workload — a rising count here is
-    /// the per-resource import the model exists to avoid.
+    /// How many windows are live. Rises with the span of guest RAM the workload
+    /// touches rather than with the number of references into it — a count that
+    /// tracks draws is the per-resource import the model exists to avoid, and a
+    /// count parked at [`WINDOW_COUNT_CAP`] is a boot spending every later
+    /// reference on the copying rails.
     pub(crate) fn len(&self) -> usize {
         self.live.len()
     }
 }
 
-/// Import one RAMBlock's whole host mapping.
+/// Import one window's host span.
 ///
 /// # Safety
 ///
 /// As [`HostRamImports::bind`].
-unsafe fn import_ramblock(
+unsafe fn import_window(
     ctx: &super::context::DeviceContext,
-    import: &GuestRamImport,
+    window: &ImportWindow,
 ) -> Result<ImportedHostRam, HostRamDecline> {
     use crate::backend::vulkan::caps::host_pointer::GUEST_IMPORT_USAGE;
 
@@ -247,8 +359,8 @@ unsafe fn import_ramblock(
     const HANDLE_TYPE: vk::ExternalMemoryHandleTypeFlags =
         vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
 
-    let host_base = import.host_base();
-    let size = import.len();
+    let host_base = window.host_ptr();
+    let size = window.len();
 
     // Which memory types will accept *this* pointer. Asked before anything is
     // created, because the answer is a property of the mapping rather than of
@@ -286,8 +398,8 @@ unsafe fn import_ramblock(
     let bound = (|| {
         let reqs = unsafe { ctx.device.get_buffer_memory_requirements(buffer) };
         if reqs.size > size {
-            // Not rounded up. The bytes past the end of a RAMBlock are this
-            // process's own memory, and handing the GPU write access to them is
+            // Not rounded up. Past the end of the last window lies memory the
+            // RAMBlock does not back, and handing the GPU write access to it is
             // the one stray the bound exists to prevent.
             return Err(HostRamDecline::TooSmall {
                 required: reqs.size,
@@ -312,7 +424,7 @@ unsafe fn import_ramblock(
             Ok(()) => Ok(ImportedHostRam {
                 buffer,
                 memory,
-                size,
+                window: *window,
             }),
             Err(result) => {
                 // Freeing the memory is what ends the GPU's access to the
@@ -458,6 +570,12 @@ mod tests {
             HostRamDecline::BindBuffer {
                 result: vk::Result::ERROR_UNKNOWN,
             },
+            HostRamDecline::WindowCountCap { windows: 0 },
+            HostRamDecline::WindowByteCap {
+                imported: 0,
+                want: 0,
+            },
+            HostRamDecline::WindowMissesRange { offset: 0, len: 0 },
         ];
         let mut slugs: Vec<_> = all.iter().map(|d| d.slug()).collect();
         let count = slugs.len();
@@ -483,13 +601,104 @@ mod tests {
         assert_eq!(outer.fields(), inner.fields());
     }
 
-    /// A fresh map holds nothing and reports nothing imported. The count is the
-    /// reading that says whether the model held: it must stay at the number of
-    /// RAMBlocks for a whole boot rather than tracking the workload.
+    /// A fresh map holds nothing and reports nothing imported.
     #[test]
     fn an_empty_map_reports_no_imports() {
         let imports = HostRamImports::default();
         assert_eq!(imports.len(), 0);
         assert_eq!(imports.imported_bytes(), 0);
+    }
+
+    /// A window's whole point is that it is a bounded slice of guest RAM. This
+    /// is the arithmetic behind that claim on this pathway's shape: a 16 GiB
+    /// RAMBlock and a full-screen reference into it must reach the driver as
+    /// tens of megabytes, and the total across a boot must stay inside a cap the
+    /// host can afford to have locked.
+    ///
+    /// Whole-RAMBlock import is what this replaces, and it fails here on the
+    /// first assertion.
+    #[test]
+    fn a_window_over_this_pathway_is_a_fraction_of_the_block() {
+        use crate::runtime::guest_ram::{GuestRamImport, GuestRamRegion};
+
+        const GUEST_RAM: u64 = 16 << 30;
+        // 3440x1440 at four bytes a pixel: the largest mode the display model
+        // advertises, so the largest single reference a scanout can make.
+        const FRAME: u64 = 3440 * 1440 * 4;
+
+        let import = GuestRamImport::new(
+            GuestRamRegion {
+                gpa_base: 0x1_0000_0000,
+                host_va: 0x7f00_0000_0000,
+                len: GUEST_RAM,
+            },
+            0x1000,
+        )
+        .expect("a page-aligned 16 GiB block is importable");
+        let slice = import
+            .slice(GUEST_RAM / 2 + 0x3000, FRAME)
+            .expect("a frame inside the block is sliceable");
+        let range = import.resolve(&slice).expect("its own slice resolves");
+        let window = import
+            .window(range, GUEST_IMPORT_WINDOW_BYTES)
+            .expect("a bucket-sized grain is a power of two");
+
+        assert!(
+            window.len() < GUEST_IMPORT_WINDOW_BYTES + FRAME,
+            "a frame must pull one window's worth, got {:#x}",
+            window.len()
+        );
+        // The total cap must bound guest RAM rather than restate it: a cap at or
+        // above `-m` is the whole-RAMBlock import wearing a budget's name.
+        const { assert!(WINDOW_TOTAL_BYTE_CAP < GUEST_RAM) };
+        assert_eq!(
+            window.offset_of(import.id(), range),
+            Some(range.offset - window.offset()),
+            "the window must hold the range it was opened for"
+        );
+    }
+
+    /// Both caps refuse, and each says which one did. A boot that stopped
+    /// importing wants to know whether to raise the slot count or the byte
+    /// budget, and one shared refusal answers neither.
+    #[test]
+    fn each_cap_refuses_under_its_own_name() {
+        let full = HostRamDecline::WindowCountCap {
+            windows: WINDOW_COUNT_CAP,
+        };
+        assert_eq!(full.slug(), "host_ram_import_window_count_cap");
+        assert!(full
+            .fields()
+            .iter()
+            .any(|(k, v)| *k == "cap" && v == &WINDOW_COUNT_CAP.to_string()));
+
+        let broke = HostRamDecline::WindowByteCap {
+            imported: WINDOW_TOTAL_BYTE_CAP,
+            want: GUEST_IMPORT_WINDOW_BYTES,
+        };
+        assert_eq!(broke.slug(), "host_ram_import_window_byte_cap");
+        assert!(broke
+            .fields()
+            .iter()
+            .any(|(k, v)| *k == "cap" && v == &WINDOW_TOTAL_BYTE_CAP.to_string()));
+    }
+
+    /// An empty map affords a window; a map already holding the byte cap does
+    /// not, and refuses by the byte cap rather than the slot count. The caps are
+    /// what bound the host's locked memory, so a budget that admitted one more
+    /// window past them would make both numbers advisory.
+    #[test]
+    fn the_budget_refuses_once_a_cap_is_reached() {
+        let empty = HostRamImports::default();
+        assert!(empty.affordable(GUEST_IMPORT_WINDOW_BYTES).is_ok());
+        assert!(empty.affordable(WINDOW_TOTAL_BYTE_CAP).is_ok());
+        assert!(matches!(
+            empty.affordable(WINDOW_TOTAL_BYTE_CAP + 1),
+            Err(HostRamDecline::WindowByteCap { .. })
+        ));
+        assert!(matches!(
+            empty.affordable(u64::MAX),
+            Err(HostRamDecline::WindowByteCap { .. })
+        ));
     }
 }

@@ -12,10 +12,11 @@
 //!
 //! What the extension does not carry is a bound. That is
 //! [`crate::runtime::guest_ram`]'s job, and it is a type rather than a rule: an
-//! import is sized to a RAMBlock exactly, and every reference inside it is a
-//! `GuestSlice` that no call site can construct without the bounds check. Read
-//! that module's doc before adding an import site; nothing here re-states it,
-//! and nothing scans for violations of it.
+//! import is sized to an `ImportWindow` of one RAMBlock and never past its end,
+//! and every reference inside it is a `GuestSlice` that no call site can
+//! construct without the bounds check. Read that module's doc before adding an
+//! import site; nothing here re-states it, and nothing scans for violations of
+//! it.
 //!
 //! # Query and enable together
 //!

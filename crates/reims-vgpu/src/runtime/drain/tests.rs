@@ -32,8 +32,7 @@ fn no_child_opcode_is_claimed_by_an_arm_and_branched_on_inside_another() {
     for line in SRC.lines() {
         let body = line.trim();
         let is_arm_indent = line.starts_with("        ") && !line.starts_with("         ");
-        if is_arm_indent && body.starts_with("CHILD_OP_") || is_arm_indent && body.starts_with("| ")
-        {
+        if is_arm_indent && (body.starts_with("CHILD_OP_") || body.starts_with("| ")) {
             for name in body.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
                 if name.starts_with("CHILD_OP_") {
                     pending.push(name);

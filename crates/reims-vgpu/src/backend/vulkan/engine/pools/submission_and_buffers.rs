@@ -44,12 +44,13 @@ impl ResourcePools {
         (self.registry.len(), self.targets.len(), sampled, storage)
     }
 
-    /// The bindable range `guest_ref` names, importing its RAMBlock if this is
-    /// the first reference into it.
+    /// The bindable range `guest_ref` names, opening a window over it if no live
+    /// window already holds those bytes.
     ///
-    /// Unlike [`Self::import_guest_window`] there is nothing to displace: an
-    /// import is per RAMBlock and lives as long as the device, so no caller can
-    /// find the buffer it just bound freed underneath a submission in flight.
+    /// Nothing is ever displaced: a window lives as long as the device, and past
+    /// the caps in [`host_ram`] the answer is a decline rather than an eviction.
+    /// So no caller can find the buffer it just bound freed underneath a
+    /// submission in flight.
     ///
     /// # Safety
     ///
@@ -62,12 +63,13 @@ impl ResourcePools {
         unsafe { self.host_ram_imports.bind(ctx, guest_ref) }
     }
 
-    /// How many RAMBlocks are imported, and how many bytes they cover.
+    /// How many windows are imported, and how many bytes they cover.
     ///
-    /// The count is the reading that says whether the model held: one or two
-    /// for a whole boot. A count that tracks the workload is a per-resource
-    /// import, which the extension does not guarantee works and which pays the
-    /// driver's page pinning for an answer that never changes.
+    /// The pair is the reading that says whether the model held. Both settle
+    /// once the workload's span of guest RAM is covered; a count still climbing
+    /// late in a boot is the per-resource import the model exists to avoid, and
+    /// bytes at [`host_ram`]'s total cap is a boot spending every further
+    /// reference on the copying rails.
     pub(crate) fn host_ram_import_census(&self) -> (usize, u64) {
         (
             self.host_ram_imports.len(),
