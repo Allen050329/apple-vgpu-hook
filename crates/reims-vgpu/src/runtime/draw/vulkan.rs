@@ -2544,6 +2544,17 @@ fn load_buffer_content<M: HostMemory + HostOps>(
 /// texel layout Vulkan samples identically (BGRA8/RGBA8 UNORM), tight rows,
 /// window inside the allocation, span ≥ the zero-copy floor, every page
 /// walkable, and packed-contiguous runs mappable.
+///
+/// **Every gate names itself on the `zc_lin_*` route set, including the ones
+/// that decline before the walk.** Only the three walk refusals used to, and
+/// the whole set read zero on a driven Safari-drag boot — which says the walk
+/// was never reached and says nothing at all about why. The rail declined
+/// 91 687 times in that boot's steady state and the caller fell to
+/// `load_linear_guest_memoized`, whose own doc concedes it re-reads the full
+/// `bpr * h` span out of guest memory and memcmps it against the memo on every
+/// bind, hit or miss. That was 62 µs of a 191 µs draw. A rail that costs the
+/// device its largest per-draw item when it declines may not decline silently;
+/// the routes below are what turn "the gather is not running" into which gate.
 fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2555,7 +2566,10 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // The object-list entry + descriptor are resolved+decoded once by the caller
     // (`resolve_sampled_source`'s linear branch) and threaded in as `tex`; the
     // cache fallback shares the same decode.
-    let declared_format = tex.declared_pixel_format()?;
+    let Some(declared_format) = tex.declared_pixel_format() else {
+        crate::runtime::drain::note_store_route("zc_lin_no_declared_format");
+        return None;
+    };
     // sRGB variants ride the same rail as their linear siblings: the layout is
     // identical and the CPU loaders never decoded either. The qualifier is
     // still lost, so the census records it rather than letting the fold be
@@ -2566,13 +2580,54 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // additionally needs the optional linear-filter feature — LUTs are sampled
     // with interpolation — so it is gated on the host capability and otherwise
     // declines here, leaving the sample fail-visible (no CPU float loader arm).
+    //
+    // The two ways a format declines are separated, because they want opposite
+    // fixes and a single count reads the same for both. `sampled_pixels`
+    // answering `Err` means the *contract* carries no [`TexelLayout`] for the
+    // format at all — either it is undefined, or its Metal channels do not sit
+    // identically on their Vulkan ones, which is a component mapping this rail
+    // does not yet carry. Answering `Ok` with a layout this rail does not admit
+    // means the layout exists and the eligibility test below turned it down.
+    // The first is closed by teaching the table a format; the second by
+    // widening what the gather accepts. Both fall to
+    // `load_linear_guest_memoized`, so both cost the same and only the fix
+    // differs.
     let native = match translate::pixel::sampled_pixels(declared_format) {
-        Ok((layout, decline))
-            if layout.is_four_byte_color()
+        // Deduped per declared format, which is a handful of values a boot
+        // enumerates in a handful of lines. The number is the guest's own
+        // `MTLPixelFormat` ordinal, so it names the format without this device
+        // having to hold a second spelling of Apple's table.
+        Err(_) => {
+            crate::runtime::drain::note_store_route("zc_lin_format_no_layout");
+            if crate::observe::first_sight("zc_lin_format_no_layout", u64::from(declared_format)) {
+                crate::observe::off(format!(
+                    "zc_lin_format_no_layout fmt={declared_format:#x} \
+                     (no sampled TexelLayout; the bind falls to the CPU \
+                     re-read + memcmp rung)"
+                ));
+            }
+            return None;
+        }
+        Ok((layout, decline)) => {
+            let eligible = layout.is_four_byte_color()
                 || layout == TexelLayout::R16Float
                 || (layout == TexelLayout::R32Float
-                    && engine::supports_sampled_r32f_linear_filter()) =>
-        {
+                    && engine::supports_sampled_r32f_linear_filter());
+            if !eligible {
+                crate::runtime::drain::note_store_route(match layout {
+                    TexelLayout::R8 => "zc_lin_format_r8",
+                    TexelLayout::Rg8 => "zc_lin_format_rg8",
+                    TexelLayout::R32Float => "zc_lin_format_r32f_unfilterable",
+                    // Admitted by `eligible` above, so reaching here would mean
+                    // the two rules had drifted apart. A healthy zero: a firing
+                    // is the bug, and it would otherwise be invisible because
+                    // the caller's fallback still paints the right pixels.
+                    TexelLayout::Rgba8 | TexelLayout::Bgra8 | TexelLayout::R16Float => {
+                        "zc_lin_format_eligible_but_refused"
+                    }
+                });
+                return None;
+            }
             if decline.is_some() {
                 srgb_census::note_downgrade(
                     srgb_census::site::LINEAR_SAMPLE_ZERO_COPY,
@@ -2581,24 +2636,46 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             }
             layout
         }
-        _ => return None,
     };
     let bpp = native.bytes_per_texel();
-    let (gva, layout) = tex.level_gva(0, state.page_shift)?;
+    let Some((gva, layout)) = tex.level_gva(0, state.page_shift) else {
+        crate::runtime::drain::note_store_route("zc_lin_no_level_gva");
+        return None;
+    };
     let (w, h) = (layout.width, layout.height);
     if w == 0 || h == 0 {
+        crate::runtime::drain::note_store_route("zc_lin_no_extent");
         return None;
     }
-    let (span, row_length_texels) = strided_window_extent(w, h, bpp as u64, layout.row_stride)?;
+    let Some((span, row_length_texels)) =
+        strided_window_extent(w, h, bpp as u64, layout.row_stride)
+    else {
+        crate::runtime::drain::note_store_route("zc_lin_unstrideable");
+        return None;
+    };
     // The min-byte floor keeps small four-byte textures on the cheaper CPU
     // memo/cache path. Single-channel float LUTs have no CPU loader arm
     // (`texel_to_rgba8` returns `None`), so this native gather is their only
     // correct rail — exempt them from the floor or a small display-profile LUT
     // would fall through to a failed resolve.
     if native.is_four_byte_color() && span < ZERO_COPY_SAMPLED_MIN_BYTES {
+        // Banded, because the floor's own doc argues from where the workload's
+        // spans cluster relative to it, and a bare count cannot re-check that
+        // argument on a workload the doc was not tuned against. The bands are
+        // read against the floor: a population sitting just under it is the
+        // floor mis-set, and one sitting two decades under it is the floor
+        // doing what it was written to do.
+        crate::runtime::drain::note_store_route(if span < 4 * 1024 {
+            "zc_lin_below_floor_lt4k"
+        } else if span < 16 * 1024 {
+            "zc_lin_below_floor_lt16k"
+        } else {
+            "zc_lin_below_floor_lt64k"
+        });
         return None;
     }
     if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
+        crate::runtime::drain::note_store_route("zc_lin_past_allocation");
         return None;
     }
     // Same coherence rule as the CPU loaders: land any resident-authoritative
