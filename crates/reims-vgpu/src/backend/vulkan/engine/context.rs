@@ -496,6 +496,31 @@ impl DeviceContext {
                 return Err(DrawError::Init(InitDecline::NoGraphicsQueueFamily));
             }
         };
+        // A queue family that transfers and does nothing else is a dedicated
+        // copy engine, and the reason to want one is that this device's largest
+        // remaining cost is bytes crossing the bus: a driven Safari drag moves
+        // ~2.7 GB of guest buffer runs into device-local memory and writes
+        // ~5.1 GB of rendered surface back to guest pages every second, all of
+        // it recorded into the draw's own command buffer, where it serialises
+        // against the rendering it feeds.
+        //
+        // Selected here and reported below, and nothing yet asks for a queue
+        // from it — the reading comes first, on every pathway, because most
+        // integrated parts have no such family and a rail built for one would
+        // then be a rail most hosts never take.
+        //
+        // Selected by what the family can do, never by device or driver name.
+        // `TRANSFER` alone is the whole test: `GRAPHICS` or `COMPUTE` implies
+        // transfer support, so a family carrying either is the one this device
+        // already submits draws to and moving copies there buys nothing.
+        // Sparse-binding and the video/optical-flow bits do not disqualify a
+        // family — they say what else the hardware block can do, not that it
+        // shares the graphics engine.
+        //
+        // `None` on a host with no such family, where everything stays on `gq`.
+        // That is not a fallback: it is the only arrangement most integrated
+        // parts offer.
+        let transfer_qf = dedicated_transfer_family(&qfs);
         let prio = [1.0f32];
         let qci = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(gq)
@@ -718,6 +743,18 @@ impl DeviceContext {
         // device without a copy. Load-bearing for portability debugging — "why
         // is this host slow / blank" starts here.
         crate::observe::off(caps.selection_line(&device_name));
+        // Beside `vk_caps` rather than inside it: the queue arrangement is a
+        // property of the device this engine created, and `HostGpuCaps` is
+        // built before any queue family is chosen. `transfer_family=none` is
+        // not a degraded reading — it is the arrangement, and it says this
+        // boot's copies share the queue its draws are submitted to.
+        crate::observe::off(format!(
+            "vk_queues families={} graphics_family={gq} compute_capable={compute_capable} transfer_family={}",
+            qfs.len(),
+            transfer_qf
+                .map(|q| q.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+        ));
         // Whether this host could sample guest pages in place, which is what
         // decides if the sampled cache is memoizing a copy that has to exist.
         // Reported and never branched on — see the module doc for why a positive
@@ -950,6 +987,31 @@ impl DeviceContext {
     pub(crate) fn queue(&self) -> vk::Queue {
         unsafe { self.device.get_device_queue(self.gq, 0) }
     }
+
+}
+
+/// The index of a queue family that transfers and does nothing else — a copy
+/// engine that runs beside the graphics one rather than through it.
+///
+/// `TRANSFER` alone is the whole test. `GRAPHICS` and `COMPUTE` both imply
+/// transfer support, so a family carrying either is one this device already
+/// submits draws to, and moving a copy there would buy nothing. Sparse binding,
+/// video decode/encode and optical flow do **not** disqualify a family: they say
+/// what else that hardware block can do, not that it shares the graphics engine.
+///
+/// `None` where the host has no such family, which is most integrated parts.
+/// That is the arrangement rather than a degraded one, and the caller keeps
+/// every copy on the graphics queue.
+fn dedicated_transfer_family(families: &[vk::QueueFamilyProperties]) -> Option<u32> {
+    families
+        .iter()
+        .position(|q| {
+            q.queue_flags.contains(vk::QueueFlags::TRANSFER)
+                && !q
+                    .queue_flags
+                    .intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+        })
+        .map(|i| i as u32)
 }
 
 /// Process-global engine state ownership (device + recreate policy + init fail cache).
@@ -1373,6 +1435,86 @@ mod pipeline_cache_blob_tests {
             }
         }
         std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod transfer_family_tests {
+    use super::*;
+
+    fn family(flags: vk::QueueFlags) -> vk::QueueFamilyProperties {
+        vk::QueueFamilyProperties::default()
+            .queue_flags(flags)
+            .queue_count(1)
+    }
+
+    /// A family that also draws or dispatches is one this device already
+    /// submits to, so picking it would move nothing off the graphics engine
+    /// while adding an ownership transfer to every copy. Both bits disqualify,
+    /// and `TRANSFER` is often not even spelled on a graphics family — the spec
+    /// makes it implicit — so the test is over families that name it and
+    /// families that do not.
+    #[test]
+    fn a_family_that_also_draws_or_dispatches_is_not_a_copy_engine() {
+        use vk::QueueFlags as F;
+        for flags in [
+            F::GRAPHICS,
+            F::COMPUTE,
+            F::GRAPHICS | F::COMPUTE,
+            F::GRAPHICS | F::TRANSFER,
+            F::COMPUTE | F::TRANSFER,
+            F::GRAPHICS | F::COMPUTE | F::TRANSFER | F::SPARSE_BINDING,
+        ] {
+            assert_eq!(
+                dedicated_transfer_family(&[family(flags)]),
+                None,
+                "{flags:?} shares the engine this device already submits to"
+            );
+        }
+    }
+
+    /// The bits that say what *else* a copy engine can do must not disqualify
+    /// it. A discrete part commonly exposes several transfer-only families that
+    /// differ exactly in these, and refusing them would leave a host with a copy
+    /// engine reading as a host without one.
+    #[test]
+    fn the_other_bits_on_a_transfer_only_family_do_not_disqualify_it() {
+        use vk::QueueFlags as F;
+        for extra in [
+            F::empty(),
+            F::SPARSE_BINDING,
+            F::VIDEO_DECODE_KHR,
+            F::VIDEO_ENCODE_KHR,
+            F::OPTICAL_FLOW_NV,
+        ] {
+            assert_eq!(
+                dedicated_transfer_family(&[family(F::TRANSFER | extra)]),
+                Some(0),
+                "TRANSFER | {extra:?} is still a copy engine"
+            );
+        }
+    }
+
+    /// A family with no transfer bit at all is not one, and a host that offers
+    /// none answers `None` rather than falling to index zero — which would
+    /// submit copies to the graphics family under a name that says otherwise.
+    #[test]
+    fn a_host_with_no_copy_engine_answers_none_rather_than_the_first_family() {
+        use vk::QueueFlags as F;
+        assert_eq!(dedicated_transfer_family(&[]), None);
+        assert_eq!(
+            dedicated_transfer_family(&[family(F::GRAPHICS | F::COMPUTE | F::TRANSFER)]),
+            None,
+            "the single-family host every integrated part presents"
+        );
+        assert_eq!(
+            dedicated_transfer_family(&[
+                family(F::GRAPHICS | F::COMPUTE | F::TRANSFER),
+                family(F::TRANSFER | F::SPARSE_BINDING),
+            ]),
+            Some(1),
+            "the second family is the copy engine and the index must be its own"
+        );
     }
 }
 
