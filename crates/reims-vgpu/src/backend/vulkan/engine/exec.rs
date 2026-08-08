@@ -1494,27 +1494,103 @@ type OwnedDepthImage = (vk::Image, vk::DeviceMemory, vk::ImageView);
 /// The framebuffer is this draw's either way and is not this function's to make:
 /// it binds one specific `render_pass` alongside the colour view, and only the
 /// caller knows which.
+struct AcquiredDepth {
+    view: vk::ImageView,
+    /// Set only on the transient rail — the resident rail's image belongs to the
+    /// registry and must not be disposed with the draw.
+    owned: Option<OwnedDepthImage>,
+    /// The identity to mark once the pass has stored into it, so the *next*
+    /// pass's LOAD has something to load. `None` on the transient rail, whose
+    /// buffer is gone by then.
+    identity: Option<super::types::TargetIdentity>,
+    /// Whether the resident already held rendered contents when this draw
+    /// resolved it. Always false on the transient rail: a buffer created for
+    /// this draw has nothing in it, which is why that rail could never honour a
+    /// LOAD and why the decline it used to raise was unconditional.
+    content_ready: bool,
+}
+
+impl AcquiredDepth {
+    /// Whether the render pass may declare `VK_ATTACHMENT_LOAD_OP_LOAD` for this
+    /// draw's depth attachment.
+    ///
+    /// **The only thing `DepthAttachKey::load` may be built from.** The guest
+    /// asking is one of two terms and it is the term that does not decide: a
+    /// LOAD pass also declares `initial_layout` DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    /// and naming a layout an image is not in is undefined behaviour rather than
+    /// a stale read — so an image nothing has rendered into cannot be loaded from
+    /// whatever the guest asked for. The two terms live behind one call because
+    /// they were briefly two expressions at one site, which is the shape where a
+    /// later edit reaches for the guest's flag alone and gets a validation error
+    /// on hosts that check and undefined contents on hosts that do not.
+    fn honours_load(&self, guest_wants_load: bool) -> bool {
+        guest_wants_load && self.content_ready
+    }
+}
+
 unsafe fn acquire_depth_view(
     ctx: &super::context::DeviceContext,
     pools: &mut super::pools::ResourcePools,
     req: &DrawRequest,
     counters: &EngineCounters,
-) -> Result<(vk::ImageView, Option<OwnedDepthImage>), DrawError> {
+) -> Result<AcquiredDepth, DrawError> {
     let with_stencil = req.depth.as_ref().and_then(|d| d.stencil).is_some();
     if let Some(identity) = req.depth.as_ref().and_then(|d| d.identity.clone()) {
+        // Asked before `registry_ensure_depth`, because that call creates the
+        // slot when it is absent and a fresh slot is `content_ready == false`.
+        // Asking after would answer about the image this draw just made rather
+        // than about the one the guest expects to load.
+        let content_ready = pools.registry_content_ready(&identity);
         let (_image, view) = pools.registry_ensure_depth(
             ctx,
-            identity,
+            identity.clone(),
             req.width,
             req.height,
             with_stencil,
             counters,
         )?;
-        return Ok((view, None));
+        // A geometry or aspect change recreates the image inside that call, and
+        // the recreated one holds nothing. Re-asking is what keeps this honest.
+        let content_ready = content_ready && pools.registry_content_ready(&identity);
+        return Ok(AcquiredDepth {
+            view,
+            owned: None,
+            identity: Some(identity),
+            content_ready,
+        });
     }
     let (dimg, dmem, dview) =
         pools.create_transient_depth(ctx, req.width, req.height, with_stencil, counters)?;
-    Ok((dview, Some((dimg, dmem, dview))))
+    Ok(AcquiredDepth {
+        view: dview,
+        owned: Some((dimg, dmem, dview)),
+        identity: None,
+        content_ready: false,
+    })
+}
+
+/// A pass asked to load depth this device has nothing to load.
+///
+/// Two ways to reach it, and they are different findings. The pass is the
+/// **first** into a depth texture, so `MTLLoadActionLoad` on undefined contents
+/// is the guest's own undefined behaviour and a CLEAR is a conformant answer.
+/// Or the depth resident was **reclaimed** between two passes that meant to
+/// chain — real lost depth, bounded by `IDLE_TARGET_AGE_MS`, and the reading
+/// that would justify giving depth residents an age of their own.
+///
+/// Latched per geometry-and-aspect rather than per pipeline: what a reader needs
+/// is whether this happens at all and to what shape of attachment, and a
+/// per-pipeline latch on a workload with hundreds of pipelines answers a
+/// different question at a hundred times the volume.
+fn note_depth_load_without_content(width: u32, height: u32, stencil: bool) {
+    let key = (u64::from(width) << 32) ^ (u64::from(height) << 1) ^ u64::from(stencil);
+    if crate::observe::first_sight("depth_load_without_content", key) {
+        crate::observe::fail(format!(
+            "depth_load reason=depth_load_without_content {width}x{height} \
+             stencil={} (pass asked LOAD, resident holds nothing; cleared)",
+            u8::from(stencil)
+        ));
+    }
 }
 
 pub(crate) unsafe fn execute_draw_inner(
@@ -1795,9 +1871,29 @@ pub(crate) unsafe fn execute_draw_inner(
             super::reason::DrawReason::DepthWithSecondaryAttachments,
         ));
     }
+    // The depth attachment is resolved here rather than beside the framebuffer
+    // below, because the pass key needs an answer this device can only get from
+    // the resident: whether a `MTLLoadActionLoad` can be honoured at all.
+    //
+    // A LOAD pass declares `initial_layout` DEPTH_STENCIL_ATTACHMENT_OPTIMAL. An
+    // image that nothing has rendered into is in UNDEFINED, and naming a layout
+    // an image is not in is undefined behaviour rather than a stale read — so
+    // "the guest asked to load" and "there is something to load" are two
+    // questions and only the second one is about this device.
+    let depth_attachment = req
+        .depth
+        .as_ref()
+        .map(|_| acquire_depth_view(ctx, pools, req, counters))
+        .transpose()?;
     if let Some(d) = &req.depth {
+        let load = depth_attachment
+            .as_ref()
+            .is_some_and(|a: &AcquiredDepth| a.honours_load(d.load));
+        if d.load && !load {
+            note_depth_load_without_content(req.width, req.height, d.stencil.is_some());
+        }
         pass_key.depth = Some(super::caches::DepthAttachKey {
-            load: d.load,
+            load,
             stencil: d.stencil.is_some(),
         });
     }
@@ -2186,17 +2282,16 @@ pub(crate) unsafe fn execute_draw_inner(
                     counters,
                 )?;
                 (primary_image, fb, primary_access, primary_view)
-            } else if req.depth.is_some() {
-                let (dview, owned) = acquire_depth_view(ctx, pools, req, counters)?;
+            } else if let Some(d) = depth_attachment.as_ref() {
                 let fb = pools.create_mrt_framebuffer(
                     ctx,
                     render_pass,
-                    &[primary_view, dview],
+                    &[primary_view, d.view],
                     req.width,
                     req.height,
                     counters,
                 )?;
-                transient_depth = Some((owned, fb));
+                transient_depth = Some((d.owned, fb));
                 (primary_image, fb, primary_access, primary_view)
             } else if req.color_input {
                 // Fetch pass carries an input reference → the slot's cached
@@ -2225,17 +2320,16 @@ pub(crate) unsafe fn execute_draw_inner(
             // framebuffer [color, depth] under the depth `render_pass`.
             let t = pools.acquire_target(ctx, target_key, primary_pass, counters)?;
             let (pool_image, pool_view, pool_fb) = (t.image, t.view, t.framebuffer);
-            if req.depth.is_some() {
-                let (dview, owned) = acquire_depth_view(ctx, pools, req, counters)?;
+            if let Some(d) = depth_attachment.as_ref() {
                 let fb = pools.create_mrt_framebuffer(
                     ctx,
                     render_pass,
-                    &[pool_view, dview],
+                    &[pool_view, d.view],
                     req.width,
                     req.height,
                     counters,
                 )?;
-                transient_depth = Some((owned, fb));
+                transient_depth = Some((d.owned, fb));
                 (pool_image, fb, super::pools::ResidentAccess::Untouched, pool_view)
             } else if req.color_input {
                 let fb = pools.create_mrt_framebuffer(
@@ -3315,6 +3409,16 @@ pub(crate) unsafe fn execute_draw_inner(
         for (identity, _image, _old) in &mrt_secondaries {
             pools.registry_mark_ready_at(identity, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         }
+    }
+    // The depth pass stores unconditionally and settles at
+    // DEPTH_STENCIL_ATTACHMENT_OPTIMAL, so after this draw the resident holds
+    // depth a later pass can load and sits in the layout that pass will name.
+    // Marked here rather than beside the colour target above because the two
+    // are different residents with different reclaim rules — see
+    // `registry_mark_depth_ready` for the sole-copy line that is deliberately
+    // absent from it.
+    if let Some(identity) = depth_attachment.as_ref().and_then(|d| d.identity.as_ref()) {
+        pools.registry_mark_depth_ready(identity);
     }
     let mut sampled_retains: Vec<super::pools::SampledRetain> = Vec::new();
     for prepared in &sampled {
@@ -4520,5 +4624,64 @@ mod tests {
         let bytes = content.cpu_bytes();
         assert_eq!(&bytes[..100], &backing[..100]);
         assert_eq!(&bytes[100..156], &backing[200..256]);
+    }
+}
+
+#[cfg(test)]
+mod depth_load_tests {
+    use super::*;
+
+    fn acquired(content_ready: bool) -> AcquiredDepth {
+        AcquiredDepth {
+            view: vk::ImageView::null(),
+            owned: None,
+            identity: None,
+            content_ready,
+        }
+    }
+
+    /// A depth LOAD needs both the guest asking and a resident with something in
+    /// it, and the second term is the one this device owns.
+    ///
+    /// The asymmetry is the point. Declaring LOAD to Vulkan also declares
+    /// `initial_layout` DEPTH_STENCIL_ATTACHMENT_OPTIMAL, and an image nothing
+    /// has rendered into is in UNDEFINED — so honouring the guest's flag on an
+    /// empty resident is not a stale read but undefined behaviour, caught by a
+    /// validation layer where one runs and silent where none does. A pass that
+    /// does not ask must never be given LOAD either: that would turn a CLEAR the
+    /// guest asked for into a load of last frame's depth.
+    #[test]
+    fn a_depth_load_needs_both_the_guest_asking_and_a_resident_holding_something() {
+        assert!(
+            acquired(true).honours_load(true),
+            "guest asked and the resident holds depth: the one case that loads"
+        );
+        assert!(
+            !acquired(false).honours_load(true),
+            "an empty resident cannot be loaded from whatever the guest asked"
+        );
+        assert!(
+            !acquired(true).honours_load(false),
+            "a guest that asked to clear must clear, resident contents or not"
+        );
+        assert!(!acquired(false).honours_load(false));
+    }
+
+    /// The transient rail can never honour a LOAD, whatever the guest asked.
+    ///
+    /// Its buffer is created for this draw and destroyed after it, so there has
+    /// never been anything in it to load. That is the same conclusion the old
+    /// `depth_load_unsupported_transient` decline reached unconditionally, and it
+    /// still holds for the rail that decline was named for — what changed is that
+    /// the *identified* case is no longer routed through it.
+    #[test]
+    fn the_transient_depth_rail_never_honours_a_load() {
+        let transient = AcquiredDepth {
+            view: vk::ImageView::null(),
+            owned: Some((vk::Image::null(), vk::DeviceMemory::null(), vk::ImageView::null())),
+            identity: None,
+            content_ready: false,
+        };
+        assert!(!transient.honours_load(true));
     }
 }

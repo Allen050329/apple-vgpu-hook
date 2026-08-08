@@ -1519,6 +1519,47 @@ impl ResourcePools {
         self.set_sole_copy(identity, true);
     }
 
+    /// Mark a depth resident as holding rendered contents, after a pass that
+    /// stored them.
+    ///
+    /// The depth sibling of [`Self::registry_mark_ready_at`], and it exists
+    /// rather than reusing that one because of the line that one ends on:
+    /// `set_sole_copy(identity, true)`. Sole-copy means "these pixels exist
+    /// nowhere else, so reclaiming destroys guest work", and **both reclaim
+    /// paths skip such a slot at any age and any population**. That is right for
+    /// a colour target whose pixels the guest is waiting for and wrong for a
+    /// depth buffer, which no rail ever writes back to guest pages: marking one
+    /// sole-copy would make every depth resident permanently unreclaimable, and
+    /// VRAM would grow with the number of depth textures a guest has ever bound
+    /// rather than with the number it is using. That is the cliff this rail was
+    /// built to avoid, arrived at from the other side.
+    ///
+    /// So a depth resident stays reclaimable. The cost of being reclaimed is one
+    /// pass that wanted `MTLLoadActionLoad` getting a CLEAR instead, which
+    /// `note_depth_load_without_content` names — it is a real artifact, it is
+    /// bounded by the idle age, and it is visible. Read that counter before
+    /// deciding depth needs its own age.
+    pub(crate) fn registry_mark_depth_ready(&mut self, identity: &TargetIdentity) {
+        if let Some(slot) = self.registry.get_mut(identity) {
+            slot.content_ready = true;
+            // The depth pass declares `final_layout` DEPTH_STENCIL_ATTACHMENT_
+            // OPTIMAL unconditionally, so this is where the image is left and it
+            // is the `initial_layout` the next LOAD pass names. The two agreeing
+            // is what makes a LOAD valid without a barrier between the passes.
+            slot.access = ResidentAccess::ColorWrite(
+                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            );
+        }
+    }
+
+    /// Whether this resident already holds rendered contents — the question a
+    /// depth LOAD has to ask before it can be honoured.
+    pub(crate) fn registry_content_ready(&self, identity: &TargetIdentity) -> bool {
+        self.registry
+            .get(identity)
+            .is_some_and(|slot| slot.content_ready)
+    }
+
     /// Pin/unpin a resident render target against LRU eviction (deferred
     /// render Stores). Pins are counted, not boolean: a surface can have several
     /// deferred windows armed at once and each holds one count, so the slot
