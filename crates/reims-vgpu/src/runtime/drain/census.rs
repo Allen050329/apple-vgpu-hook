@@ -1968,7 +1968,7 @@ static STORE_ROUTES: std::sync::Mutex<Option<std::collections::BTreeMap<&'static
 /// 3/14 before them, 4/14 after the first, 2/14 after all five. The hazards
 /// they closed were real undefined behaviour and those fixes stand on that
 /// ground alone — see
-/// `engine::exec::resident_read_source_scope` — but
+/// `engine::exec::barrier_resident_for_transfer_read` — but
 /// they do not move this class.
 ///
 /// # A scoring flaw that inverts verdicts, recorded here because the harness is not tracked

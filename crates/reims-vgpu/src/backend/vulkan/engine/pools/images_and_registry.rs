@@ -328,7 +328,7 @@ impl ResourcePools {
             resident.last_touch_ms = now;
             return Ok(ResidentStorageImageUse {
                 slot: resident.slot,
-                layout: resident.layout,
+                access: resident.access,
                 generation_match: resident.generation == seed_generation,
             });
         }
@@ -371,7 +371,7 @@ impl ResourcePools {
             ResidentStorageImageSlot {
                 slot,
                 generation: 0,
-                layout: vk::ImageLayout::UNDEFINED,
+                access: ResidentAccess::Untouched,
                 pinned: false,
                 // No dispatch has written it, so it holds no guest work to lose.
                 gpu_only_content: false,
@@ -381,7 +381,7 @@ impl ResourcePools {
         self.compute_storage_order.push_back(identity);
         Ok(ResidentStorageImageUse {
             slot,
-            layout: vk::ImageLayout::UNDEFINED,
+            access: ResidentAccess::Untouched,
             generation_match: false,
         })
     }
@@ -589,15 +589,22 @@ impl ResourcePools {
         }
     }
 
+    /// Record the dispatch that just wrote this resident storage image.
+    ///
+    /// The access is not a parameter because there is only one: every executed
+    /// dispatch ends by copying the image out to its readback buffer, and the
+    /// barrier that arms that copy chains off the dispatch's own `SHADER_WRITE`.
+    /// So what a later reader must wait for is the transfer read, and the layout
+    /// it must name is that read's `TRANSFER_SRC_OPTIMAL` — both carried by
+    /// [`ResidentAccess::TransferRead`].
     pub(crate) fn mark_resident_storage_image(
         &mut self,
         identity: &ComputeStorageResidencyKey,
         generation: u32,
-        layout: vk::ImageLayout,
     ) {
         if let Some(resident) = self.compute_storage_registry.get_mut(identity) {
             resident.generation = generation;
-            resident.layout = layout;
+            resident.access = ResidentAccess::TransferRead;
         }
         // The dispatch just wrote this image, so nothing outside it holds the
         // result yet.
@@ -713,18 +720,18 @@ impl ResourcePools {
     }
 
     /// Snapshot of a resident storage image for a copy-on-sample source:
-    /// `(image, key, generation, current layout)`.
+    /// `(image, key, generation, what last touched it)`.
     pub(crate) fn compute_resident_snapshot(
         &mut self,
         identity: &ComputeStorageResidencyKey,
-    ) -> Option<(vk::Image, StorageImageKey, u32, vk::ImageLayout)> {
+    ) -> Option<(vk::Image, StorageImageKey, u32, ResidentAccess)> {
         self.note_compute_resident_use(identity);
         self.compute_storage_registry.get(identity).map(|resident| {
             (
                 resident.slot.image,
                 resident.slot.key,
                 resident.generation,
-                resident.layout,
+                resident.access,
             )
         })
     }
@@ -833,7 +840,7 @@ impl ResourcePools {
                 generation: new.generation,
                 content_ready: false,
                 content_epoch: None,
-                layout: vk::ImageLayout::UNDEFINED,
+                access: ResidentAccess::Untouched,
                 color_format: new.color_format,
                 pin_count: 0,
                 // Nothing has drawn into it, so it holds no guest work to lose.
@@ -1429,9 +1436,12 @@ impl ResourcePools {
         Ok(fb)
     }
 
-    /// Mark a resident ready with an explicit post-pass layout (MRT secondary
-    /// resolves to SHADER_READ_ONLY_OPTIMAL; the primary uses
-    /// `registry_mark_ready`'s TRANSFER_SRC_OPTIMAL).
+    /// Mark a resident ready after a render pass wrote it as a colour
+    /// attachment and left it at an explicit `final_layout` — the MRT secondary
+    /// arm, which settles at `COLOR_ATTACHMENT_OPTIMAL` where
+    /// [`Self::registry_mark_ready`]'s primary settles at
+    /// `TRANSFER_SRC_OPTIMAL`. Both record the same *access*; only the layout
+    /// differs, which is the distinction [`ResidentAccess::ColorWrite`] carries.
     pub(crate) fn registry_mark_ready_at(
         &mut self,
         identity: &TargetIdentity,
@@ -1440,7 +1450,7 @@ impl ResourcePools {
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.content_ready = true;
             slot.content_epoch = None;
-            slot.layout = layout;
+            slot.access = ResidentAccess::ColorWrite(layout);
         }
         self.set_sole_copy(identity, true);
     }
@@ -1505,8 +1515,10 @@ impl ResourcePools {
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.content_ready = true;
             slot.content_epoch = None;
-            // Draw pass final_layout is TRANSFER_SRC_OPTIMAL.
-            slot.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+            // Draw pass final_layout is TRANSFER_SRC_OPTIMAL, and the access
+            // that left it there is the pass's colour attachment write — not a
+            // transfer, despite the layout's name.
+            slot.access = ResidentAccess::ColorWrite(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         }
         self.set_sole_copy(identity, true);
     }
@@ -1546,13 +1558,17 @@ impl ResourcePools {
         }
     }
 
-    pub(crate) fn registry_set_layout(
-        &mut self,
-        identity: &TargetIdentity,
-        layout: vk::ImageLayout,
-    ) {
+    /// Record a non-writing touch of a resident: a draw sampled it, or a
+    /// transfer read it out (present blit, guest-page readback, GPU seed
+    /// source). The writing touches go through [`Self::registry_mark_ready`]
+    /// and [`Self::registry_mark_ready_at`], which also vouch for the pixels.
+    ///
+    /// Every rail that touches a resident has to land in one of the three,
+    /// because the next barrier over that image derives its source scope from
+    /// what it finds here — see [`ResidentAccess`].
+    pub(crate) fn registry_note_access(&mut self, identity: &TargetIdentity, access: ResidentAccess) {
         if let Some(slot) = self.registry.get_mut(identity) {
-            slot.layout = layout;
+            slot.access = access;
         }
     }
 
@@ -2135,7 +2151,7 @@ pub(super) mod pin_count_tests {
             generation: 1,
             content_ready,
             content_epoch: None,
-            layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            access: ResidentAccess::ColorWrite(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
             color_format: translate::pixel::SCANOUT_FORMAT,
             pin_count: 0,
             gpu_only_content: false,
@@ -2429,9 +2445,9 @@ pub(super) mod pin_count_tests {
             "nothing has vouched for its pixels"
         );
         assert_eq!(
-            slot.layout,
-            vk::ImageLayout::UNDEFINED,
-            "nothing has transitioned it yet"
+            slot.access,
+            ResidentAccess::Untouched,
+            "nothing has touched it yet"
         );
         assert_eq!(slot.pin_count, 0, "no deferred window holds it yet");
     }

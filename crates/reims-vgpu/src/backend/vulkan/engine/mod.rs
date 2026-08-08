@@ -2097,7 +2097,7 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
             target_readback_ops(),
             ReadbackDelivery::Lease,
         )?;
-        pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        pools.registry_note_access(identity, pools::ResidentAccess::TransferRead);
         counters.note_target_read(rb_size);
         Ok(match delivered {
             ReadbackResult::Leased { token, ptr, len } => Some(LeasedFrame {
@@ -2335,7 +2335,7 @@ pub fn copy_target_to_guest_pages(
             .guest_write_regions
             .fetch_add(plan.regions(), Ordering::Relaxed);
         copy_image_level0_to_buffer(ctx, pools, counters, &snap, &plan)?;
-        pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        pools.registry_note_access(identity, pools::ResidentAccess::TransferRead);
         counters.note_target_read(u64::from(dst.width) * u64::from(dst.height) * 4);
     }
     // Past the last fallible step, so this runs exactly when the copy is on the
@@ -2854,7 +2854,7 @@ fn resident_read_snapshot(
         image: slot.image,
         width: slot.width,
         height: slot.height,
-        layout: slot.layout,
+        layout: slot.access.layout(),
         bgra: slot.scanout_order(),
     })
 }
@@ -2884,7 +2884,7 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
             rb_size,
             target_readback_ops(),
         )?;
-        pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        pools.registry_note_access(identity, pools::ResidentAccess::TransferRead);
         counters.note_target_read(rb_size);
         Ok(TargetReadback {
             pixels: out,

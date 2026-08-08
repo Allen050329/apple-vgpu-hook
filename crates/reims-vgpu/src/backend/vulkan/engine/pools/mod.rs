@@ -880,14 +880,16 @@ pub(crate) struct StorageImageSlot {
 
 pub(crate) struct ResidentStorageImageUse {
     pub slot: StorageImageSlot,
-    pub layout: vk::ImageLayout,
+    pub access: ResidentAccess,
     pub generation_match: bool,
 }
 
 struct ResidentStorageImageSlot {
     slot: StorageImageSlot,
     generation: u32,
-    layout: vk::ImageLayout,
+    /// What last touched this image, and where that left it — see
+    /// [`ResidentAccess`], which the target registry shares.
+    access: ResidentAccess,
     /// Deferred-writeback pin: the resident is the only copy of this content
     /// (guest pages are stale) — LRU eviction must skip it until the caller
     /// flushes and unpins.
@@ -1005,6 +1007,99 @@ pub(crate) struct NonPinnedTotals {
     pub bytes: u64,
 }
 
+/// Where a registry-resident image sits, and what put it there, as one value.
+///
+/// The two halves are inseparable because reading either one alone is the bug
+/// this type exists to make unrepresentable. A tracked **layout** names where
+/// the image is; a barrier's source scope has to name what last **touched** it,
+/// and on this registry the two disagree by construction. A render pass moves
+/// its primary attachment to `TRANSFER_SRC_OPTIMAL` through `final_layout`
+/// without any transfer having run, so a resident sitting in that layout was in
+/// fact last written by a colour attachment write. Deriving a barrier's source
+/// scope from the layout reads that write as a transfer read and leaves the
+/// colour writes free to race whatever comes next — the same stale-frame
+/// failure as omitting the barrier outright, only harder to see.
+///
+/// A resident is the only image class where this matters. Pool-owned transients
+/// re-enter their free lists only through `drain_cleanup`, which `retire_slot`
+/// reaches only after `wait_for_fences` on the submission that last used them,
+/// so a pooled image cannot be handed out while GPU work still reads it and
+/// there is nothing for a source scope to name. A resident is keyed by
+/// [`TargetIdentity`] and deliberately outlives the draw so its pixels survive
+/// to the next one, which is exactly what makes it useful — and exactly why it
+/// alone has to state what it is waiting for.
+///
+/// The enum is closed because the rails that touch a resident are: a draw's
+/// render pass, an MRT secondary's render pass, a resident sample, and the
+/// three transfer reads (present blit, guest-page readback, GPU seed source).
+/// Every one of them ends in one of these variants, which is what lets
+/// [`Self::source_scope`] be exact rather than a blunt `ALL_COMMANDS` union
+/// over every write a resident could conceivably carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResidentAccess {
+    /// Created or recycled; nothing has touched the image.
+    Untouched,
+    /// A render pass wrote it as a colour attachment and left it in that pass's
+    /// `final_layout` — `TRANSFER_SRC_OPTIMAL` for a primary target,
+    /// `COLOR_ATTACHMENT_OPTIMAL` for an MRT secondary.
+    ColorWrite(vk::ImageLayout),
+    /// A draw sampled it.
+    ShaderRead,
+    /// A transfer read it: a present blit, a guest-page readback, a GPU seed
+    /// copy, or this draw's own copy-on-sample snapshot.
+    TransferRead,
+}
+
+impl ResidentAccess {
+    /// Where the image is — the `old_layout` a barrier over it must name.
+    pub(crate) fn layout(self) -> vk::ImageLayout {
+        match self {
+            Self::Untouched => vk::ImageLayout::UNDEFINED,
+            Self::ColorWrite(layout) => layout,
+            Self::ShaderRead => vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            Self::TransferRead => vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        }
+    }
+
+    /// What last touched it — the `srcStageMask`/`srcAccessMask` a barrier over
+    /// it must name, whichever direction that barrier goes.
+    ///
+    /// One answer serves reads and writes both. A read-after-write needs the
+    /// write made available, which the write's own access flag supplies; a
+    /// write-after-read needs an execution dependency on the read, which the
+    /// read's own stage supplies. Naming the single access that actually
+    /// happened covers each hazard in its own direction.
+    ///
+    /// Naming only the *last* access is sufficient because consecutive barriers
+    /// over one resident form a dependency chain: the barrier that let access
+    /// N+1 happen already named access N as its source, so a write two accesses
+    /// back stays ordered through the barrier that stood between them. That
+    /// holds only while every touch updates the registry, which is why this
+    /// enum and the field carrying it are the same value — a rail that touches
+    /// a resident without recording it is the one way to break the chain, and
+    /// it cannot compile without choosing a variant.
+    pub(crate) fn source_scope(self) -> (vk::PipelineStageFlags, vk::AccessFlags) {
+        match self {
+            Self::Untouched => (
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::AccessFlags::empty(),
+            ),
+            Self::ColorWrite(_) => (
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            ),
+            Self::ShaderRead => (
+                vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::AccessFlags::SHADER_READ,
+            ),
+            Self::TransferRead => (
+                vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::TRANSFER_READ,
+            ),
+        }
+    }
+}
+
 pub(crate) struct ResidentTargetSlot {
     pub image: vk::Image,
     pub memory: vk::DeviceMemory,
@@ -1026,8 +1121,9 @@ pub(crate) struct ResidentTargetSlot {
     /// epoch 0 ("nothing published since attach") is a legal *mapping* value
     /// and a bare `0 == 0` would match an image that was never stamped at all.
     pub content_epoch: Option<u32>,
-    /// Last known layout (tracked for correct barriers).
-    pub layout: vk::ImageLayout,
+    /// What last touched this image, and where that left it. See
+    /// [`ResidentAccess`] for why these are one field and not two.
+    pub access: ResidentAccess,
     /// Concrete Vulkan attachment format the image was created with. Every
     /// question about this resident's channel order is asked of this field,
     /// through [`ResidentTargetSlot::scanout_order`] — a format change forces an
@@ -2949,7 +3045,7 @@ mod staging_mapping_tests {
 
 #[cfg(test)]
 mod resident_reuse_tests {
-    use super::ResidentTargetSlot;
+    use super::{ResidentAccess, ResidentTargetSlot};
     use crate::backend::vulkan::translate;
     use ash::vk;
 
@@ -2966,7 +3062,7 @@ mod resident_reuse_tests {
             generation,
             content_ready: false,
             content_epoch: None,
-            layout: vk::ImageLayout::UNDEFINED,
+            access: ResidentAccess::Untouched,
             color_format: format,
             pin_count: 0,
             gpu_only_content: false,

@@ -3282,7 +3282,7 @@ mod recycle_tests {
                 ResidentStorageImageSlot {
                     slot: null_storage_slot(8, 8),
                     generation: 0,
-                    layout: vk::ImageLayout::UNDEFINED,
+                    access: ResidentAccess::Untouched,
                     pinned,
                     gpu_only_content: false,
                     last_touch_ms: touch,
@@ -3346,7 +3346,7 @@ mod recycle_tests {
         let mut pools = ResourcePools::new();
         let id = admit_compute_resident(&mut pools, 1, 1_000, false);
         // The dispatch wrote it. Nothing else holds the result.
-        pools.mark_resident_storage_image(&id, 7, vk::ImageLayout::GENERAL);
+        pools.mark_resident_storage_image(&id, 7);
 
         let cutoff = 10_000u64.saturating_sub(IDLE_TARGET_AGE_MS);
         assert!(
@@ -3387,14 +3387,14 @@ mod recycle_tests {
             "both are re-servable, so both could be given back"
         );
 
-        pools.mark_resident_storage_image(&a, 1, vk::ImageLayout::GENERAL);
+        pools.mark_resident_storage_image(&a, 1);
         assert_eq!(
             pools.recoverable_compute_storage_residents(),
             vec![b],
             "the sole copy drops out; its peer is still offered"
         );
 
-        pools.mark_resident_storage_image(&b, 1, vk::ImageLayout::GENERAL);
+        pools.mark_resident_storage_image(&b, 1);
         assert!(
             pools.recoverable_compute_storage_residents().is_empty(),
             "nothing left that can be destroyed without refusing a later dispatch"
@@ -3435,15 +3435,15 @@ mod recycle_tests {
             "a resident no dispatch has written holds no guest work"
         );
 
-        pools.mark_resident_storage_image(&a, 1, vk::ImageLayout::GENERAL);
+        pools.mark_resident_storage_image(&a, 1);
         check(&pools, "a dispatch wrote the first");
         assert_eq!(pools.compute_storage_sole_copy.count, 1);
         // A second dispatch into the same resident is still one resident.
-        pools.mark_resident_storage_image(&a, 2, vk::ImageLayout::GENERAL);
+        pools.mark_resident_storage_image(&a, 2);
         check(&pools, "a second dispatch into the same resident");
         assert_eq!(pools.compute_storage_sole_copy.count, 1);
 
-        pools.mark_resident_storage_image(&b, 1, vk::ImageLayout::GENERAL);
+        pools.mark_resident_storage_image(&b, 1);
         check(&pools, "a dispatch wrote the second");
         assert_eq!(pools.compute_storage_sole_copy.count, 2);
 
@@ -3461,7 +3461,7 @@ mod recycle_tests {
         assert_eq!(pools.compute_storage_sole_copy.count, 0);
 
         // Removal folds a still-sole-copy resident out — the re-key path.
-        pools.mark_resident_storage_image(&b, 3, vk::ImageLayout::GENERAL);
+        pools.mark_resident_storage_image(&b, 3);
         check(&pools, "the second written again");
         assert_eq!(pools.compute_storage_sole_copy.count, 1);
         assert!(pools.remove_compute_storage_resident(&b).is_some());
@@ -3487,7 +3487,7 @@ mod recycle_tests {
             ResidentStorageImageSlot {
                 slot: null_storage_slot(8, 8),
                 generation: 0,
-                layout: vk::ImageLayout::UNDEFINED,
+                access: ResidentAccess::Untouched,
                 pinned,
                 gpu_only_content: false,
                 last_touch_ms: touch,
