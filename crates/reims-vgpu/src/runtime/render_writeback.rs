@@ -189,6 +189,36 @@
 //! arm and land the reclaim paths would otherwise be free to take the image the
 //! parked plan reads from.
 //!
+//! # How big the cut is, and the one variant that must not take it
+//!
+//! A settle is far rarer than a Store, which is the whole reason this works. One
+//! driven Safari-drag census window:
+//!
+//! ```text
+//! gwdebt_merged           1 529     writebacks that found the debt already set
+//! settle_linear_memo_read     6     settles that actually waited
+//! settle_*                    0     every other site
+//! ```
+//!
+//! Six waits a second against 1 556 writebacks. Parking against about six
+//! distinct surfaces and landing at a settle is therefore of order **36 copies a
+//! second instead of 1 556** — the same territory the ablation measured at 86 Hz,
+//! reached without losing a frame the guest asked for.
+//!
+//! **That factor is only available if the three stamp sites do not land parked
+//! plans**, and it is a contract statement rather than a shortcut. A completion
+//! stamp says a submission finished; it does not say the guest may read the
+//! resource. [`SettleSite::CompletionStamp`], [`SettleSite::RootStamp`] and
+//! [`SettleSite::ChildStamp`] are the three that fire at that cadence, and a
+//! settle from any of them still has to wait what is already *submitted* — it
+//! simply must not turn a parked plan into a submission. Every other variant is a
+//! host toucher of guest bytes and lands everything parked before it reads.
+//!
+//! `engine::write_stamp_after_guest_writes` needs no change for this: it orders
+//! the stamp word behind outstanding copies with a GPU barrier in the same queue
+//! and never calls the settle, so a plan that is still parked is simply not
+//! something it claims anything about.
+//!
 //! One caveat for whoever reads the witness this rail feeds:
 //! `MappingEntry::render_flush`'s doc quotes `render_flush_age_sub_ms` /
 //! `_sub_frame` / `_frame_plus` figures, and **those counters exist nowhere in
