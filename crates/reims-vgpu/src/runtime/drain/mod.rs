@@ -3336,46 +3336,31 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     ),
                 }
             } else if packet.opcode == CHILD_OP_SYNCHRONIZE_RESOURCES {
-                // RE synchronizeForUnwire → FIFO 0x35: {task,count}+{oid} only.
-                // Guest contract is finish host GPU use before pageoff — not
-                // "host invents pixels into guest pages." Discrete host_cache→
-                // guest write was product invent (pre-change successful boots
-                // were stamp-only). Keep decode + wait_surface; no guest write.
+                // The command carries `{task, count}` and a list of object ids,
+                // and nothing else — no region, no direction. It is the guest
+                // saying "I am about to touch these resources with the CPU", so
+                // what this device owes is that every guest-page write it has
+                // already submitted has executed, and nothing more. It is not a
+                // request to invent pixels into guest pages.
+                //
+                // **It is also the contract's only host-to-guest copy trigger,
+                // and a driven x86/Vulkan Safari-drag boot issues none at all.**
+                // That is what makes this device's per-Store writeback pure
+                // surplus on that workload; see `runtime::render_writeback`'s
+                // module doc for what the surplus costs and what the reference
+                // host does instead. A boot where this arm starts firing is a
+                // boot where the deferral described there has a real land point,
+                // so the count is worth watching rather than assuming zero.
                 use crate::runtime::decode::fifo::decode_synchronize_resources;
                 match decode_synchronize_resources(&packet.payload) {
                     Ok(cmd) => {
-                        // The guest is about to CPU-read these resources
-                        // (pageoff/unwire): land every deferred writeback
-                        // (render/compute/linear-alias) into guest pages first
-                        // — the only host-visible choke point for guest CPU
-                        // reads (boot-25 black-wallpaper class).
-                        // The guest is about to CPU-read these mappings, so
-                        // every guest-page write this device submitted has to
-                        // have executed first.
                         crate::runtime::render_writeback::settle_guest_writes(
                             crate::runtime::render_writeback::SettleSite::ChildStamp,
                         );
-                        let flushed = 0u32;
-                        let flush_ok = true;
                         let oid = cmd.object_ids.first().copied().unwrap_or(0);
-                        // Count into the always-on teardown-churn proxy; the
-                        // per-event census floods to ~49k/session under a
-                        // continuously-animating app, so it moves behind
-                        // REIMS_VGPU_DRAW_LOG below.
-                        // A deferred guest-read flush that did NOT land right
-                        // before the guest CPU-reads these pages is a genuine
-                        // black/stale-content drop — previously buried in the
-                        // off() census (invisible in the curated fail view).
-                        // Promote it to a reason-slugged fail line.
-                        if !flush_ok {
-                            crate::observe::fail(format!(
-                                "map_family op=SynchronizeResources reason=guest_read_flush_incomplete ch={channel_id} task={} oid={oid:#x} deferred_flushed={flushed}",
-                                cmd.task_id
-                            ));
-                        }
                         if crate::observe::draw_log_enabled() {
                             crate::observe::line(format!(
-                                "map_family op=SynchronizeResources opcode={:#x} ch={channel_id} plen={plen} task={} count={} oid={oid:#x} deferred_flushed={flushed} flush_ok={flush_ok}",
+                                "map_family op=SynchronizeResources opcode={:#x} ch={channel_id} plen={plen} task={} count={} oid={oid:#x}",
                                 packet.opcode, cmd.task_id, cmd.count
                             ));
                         }
@@ -3391,8 +3376,8 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         }
                     }
                     // A refused Synchronize lets the guest CPU-read pages whose
-                    // deferred writeback never landed — the class the accepting
-                    // arm above still names "boot-25 black-wallpaper".
+                    // submitted writeback has not executed, which is a stale or
+                    // black frame the guest has no way to notice.
                     Err(e) => note_resource_list_decode_fail(
                         "SynchronizeResources",
                         packet.opcode,

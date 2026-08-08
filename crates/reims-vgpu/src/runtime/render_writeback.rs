@@ -127,6 +127,45 @@
 //! when something actually reads the bytes, which is what the contract does and
 //! what the deferred window above tried to do with the wrong land point.
 //!
+//! # Who reads these guest pages, counted
+//!
+//! A deferral is only as good as the list of readers it has to land for, so here
+//! is the list with a driven boot's rates beside it. All three are ours to
+//! trigger or the guest's to announce; none of them is an unobservable read.
+//!
+//! * **This device's own colour LOAD seed**, reading an attachment's guest pages
+//!   to seed `MTLLoadActionLoad`. [`SettleSite::LinearTextureSeed`] is where it
+//!   blocks and it is the device's largest wait — 4 701 in one drag, 99.8 % of
+//!   them genuine overlaps. Already elidable through
+//!   [`crate::runtime::gva_store_witness`].
+//! * **The host console**, painting a mapping's bytes into the host window.
+//!   `scanout_paint` fires **six times in a whole boot**; the window presents
+//!   from the resident image, not from guest pages.
+//! * **The guest CPU**, which announces itself. Zero all boot.
+//!
+//! Against 1 556 writebacks a second. The `settle_linear_memo_read` pair says
+//! the same thing from the other side: 3 796 disjointness checks a second, of
+//! which **six** found a read overlapping an outstanding write.
+//!
+//! # What a deferral has to answer, and the one thing that blocks it today
+//!
+//! Arming instead of writing is the easy half, and a second Store into one
+//! mapping should *replace* the armed copy rather than refuse it — the later
+//! frame is the fresher answer, and that replacement is the coalescing the
+//! stamp-shaped land point made unreachable. The hazards are the four this doc
+//! already lists for the old window: resident drift, pin leaks, page recycling,
+//! and ordering against the guest's own CPU write. The last one has a signal
+//! already decoded — `clear_host_valid` means the guest wrote those bytes, so an
+//! armed copy for that mapping must be **dropped**, not landed.
+//!
+//! **The blocker is plumbing, and it is worth knowing before starting.**
+//! [`settle_guest_writes`] takes a [`SettleSite`] and nothing else — no
+//! `DeviceState`, no `HostMemory` — so it can wait for submitted copies but
+//! cannot submit an armed one. Its sixteen call sites are exactly the choke
+//! points a deferral needs to land at, and every one of them would have to carry
+//! state and host to get there. That threading is the bulk of the work, not the
+//! ledger.
+//!
 //! One caveat for whoever reads the witness this rail feeds:
 //! `MappingEntry::render_flush`'s doc quotes `render_flush_age_sub_ms` /
 //! `_sub_frame` / `_frame_plus` figures, and **those counters exist nowhere in
