@@ -5645,11 +5645,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
         }
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Seed);
-        // Color load seed: CLEAR → solid; LOAD → guest/host seed when present.
-        // `seed_order` names what is in those bytes; the engine folds any needed
-        // R/B exchange into its copy into the mapped staging span rather than
-        // making this side materialize a converted frame.
+        // Colour load seed: LOAD → guest/host seed when present. `seed_order`
+        // names what is in those bytes; the engine folds any needed R/B exchange
+        // into its copy into the mapped staging span rather than making this
+        // side materialize a converted frame.
+        //
+        // CLEAR is not a seed. It travels as `target_clear` and the render pass
+        // does it, which is what `MTLLoadActionClear` asks for.
         let mut target_rgba8: Option<std::sync::Arc<Vec<u8>>> = None;
+        let mut target_clear = [0.0f32; 4];
         let mut seed_order = crate::backend::vulkan::engine::SeedOrder::Rgba8;
         let gpu_only_content_allowed =
             crate::backend::vulkan::engine::deferred_gpu_only_content_allowed();
@@ -5812,7 +5816,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // Resident target carries the chain; no CPU seed bytes.
                 }
                 MTL_LOAD_ACTION_CLEAR => {
-                    target_rgba8 = Some(std::sync::Arc::new(solid_rgba8(w, h, &c0.clear_color)));
+                    // The pass clears the attachment. No seed: a seed would
+                    // resolve this pass key to LOAD, which is the opposite of
+                    // what the guest asked for, and would spend an allocation, a
+                    // channel exchange and a staged upload writing one constant
+                    // into every texel.
+                    target_clear = [
+                        c0.clear_color[0] as f32,
+                        c0.clear_color[1] as f32,
+                        c0.clear_color[2] as f32,
+                        c0.clear_color[3] as f32,
+                    ];
                 }
                 MTL_LOAD_ACTION_LOAD => {
                     // Which door this pass took, so a pass that ends with no
@@ -6021,6 +6035,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             .map(|c| c.store_action == MTL_STORE_ACTION_STORE)
             .unwrap_or(true);
         resources.target_rgba8 = target_rgba8;
+        resources.target_clear = target_clear;
         resources.target_seed_order = seed_order;
         // A Store reads back; anything else skips it.
         //

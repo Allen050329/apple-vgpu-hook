@@ -2962,28 +2962,7 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
-    // One clear value per attachment (slot 0 + secondaries), in FB order. Only
-    // CLEAR attachments consult these, but the count must cover all attachments.
-    let mut clear = vec![vk::ClearValue {
-        color: vk::ClearColorValue {
-            float32: [0.0, 0.0, 0.0, 0.0],
-        },
-    }];
-    for sec in &req.secondary_targets {
-        clear.push(vk::ClearValue {
-            color: vk::ClearColorValue { float32: sec.clear },
-        });
-    }
-    // Depth attachment is last (after color + secondaries), matching the pass
-    // attachment order. Only consulted when its load_op is CLEAR.
-    if let Some(d) = &req.depth {
-        clear.push(vk::ClearValue {
-            depth_stencil: vk::ClearDepthStencilValue {
-                depth: d.clear_value,
-                stencil: d.stencil.map(|s| s.clear_value).unwrap_or(0),
-            },
-        });
-    }
+    let clear = clear_values(req);
     let rp_begin = vk::RenderPassBeginInfo::default()
         .render_pass(render_pass)
         .framebuffer(target_fb)
@@ -3481,6 +3460,42 @@ fn read_occlusion_samples(
     unsafe { ctx.device.destroy_query_pool(pool, None) };
     read.map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecGetQueryPoolResults, e)))?;
     Ok(Some(samples[0]))
+}
+
+/// One `VkClearValue` per attachment, in framebuffer order: the primary colour
+/// slot, then the secondaries, then depth.
+///
+/// Only attachments whose `loadOp` is `CLEAR` consult their entry, but the
+/// vector must cover every attachment because Vulkan indexes it positionally —
+/// a short vector silently gives a later attachment an earlier one's colour.
+///
+/// The primary's entry used to be a hard-coded transparent black, and that was
+/// the whole reason `MTLLoadActionClear` could not be honoured directly: the
+/// runtime met it instead by allocating a whole-attachment RGBA8 bitmap of the
+/// requested colour and handing it over as a CPU seed, which also resolved the
+/// pass to LOAD. The clear now travels as
+/// [`super::types::DrawRequest::target_clear`], the same shape the secondaries
+/// have always used.
+fn clear_values(req: &DrawRequest) -> Vec<vk::ClearValue> {
+    let mut clear = vec![vk::ClearValue {
+        color: vk::ClearColorValue {
+            float32: req.target_clear,
+        },
+    }];
+    for sec in &req.secondary_targets {
+        clear.push(vk::ClearValue {
+            color: vk::ClearColorValue { float32: sec.clear },
+        });
+    }
+    if let Some(d) = &req.depth {
+        clear.push(vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: d.clear_value,
+                stencil: d.stencil.map(|s| s.clear_value).unwrap_or(0),
+            },
+        });
+    }
+    clear
 }
 
 /// The access a barrier over *this draw's own colour target* must name as its
@@ -4030,6 +4045,86 @@ mod tests {
                 assert!(!flags.is_empty(), "{access:?} has an access to make available");
             }
         }
+    }
+
+    /// A secondary colour attachment that clears to `clear`; every other field
+    /// is irrelevant to the clear-value vector and takes a neutral value.
+    fn secondary_with_clear(clear: [f32; 4]) -> super::super::types::SecondaryColorTarget {
+        super::super::types::SecondaryColorTarget {
+            identity: super::super::types::TargetIdentity::Surface {
+                id: 1,
+                width: 16,
+                height: 16,
+                generation: 1,
+            },
+            width: 16,
+            height: 16,
+            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+            clear,
+            load: false,
+            blend: None,
+            color_write_mask: Default::default(),
+        }
+    }
+
+    /// A `MTLLoadActionClear` reaches the attachment as the render pass's own
+    /// clear value, not as a bitmap of that colour.
+    ///
+    /// The primary's entry was a hard-coded transparent black, so the only way
+    /// to honour a colour was to allocate a whole-attachment RGBA8 image of it,
+    /// exchange its channels and stage it to the GPU — per draw, for a constant.
+    /// That also set `target_rgba8`, which is what `load_seed` means, so the
+    /// pass resolved to LOAD and a draw asking to discard its attachment loaded
+    /// it instead.
+    ///
+    /// Asserting the primary's slot follows the request is the half that fails
+    /// against the old hard-coded value. Asserting the positions is the other
+    /// half: Vulkan indexes this vector positionally, so a missing or reordered
+    /// entry hands one attachment another's colour with nothing to refuse it.
+    #[test]
+    fn every_attachment_takes_its_own_clear_and_the_primary_takes_the_guests() {
+        let req = DrawRequest {
+            target_clear: [0.25, 0.5, 0.75, 1.0],
+            secondary_targets: vec![
+                secondary_with_clear([1.0, 0.0, 0.0, 1.0]),
+                secondary_with_clear([0.0, 1.0, 0.0, 0.5]),
+            ],
+            depth: Some(super::super::types::DepthState {
+                test_enable: true,
+                write_enable: true,
+                compare: super::super::types::SamplerCompareFunction::Less,
+                clear_value: 0.5,
+                load: false,
+                stencil: None,
+            }),
+            ..DrawRequest::default()
+        };
+
+        let clear = clear_values(&req);
+        assert_eq!(
+            clear.len(),
+            4,
+            "one entry per attachment: primary, two secondaries, depth"
+        );
+        unsafe {
+            assert_eq!(
+                clear[0].color.float32,
+                [0.25, 0.5, 0.75, 1.0],
+                "the primary takes the guest's clear colour, not a fixed black"
+            );
+            assert_eq!(clear[1].color.float32, [1.0, 0.0, 0.0, 1.0]);
+            assert_eq!(clear[2].color.float32, [0.0, 1.0, 0.0, 0.5]);
+            assert_eq!(clear[3].depth_stencil.depth, 0.5);
+        }
+    }
+
+    /// A default request still clears to transparent black, which is what every
+    /// draw that names no colour has always got.
+    #[test]
+    fn an_unstated_clear_is_transparent_black() {
+        let clear = clear_values(&DrawRequest::default());
+        assert_eq!(clear.len(), 1, "no secondaries and no depth is one entry");
+        unsafe { assert_eq!(clear[0].color.float32, [0.0; 4]) };
     }
 
     /// This draw's own snapshot copy is recorded after the registry's access is

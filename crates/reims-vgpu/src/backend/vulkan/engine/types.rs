@@ -383,12 +383,28 @@ pub struct DrawRequest {
     /// Load the live GPU image for [`DrawRequest::target_identity`] instead of
     /// seeding the attachment from the CPU. Requires that resident to exist.
     ///
-    /// This and `target_rgba8` are the whole load action, and they are ordered:
-    /// `load_from_target` wins, else a seed is uploaded, else the attachment
-    /// clears to transparent black. There is no third spelling — the primary
-    /// attachment's `VkClearValue` is `[0, 0, 0, 0]` unconditionally, so a
-    /// "clear to these floats" request could never have been honoured.
+    /// This, `target_rgba8` and [`DrawRequest::target_clear`] are the whole
+    /// load action, and they are ordered: `load_from_target` wins, else a seed
+    /// is uploaded, else the attachment clears to `target_clear`.
     pub load_from_target: bool,
+    /// Clear value for the primary colour attachment, in semantic float
+    /// channels — the same shape [`SecondaryColorTarget::clear`] has carried all
+    /// along, and consulted only when the pass resolves to `loadOp = CLEAR`.
+    ///
+    /// This used to not exist. The primary's `VkClearValue` was `[0, 0, 0, 0]`
+    /// unconditionally, so a `MTLLoadActionClear` with a colour could not be
+    /// expressed — and the runtime met the contract by allocating a
+    /// whole-attachment RGBA8 bitmap of that solid colour on the CPU, handing it
+    /// over as `target_rgba8`, and paying a channel exchange and a staged upload
+    /// to put a constant into every texel. That also forced the pass key to a
+    /// LOAD pass, because a present seed is what `load_seed` means, so a draw
+    /// that asked to discard its attachment loaded it instead.
+    ///
+    /// Floats rather than the unorm8 the seed quantised to, which is what the
+    /// contract says: an sRGB attachment takes its clear in linear space and the
+    /// driver encodes it, where the byte path wrote pre-quantised values past
+    /// the encode entirely.
+    pub target_clear: [f32; 4],
     /// When true, skip full-frame readback (non-Store / ticket path). Content
     /// remains on the GPU under `target_identity` when provided.
     pub skip_readback: bool,
