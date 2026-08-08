@@ -6,7 +6,8 @@
 //! separate the two shapes a slow draw comes in, and they need opposite work:
 //!
 //! - **Bytes.** `stage` and `readback` dominate → the fix is to move less, which
-//!   is the deferred-rail and `output_bgra` family.
+//!   is the guest-page writeback family: render into the order the destination
+//!   stores and copy straight into its pages, so no byte crosses host memory.
 //! - **Latency.** `wait` dominates → the fix is to stop round-tripping the GPU
 //!   per draw, and moving bytes faster buys nothing.
 //!

@@ -642,7 +642,6 @@ fn depth_test_honored_on_resident_target_path() {
         let mut req = engine_req(&vert, &frag, w, h);
         req.vertex_count = 6;
         req.target_identity = Some(identity.clone());
-        req.output_bgra = true;
         req.skip_readback = true;
         req.storage_buffers.push(StorageBufferResource {
             binding: 0,
@@ -1612,7 +1611,6 @@ fn a_bgra_resident_draw_reads_back_identically_twice() {
     };
     let mut req = engine_req(&v, &f, w, h);
     req.target_identity = Some(identity.clone());
-    req.output_bgra = true;
     req.skip_readback = true;
     match engine::execute_draw_request(&req) {
         Ok(_) => {}
@@ -1731,7 +1729,6 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
     let mut req = engine_req(&vert, &frag, w, h);
     req.vertex_count = 6;
     req.target_identity = Some(identity.clone());
-    req.output_bgra = true;
     req.skip_readback = true;
 
     let positions: [[f32; 4]; 6] = [
@@ -2004,7 +2001,6 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
         let mut req = engine_req(&vert, &frag, w, h);
         req.vertex_count = 6;
         req.target_identity = Some(identity.clone());
-        req.output_bgra = true;
         req.skip_readback = true;
         req.storage_buffers.push(StorageBufferResource {
             binding: 0,
@@ -2125,7 +2121,6 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
         let mut req = engine_req(&vert, &frag, w, h);
         req.vertex_count = 6;
         req.target_identity = Some(identity.clone());
-        req.output_bgra = true;
         req.skip_readback = true;
         req.storage_buffers.push(StorageBufferResource {
             binding: 0,
@@ -2207,7 +2202,6 @@ fn partial_draw_preserves_rgba_seed_on_bgra_target() {
     let seed_rgba = [17u8, 91, 203, 255];
     let mut req = engine_req(&vert, &frag, w, h);
     req.target_identity = Some(identity.clone());
-    req.output_bgra = true;
     req.skip_readback = true;
     req.target_rgba8 = Some(std::sync::Arc::new(seed_rgba.repeat((w * h) as usize)));
     req.scissors = vec![ScissorResource {

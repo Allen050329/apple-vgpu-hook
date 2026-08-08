@@ -1337,20 +1337,24 @@ pub(crate) unsafe fn execute_draw_inner(
     // submit entirely. Every other draw claims a slot via begin_entry, which
     // flushes any open batch first (queue order = record order).
     let is_mrt = !req.secondary_targets.is_empty();
-    // The resolved attachment decides its own channel order: a resident target
-    // takes the identity's (`TargetIdentity::is_bgra` — every type-11 surface is
-    // BGRA), and the pooled path stays RGBA. `req.output_bgra` remains an
-    // explicit opt-in for identities whose namespace does not imply an order.
+    // The resolved attachment decides its own channel order, and the identity is
+    // the only thing that decides it: see [`TargetIdentity::is_bgra`]. A pooled
+    // draw with no identity has no destination to match and stays RGBA.
     //
     // Derived here rather than at each runtime call site so that all the draws
     // sharing one identity in a frame agree by construction. `registry_ensure`
     // destroys and recreates the image on an order mismatch, so a per-path
     // predicate that one path spells differently is a full reallocation per
     // composite, not a wrong colour.
-    let output_bgra = req
-        .target_identity
-        .as_ref()
-        .is_some_and(|id| req.output_bgra || id.is_bgra());
+    //
+    // A `DrawRequest::output_bgra` used to sit beside this as an explicit
+    // opt-in, OR-ed in here. It is gone rather than unused: once every
+    // namespace with a byte-for-byte destination answers from its own key, the
+    // only thing an opt-in could express is an order that *disagrees* with the
+    // key — which is the per-frame reallocation the paragraph above describes,
+    // spelled as a feature. No runtime caller ever set it, and the six parity
+    // tests that did were all already rendering into a `Surface` identity.
+    let output_bgra = req.target_identity.as_ref().is_some_and(|id| id.is_bgra());
     // A guest-sourced sampled bind used to force the immediate-submit path.
     // Its read of guest RAM happens when the CB *executes*, and this device
     // acked the packet as soon as it was consumed, so deferred submit stretched

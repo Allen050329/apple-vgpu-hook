@@ -364,8 +364,8 @@ pub struct DrawRequest {
     pub target_rgba8: Option<std::sync::Arc<Vec<u8>>>,
     /// Byte order of the CPU seed above, relative to the attachment it seeds.
     ///
-    /// The attachment is BGRA when [`DrawRequest::output_bgra`] and RGBA
-    /// otherwise. When the two disagree the exchange is folded into the copy
+    /// The attachment's order is [`TargetIdentity::is_bgra`] and nothing else.
+    /// When the two disagree the exchange is folded into the copy
     /// into the mapped staging span, which has to happen regardless — so a
     /// caller whose pixels are already in guest scanout order never has to
     /// materialize a converted frame to seed a draw with them.
@@ -392,11 +392,6 @@ pub struct DrawRequest {
     /// When true, skip full-frame readback (non-Store / ticket path). Content
     /// remains on the GPU under `target_identity` when provided.
     pub skip_readback: bool,
-    /// When true, render into a B8G8R8A8_UNORM resident target so the stored
-    /// bytes are already in guest scanout order — enables zero-copy
-    /// import-present (no CPU RGBA→BGRA swizzle). Honored only with
-    /// `target_identity` (the pooled path stays RGBA).
-    pub output_bgra: bool,
     /// Present-boundary GPU seed: copy this READY resident target's content
     /// into the draw target before the pass (which then runs with LOAD),
     /// eliding the CPU front-frame read + full-frame seed upload. Requires
