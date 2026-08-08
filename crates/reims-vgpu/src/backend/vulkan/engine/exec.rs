@@ -127,6 +127,68 @@ fn single_run(
 /// [`super::quiesce_guest_reads`], called from `write_stamp`, is what makes that
 /// ordering a rule rather than a short window; `snapshot_volatile` records that
 /// the runtime asked for a stable snapshot, which only arm 3 still gives it.
+/// How many recently-gathered buffer keys [`note_gather_key_recurrence`]
+/// remembers.
+///
+/// A bound, so it is stated and its saturation is counted rather than assumed:
+/// `gather_key_evict` firing means the window is smaller than the guest's live
+/// buffer set and the repeat rate below is an *under*-estimate. 1 024 against a
+/// measured ~3.5 live binds per submission leaves room for roughly 290
+/// submissions of history, which is well past the per-command-buffer reuse the
+/// `cb_bound_buffers` map already captures.
+const RECENT_GATHER_KEYS: usize = 1024;
+
+/// Recently-gathered keys, in insertion order beside a set for the test.
+///
+/// Sizing evidence for a cross-submission gather cache, and nothing else — this
+/// records what *was* gathered and never changes what is. `cb_bound_buffers`
+/// already serves a repeat inside one command buffer, and `seal_entry` drops
+/// that map on every submission (a driven boot: 83 293 seals, 290 747 entries
+/// discarded). Whether keeping the device-local gather buffer across a
+/// submission is worth its VRAM depends first on whether the same key comes back
+/// at all, which nothing measured.
+#[derive(Default)]
+struct RecentGathers {
+    /// Insertion order, so the oldest key is the one evicted.
+    order: std::collections::VecDeque<GatherKey>,
+    /// The same keys, for the membership test.
+    seen: std::collections::HashSet<GatherKey>,
+}
+
+/// The identity `stage_buffer_content` already keys its per-command-buffer
+/// bind map on: the resolved runs' allocation and the span's length.
+type GatherKey = (usize, u64);
+
+static RECENT_GATHERS: std::sync::Mutex<Option<RecentGathers>> = std::sync::Mutex::new(None);
+
+/// Band a gather by whether this exact `(runs, len)` key was gathered recently.
+///
+/// A repeat is a gather a cross-submission cache could have served; a fresh key
+/// is one it could not. The split is the whole sizing, and the eviction counter
+/// is what keeps the reading honest about its own window.
+fn note_gather_key_recurrence(key: GatherKey, bytes: u64) {
+    use crate::runtime::drain::{note_store_route, note_store_route_n};
+    let Ok(mut guard) = RECENT_GATHERS.lock() else {
+        return;
+    };
+    let recent = guard.get_or_insert_with(RecentGathers::default);
+    if recent.seen.contains(&key) {
+        note_store_route("gather_key_repeat");
+        note_store_route_n("gather_key_repeat_kb", bytes / 1024);
+        return;
+    }
+    note_store_route("gather_key_fresh");
+    note_store_route_n("gather_key_fresh_kb", bytes / 1024);
+    recent.order.push_back(key);
+    recent.seen.insert(key);
+    if recent.order.len() > RECENT_GATHER_KEYS {
+        if let Some(old) = recent.order.pop_front() {
+            recent.seen.remove(&old);
+            note_store_route("gather_key_evict");
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "buffer staging carries the Vulkan context, pools, binding, and lifetime sets"
@@ -182,6 +244,7 @@ unsafe fn stage_buffer_content(
                 // direct bind does, so this owes the same quiesce.
                 pools.note_guest_read_recorded();
                 counters.note_buffer_guest_gather(src.total_len, pending.regions());
+                note_gather_key_recurrence(key, src.total_len);
                 gathers.push(pending);
                 bound
             } else {
