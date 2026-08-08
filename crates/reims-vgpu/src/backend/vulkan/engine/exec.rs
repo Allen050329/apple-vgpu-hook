@@ -1302,6 +1302,109 @@ unsafe fn upload_buffer_to_sampled_image(
     );
 }
 
+/// The eleven conditions that decide how a draw reaches the submission ring.
+///
+/// Two questions, one set of fields. `batch_eligible` asks whether this draw
+/// may leave its command buffer in recording state for a successor to append
+/// to; [`Self::refusal`] asks whether *this* draw may be that successor. The
+/// first seven terms answer both, and while they were two hand-written lists a
+/// `debug_assert` was the only thing keeping the shared prefix in step —
+/// which caught a divergence in debug builds and shipped it in release.
+/// Deriving `batch_eligible` from the fields the ladder reads removes the
+/// second spelling instead of checking it.
+///
+/// # Not a term: sampling the target it renders into
+///
+/// It was one, and it refused 29.7 % of all draws — the single largest reason
+/// a draw forced its own submission. The engine handles that case by copying
+/// the resident into a pooled image and binding the copy, and that copy is
+/// recorded into this draw's own command buffer between the previous draw's
+/// `cmd_end_render_pass` and this one's `cmd_begin_render_pass`. Inside an open
+/// batch it therefore captures the target as of this draw's position in the
+/// stream, which is exactly what the draw asked for. What the refusal was
+/// standing in for was the missing dependency in front of that copy; see
+/// [`barrier_resident_for_transfer_read`].
+struct JoinTerms {
+    force_loss: bool,
+    quirk: bool,
+    is_mrt: bool,
+    has_depth: bool,
+    reads_back: bool,
+    has_query: bool,
+    no_identity: bool,
+    not_load_from_target: bool,
+    cpu_seed: bool,
+    gpu_seed: bool,
+    no_open_batch: bool,
+}
+
+/// What a [`JoinTerms`] rung is a statement about.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum JoinScope {
+    /// A property of this draw alone: it must not defer its submit at all, so
+    /// it may neither open a batch nor join one.
+    Draw,
+    /// A property of how this draw sits against an *already open* batch. It
+    /// says nothing about whether this draw may leave its own command buffer
+    /// recording afterwards, so it bars joining and not opening.
+    Fit,
+}
+
+/// One rung of [`JoinTerms::LADDER`]: the term, what it is a statement about,
+/// and the census name it carries when it is the first to refuse.
+type JoinRefusal = (fn(&JoinTerms) -> bool, JoinScope, &'static str);
+
+impl JoinTerms {
+    /// The refusals in ladder order.
+    ///
+    /// [`Self::batch_eligible`] is this same list filtered to [`JoinScope::Draw`]
+    /// rather than a second copy of its prefix. A rung therefore cannot reach
+    /// one question and miss the other, and cannot be mis-scoped by landing at
+    /// the wrong index — its scope is written beside it, not inferred from
+    /// where it sits.
+    const LADDER: [JoinRefusal; 11] = [
+        (|t| t.force_loss, JoinScope::Draw, "nojoin_force_loss"),
+        (|t| t.quirk, JoinScope::Draw, "nojoin_quirk"),
+        (|t| t.is_mrt, JoinScope::Draw, "nojoin_mrt"),
+        (|t| t.has_depth, JoinScope::Draw, "nojoin_depth"),
+        (|t| t.reads_back, JoinScope::Draw, "nojoin_reads_back"),
+        (|t| t.has_query, JoinScope::Draw, "nojoin_query"),
+        (|t| t.no_identity, JoinScope::Draw, "nojoin_no_identity"),
+        (
+            |t| t.not_load_from_target,
+            JoinScope::Fit,
+            "nojoin_not_load_from_target",
+        ),
+        (|t| t.cpu_seed, JoinScope::Fit, "nojoin_cpu_seed"),
+        (|t| t.gpu_seed, JoinScope::Fit, "nojoin_gpu_seed"),
+        (|t| t.no_open_batch, JoinScope::Fit, "nojoin_no_open_batch"),
+    ];
+
+    /// Whether this draw may defer its submit and leave its command buffer
+    /// recording for a successor.
+    fn batch_eligible(&self) -> bool {
+        !Self::LADDER
+            .iter()
+            .any(|(refuses, scope, _)| *scope == JoinScope::Draw && refuses(self))
+    }
+
+    /// Why this draw does not append to the open batch, named by its first
+    /// refusing term, or `None` when it does.
+    ///
+    /// A joiner records into a command buffer an earlier draw left open, so
+    /// everything that bars opening must bar joining. Nothing asserts that:
+    /// this walks every rung and [`Self::batch_eligible`] walks a subset of the
+    /// same rungs, so a `None` here cannot coexist with a refusing
+    /// [`JoinScope::Draw`] rung. The `debug_assert` that used to police two
+    /// hand-written lists is gone with the second list.
+    fn refusal(&self) -> Option<&'static str> {
+        Self::LADDER
+            .iter()
+            .find(|(refuses, _, _)| refuses(self))
+            .map(|(_, _, name)| *name)
+    }
+}
+
 fn draw_has_no_invocations(req: &DrawRequest) -> bool {
     let element_count = req
         .indexed
@@ -1368,13 +1471,6 @@ pub(crate) unsafe fn execute_draw_inner(
     // and the query result is not readable until the command buffer has
     // completed — so a batched queried draw would return `None` for a count the
     // guest is about to read. The cost lands only on passes that arm a query.
-    let batch_eligible = !force_loss
-        && !ctx.caps.quirks.no_deferred_draw_batching
-        && !is_mrt
-        && req.depth.is_none()
-        && req.skip_readback
-        && req.occlusion_query.is_none()
-        && req.target_identity.is_some();
     let samples_own_target = req.sampled_images.iter().any(|s| {
         matches!(
             (&s.source, req.target_identity.as_ref()),
@@ -1393,89 +1489,84 @@ pub(crate) unsafe fn execute_draw_inner(
     // Why this draw does not append to the open batch, named by its first
     // refusing term.
     //
-    // 56 % of draws force a fresh command buffer, and each of those is a
-    // `vkQueueSubmit` and a fence — ~2 100 a second against a ring eight deep,
-    // which is what `Phase::Slot` measures the worker blocking on. A bare join
-    // rate cannot say which of these terms to attack, and the rule has enough
-    // terms that guessing picks the wrong one: `!samples_own_target` is the
-    // obvious suspect since the GVA resident sampled rung made self-alias
-    // common, but `batch_eligible` alone folds seven conditions before any of
-    // these are reached.
+    // A draw that does not join is a `vkQueueSubmit` and a fence, and that is
+    // what `Phase::Slot` measures the worker blocking on. A bare join rate
+    // cannot say which of these terms to attack, and the rule has enough terms
+    // that guessing picks the wrong one — `batch_eligible` alone folds seven
+    // conditions before any of the rest are reached.
     //
     // # What it read
     //
-    // Driven Safari drag, 95 694 draws, and only four of the twelve refusals
-    // ever fire:
+    // Driven Safari drag, 97 986 draws, and only four of the twelve refusals
+    // ever fired:
     //
-    //   join_appended                41 654   43.5 %
-    //   nojoin_samples_own_target    28 431   29.7 %
-    //   nojoin_not_load_from_target  14 332   15.0 %
-    //   nojoin_no_open_batch         11 277   11.8 %
+    //   join_appended                42 652   43.5 %
+    //   nojoin_samples_own_target    29 113   29.7 %
+    //   nojoin_not_load_from_target  14 683   15.0 %
+    //   nojoin_no_open_batch         11 538   11.8 %
     //
     // **All seven `batch_eligible` terms read zero.** Nothing here is refused
     // for a device-lost force, a driver quirk, MRT, a depth attachment, a
     // readback, an occlusion query or a missing identity — they are real
     // conditions this workload does not present, and a firing one is news.
     //
-    // So the batching ceiling is one term: a draw sampling the target it renders
-    // into. Letting those append would take the join rate from 43.5 % to ~73 %
-    // and roughly halve the submissions the ring blocks on. It is not free —
-    // the engine snapshots on self-alias, and inside an open batch that snapshot
-    // has to be recorded at this draw's position in the command buffer rather
-    // than taken from the image as it stood before the batch opened, or the
-    // draw samples content from the wrong point in the stream.
+    // So the batching ceiling was one term: a draw sampling the target it
+    // renders into, which the GVA resident sampled rung made common. That term
+    // is gone, and the reason it was ever there does not survive reading the
+    // snapshot path. The snapshot is a `cmd_copy_image` recorded into *this*
+    // command buffer, after the previous draw's `cmd_end_render_pass` and
+    // before this draw's `cmd_begin_render_pass`, from the registry-resident
+    // image every batched draw with that identity renders into — so inside an
+    // open batch it already captures the target as of this draw's position in
+    // the stream, which is the property a self-alias draw needs.
     //
-    // The seven terms of `batch_eligible` are spelled out here rather than
-    // folded, because "ineligible" would otherwise have been the one bucket
-    // hiding whether any of them mattered — and the answer is that none does. `joins` still reads
-    // `batch_eligible` through the first seven arms, so the two cannot diverge:
-    // an arm added to one without the other changes what `joins` means and the
-    // debug assertion below fails.
+    // What did have to change is the barrier in front of that copy. It was
+    // skipped whenever the resident already sat in `TRANSFER_SRC_OPTIMAL`,
+    // which is exactly the layout a render pass leaves its primary attachment
+    // in — so a snapshot following a draw into the same image took no
+    // dependency on it. Between two submissions that was merely undefined;
+    // inside one command buffer, with the producing draw a few commands back,
+    // it is the same undefined behaviour with a much shorter fuse.
+    // `barrier_resident_for_transfer_read` now answers it unconditionally.
     //
-    // One expression, evaluated once, so the decision and the census cannot
-    // disagree about what the rule is. Ordered as the predicate was, except that
-    // `batch_slot` stays last because it is the only term that looks anything
-    // up.
-    let no_join = if force_loss {
-        Some("nojoin_force_loss")
-    } else if ctx.caps.quirks.no_deferred_draw_batching {
-        Some("nojoin_quirk")
-    } else if is_mrt {
-        Some("nojoin_mrt")
-    } else if req.depth.is_some() {
-        Some("nojoin_depth")
-    } else if !req.skip_readback {
-        Some("nojoin_reads_back")
-    } else if req.occlusion_query.is_some() {
-        Some("nojoin_query")
-    } else if req.target_identity.is_none() {
-        Some("nojoin_no_identity")
-    } else if !req.load_from_target {
-        Some("nojoin_not_load_from_target")
-    } else if req.target_rgba8.is_some() {
-        Some("nojoin_cpu_seed")
-    } else if req.seed_from_target.is_some() {
-        Some("nojoin_gpu_seed")
-    } else if samples_own_target {
-        Some("nojoin_samples_own_target")
-    } else if batch_target
-        .as_ref()
-        .and_then(|t| pools.batch_slot(t))
-        .is_none()
-    {
-        Some("nojoin_no_open_batch")
-    } else {
-        None
+    // The terms are gathered into [`JoinTerms`] rather than spelled out here,
+    // because they answer two questions — may this draw *open* a batch, and may
+    // it *join* the open one — and those were two hand-written lists whose
+    // shared prefix a `debug_assert` had to police. `batch_eligible` is now
+    // derived from the same fields the ladder reads, so an added term cannot
+    // reach one and miss the other.
+    let terms = JoinTerms {
+        force_loss,
+        quirk: ctx.caps.quirks.no_deferred_draw_batching,
+        is_mrt,
+        has_depth: req.depth.is_some(),
+        reads_back: !req.skip_readback,
+        has_query: req.occlusion_query.is_some(),
+        no_identity: req.target_identity.is_none(),
+        not_load_from_target: !req.load_from_target,
+        cpu_seed: req.target_rgba8.is_some(),
+        gpu_seed: req.seed_from_target.is_some(),
+        // Last because it is the only term that looks anything up. Evaluated
+        // eagerly, which costs one `Option` compare on a draw an earlier term
+        // already refused.
+        no_open_batch: batch_target
+            .as_ref()
+            .and_then(|t| pools.batch_slot(t))
+            .is_none(),
     };
-    crate::runtime::drain::note_store_route(no_join.unwrap_or("join_appended"));
+    let batch_eligible = terms.batch_eligible();
+    let no_join = terms.refusal();
+    // The join arm splits by self-alias, and the two must sum to the joins.
+    // `nojoin_samples_own_target` was 29.7 % of all draws and is the population
+    // this ladder stopped refusing; without a name of its own on the way *in*,
+    // the only visible effect would be a term that stopped firing, which reads
+    // identically to a workload that stopped presenting one.
+    crate::runtime::drain::note_store_route(no_join.unwrap_or(if samples_own_target {
+        "join_appended_self_alias"
+    } else {
+        "join_appended"
+    }));
     let joins = no_join.is_none();
-    // The ladder above restates `batch_eligible`'s terms, and `batch_eligible`
-    // is still read on its own further down. A term corrected in one spelling
-    // and not the other is the divergence this catches, at no release cost.
-    debug_assert!(
-        batch_eligible || no_join.is_some(),
-        "the no-join ladder must refuse everything batch_eligible refuses"
-    );
     // Claim the next ring slot — BEFORE any pool acquire, so a recycled slot
     // can never alias a still-in-flight CB. Blocks (retire) only when every
     // slot is still in flight; the wait lands in retire_wait_us. A batch
@@ -3543,6 +3634,54 @@ mod tests {
         GuestRun, GuestRunSource, SampledImageResource, SampledSource,
     };
     use crate::observe::Decline;
+
+    /// Build a `JoinTerms` from a bitmask, one bit per ladder rung in order.
+    fn join_terms(bits: u32) -> JoinTerms {
+        let b = |i: usize| bits & (1 << i) != 0;
+        JoinTerms {
+            force_loss: b(0),
+            quirk: b(1),
+            is_mrt: b(2),
+            has_depth: b(3),
+            reads_back: b(4),
+            has_query: b(5),
+            no_identity: b(6),
+            not_load_from_target: b(7),
+            cpu_seed: b(8),
+            gpu_seed: b(9),
+            no_open_batch: b(10),
+        }
+    }
+
+    /// Every rung must be reachable as a verdict, or the census name below it
+    /// is unattributable and the one above it is over-counted.
+    ///
+    /// The ladder returns its *first* refusing term, so a rung is reachable
+    /// only from the input that refuses at it and nowhere earlier — which is
+    /// exactly the single-bit mask for that rung.
+    #[test]
+    fn every_join_refusal_is_reachable_and_named_once() {
+        let mut seen = std::collections::HashSet::new();
+        for (rung, (_, _, name)) in JoinTerms::LADDER.iter().enumerate() {
+            assert_eq!(
+                join_terms(1 << rung).refusal(),
+                Some(*name),
+                "rung {rung} does not answer with its own name when it is the only term set"
+            );
+            assert!(seen.insert(*name), "two rungs share the census name {name}");
+        }
+        assert_eq!(join_terms(0).refusal(), None, "no term set is a join");
+    }
+
+    // There is deliberately no test that `batch_eligible` and `refusal` agree
+    // about which rungs gate opening a batch. Both read `JoinScope` off the same
+    // ladder entry, so any such test asserts the scope field against itself:
+    // mis-scoping `nojoin_query` to `Fit` — which would let a queried draw defer
+    // its submit and hand the guest a count its command buffer has not produced
+    // — leaves one green. That test was written, run against exactly that
+    // mutation, and deleted. The `debug_assert` it replaced had the same blind
+    // spot and a release-build hole besides. What makes the two agree is that
+    // there is one list.
 
     /// `bufferOffset` has a hard rule in the Vulkan spec, and this rail is the
     /// only thing that ever gives it a nonzero value: every other sampled upload
