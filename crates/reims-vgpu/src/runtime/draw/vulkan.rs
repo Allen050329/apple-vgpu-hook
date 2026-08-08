@@ -2527,6 +2527,39 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
 /// the buffer zero-copy floor and every page walkable into mappable runs.
 /// Deferred stores intersecting the span are landed first, exactly like the
 /// CPU path.
+///
+/// # The span is the rest of the allocation, and narrowing it is closed
+///
+/// `span` is `size - offset`: the bind's offset to the end of the guest
+/// allocation, not the range the draw reads. That is deliberate only in the
+/// sense that it is the widest safe answer — it was never measured against what
+/// a draw can actually reach until a `zcreach_*` census did it, and the census
+/// is gone because it answered on every axis. Do not rebuild it to re-ask; the
+/// answers, from a driven Safari-drag boot moving 2.74 GB/s on this rail:
+///
+/// * **Bound it by the vertex descriptor's stride and the draw's counts.** Only
+///   1.2 % of gathered bytes are bindable that way — but every one of those was
+///   at most 5 % of its span, so where the contract does bound a bind this
+///   gather is twenty times too wide. A small population with a large ratio.
+/// * **Bound it by the shader's declared argument size.** 67.5 % of the bytes
+///   are buffers Metal binds to the vertex stage through
+///   `setVertexBuffer:offset:atIndex:` that the pipeline's vertex descriptor
+///   never names — constant buffers, which no stride bounds. Their reflection
+///   carries `declared_size` but **no `type_name`** for 211 180 binds a boot,
+///   and without the name a `constant T&` (whose declared size is the bound)
+///   cannot be told from a `device T*` (whose declared size is one element the
+///   shader may index far past). Narrowing on the size alone is correct for the
+///   first and silently hands the GPU a short buffer for the second. This is a
+///   translator metadata gap, not a guest-contract fact: carrying the AIR
+///   argument type name is what would reopen ~46.5 GB of a boot's traffic.
+/// * **Bound an indexed draw.** 31.2 % of the bytes. `vertex_count` counts
+///   indices and an index names any vertex in the stream, so it means reading
+///   the index buffer — CPU work on the rail whose point is that the CPU does
+///   not touch these bytes.
+///
+/// The rail's real cost is not its width. 99.2 % of gathers re-copy a span this
+/// device already copied — see `note_gather_key_recurrence` in
+/// `backend::vulkan::engine::exec`.
 fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2668,280 +2701,6 @@ fn load_buffer_content<M: HostMemory + HostOps>(
     }
     let bytes = read_buffer_bytes_resolved(state, host, task_id, &backing, offset)?;
     Some(crate::backend::vulkan::engine::BufferContent::from(bytes))
-}
-
-/// Upper bound on the bytes this draw can read out of vertex-stage buffer
-/// `index`, measured from the bind's own offset. `Err` when the decoded contract
-/// does not bound it and the whole remaining allocation is the only safe answer;
-/// the variant says which, because on a driven boot that is where nearly all of
-/// the bytes are — see [`BindReachUnbounded`].
-///
-/// This is a *bound*, not an estimate, and every approximation in it is taken in
-/// the widening direction: a per-instance step rate above 1 is ignored (fewer
-/// elements are actually fetched than counted here), and an attribute whose
-/// format or step function does not translate abandons the whole bind rather
-/// than contributing a narrower number than its neighbours.
-fn vertex_bind_reach(
-    req: &DrawEncodeRequest,
-    attributes: &[crate::runtime::decode::resource::VertexAttribute],
-    index: u32,
-) -> Result<u64, BindReachUnbounded> {
-    let mut reach: Option<u64> = None;
-    for a in attributes.iter().filter(|a| a.buffer_index == index) {
-        if a.format == 0 {
-            continue;
-        }
-        let step = translate::vertex::step_function(a.declared_step_function)
-            .map_err(|_| BindReachUnbounded::UntranslatableStep)?;
-        let elements = match step {
-            crate::backend::vulkan::engine::VertexStepFunction::PerVertex => {
-                if req.indexed.is_some() {
-                    return Err(BindReachUnbounded::Indexed);
-                }
-                u64::from(req.first_vertex) + u64::from(req.vertex_count)
-            }
-            crate::backend::vulkan::engine::VertexStepFunction::PerInstance => {
-                u64::from(req.base_instance) + u64::from(req.instance_count)
-            }
-            crate::backend::vulkan::engine::VertexStepFunction::Constant => {
-                return Err(BindReachUnbounded::ConstantStep)
-            }
-        };
-        if elements == 0 {
-            continue;
-        }
-        let format = translate::vertex::attribute_format(a.format)
-            .map_err(|_| BindReachUnbounded::UntranslatableFormat)?;
-        let element_end = u64::from(a.offset) + u64::from(translate::vertex::byte_size(format));
-        let this = u64::from(a.stride)
-            .saturating_mul(elements - 1)
-            .saturating_add(element_end);
-        reach = Some(reach.map_or(this, |r: u64| r.max(this)));
-    }
-    reach.ok_or(BindReachUnbounded::NoAttribute)
-}
-
-/// Why the decoded contract does not bound a vertex-stage buffer bind.
-///
-/// Split out because the *reason* is the whole finding. A first driven boot put
-/// 98.7 % of the gathered bytes in one undifferentiated `unbounded` bucket, and
-/// that number is worth nothing on its own: `Indexed` says the index buffer
-/// would have to be read to narrow anything, while `NoAttribute` says the bind
-/// is not a vertex stream at all — a buffer the guest bound to the vertex stage
-/// through `setVertexBuffer:offset:atIndex:` that the pipeline's vertex
-/// descriptor never mentions, which is where a shader-declared size and not a
-/// stride is the bound. Those are different pieces of work with different risk,
-/// and one counter cannot tell them apart.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BindReachUnbounded {
-    /// A per-vertex attribute on an indexed draw. `vertex_count` counts indices
-    /// and an index names any vertex in the stream.
-    Indexed,
-    /// The engine prepends a CPU base-instance prefix to a `Constant`-step
-    /// stream, so the narrowed span is not the span the bind uses.
-    ConstantStep,
-    /// No attribute in the vertex descriptor names this buffer index, so
-    /// nothing here knows a stride. Typically a vertex-stage *constant* buffer
-    /// rather than a vertex stream.
-    NoAttribute,
-    /// The step function decoded to something this device declines to
-    /// translate — per-patch, or unknown.
-    UntranslatableStep,
-    /// The attribute format decoded to something outside the translate table.
-    UntranslatableFormat,
-}
-
-impl BindReachUnbounded {
-    /// Census slug. `&'static str` because that is what the route family takes,
-    /// and one arm per variant so a new reason cannot land in another's bucket.
-    fn route(self) -> (&'static str, &'static str) {
-        match self {
-            Self::Indexed => ("zcreach_unb_indexed", "zcreach_unb_indexed_kb"),
-            Self::ConstantStep => ("zcreach_unb_constant", "zcreach_unb_constant_kb"),
-            Self::NoAttribute => ("zcreach_unb_noattr", "zcreach_unb_noattr_kb"),
-            Self::UntranslatableStep => ("zcreach_unb_step", "zcreach_unb_step_kb"),
-            Self::UntranslatableFormat => ("zcreach_unb_format", "zcreach_unb_format_kb"),
-        }
-    }
-}
-
-/// Band a zero-copy vertex bind's *gathered* span against the reach the draw's
-/// own contract permits, into the `zcreach_*` route family.
-///
-/// The gather copies `size - offset` — everything from the bind offset to the
-/// end of the allocation — because that is the only span
-/// [`try_buffer_zero_copy_resolved`] has. On a driven boot that rail moves
-/// 2.74 GB/s at ~227 KB a gather, and nothing said how much of it a draw could
-/// read. AGENTS.md's rule for exactly this shape is to band the requested reach
-/// before narrowing anything, so this counts and does not act:
-///
-/// ```text
-/// zcreach_bounded / zcreach_unbounded      did the contract bound the bind
-/// zcreach_span_kb                          what the gather asks for
-/// zcreach_reach_kb                         what a bounded draw can read of it
-/// zcreach_le5 .. zcreach_full              the ratio, banded
-/// ```
-///
-/// `reach_kb / span_kb` over the bounded population is the number that says
-/// whether narrowing is worth its correctness risk. `unbounded_kb` is the half
-/// that cannot be narrowed at all, so a small `bounded` share caps the win no
-/// matter how favourable the ratio is.
-/// What the vertex stage's own reflection says a buffer bound at Metal index
-/// `index` is: the declared AIR argument byte size, and the AIR type name that
-/// says whether that size bounds the read or merely describes one element of it.
-///
-/// A `constant Uniforms& u [[buffer(2)]]` declares a size that *is* the bound.
-/// A `device float* p [[buffer(2)]]` may declare one too, and there it is the
-/// pointee's size while the shader indexes arbitrarily far past it — so the size
-/// alone is not the answer and the type name is carried beside it.
-fn vertex_stage_buffer_declaration(
-    reflection: &metal2vulkan::reflect::ShaderReflection,
-    index: u32,
-) -> Option<&metal2vulkan::reflect::ResourceBinding> {
-    reflection.bindings.iter().find(|b| {
-        b.kind == metal2vulkan::reflect::ResourceKind::Buffer && b.metal_index == index
-    })
-}
-
-/// Band the `NoAttribute` population against what the vertex shader's reflection
-/// declares for the same bind.
-///
-/// This is the bucket the split found: 67.5 % of every gathered byte, 232 147
-/// binds a boot at ~221 KB each, none of them a vertex stream. A stride cannot
-/// bound them because the vertex descriptor never mentions them — they are
-/// constant/storage buffers Metal binds through the same
-/// `setVertexBuffer:offset:atIndex:` call. What can bound them is the shader's
-/// own declared argument size, and this counts whether that size exists and how
-/// it compares to the span, without acting on either:
-///
-/// ```text
-/// zcreach_noattr_declared / _kb     the reflection carries a usable size
-/// zcreach_noattr_ptr / _kb          it does, but the argument is a pointer
-/// zcreach_noattr_unnamed / _kb      it does, but carries no type name
-/// zcreach_noattr_undeclared / _kb   it carries no size
-/// zcreach_noattr_unreflected / _kb  the binding is not in the reflection
-/// zcreach_noattr_d_le5 .. _full     declared size against the gathered span
-/// ```
-///
-/// The pointer split is the correctness line and it is why the size alone is not
-/// the finding. For a `constant T&` the declared size *is* the bound. For a
-/// `device T*` it is one element's size and the shader may index arbitrarily far
-/// past it, so narrowing on it would hand the GPU a short buffer and lose guest
-/// work silently. Only the first is a candidate.
-///
-/// # What a driven boot answers, and why this rail cannot be narrowed yet
-///
-/// `zcreach_noattr_declared` is **zero**. Not one bind in a Safari-drag boot
-/// reached the candidate arm:
-///
-/// ```text
-/// zcreach_noattr_unnamed       211 180 binds   46 542 590 KB
-/// zcreach_noattr_unreflected    19 726 binds    4 576 928 KB
-/// zcreach_noattr_undeclared         51 binds       10 869 KB
-/// zcreach_noattr_ptr                 0 binds            0 KB
-/// ```
-///
-/// So the blocker is not that these are pointers — none was *known* to be one.
-/// It is that the reflection carries `declared_size` without `type_name` for
-/// 211 180 of them, and with no name there is nothing to tell a `constant T&`
-/// from a `device T*`. Both spellings produce a size; only one of them is a
-/// bound. Narrowing on the size alone would be correct for the first and would
-/// silently hand the GPU a short buffer for the second.
-///
-/// That makes this a **translator metadata gap, not a guest-contract fact**, and
-/// it is the one lever here with a known shape: carrying the AIR argument type
-/// name through reflection for these bindings would put 46.5 GB of a boot's
-/// gather traffic — about two thirds of it — behind a decidable test. Until it
-/// is carried, the conservative arm is the only correct one, and this function
-/// counts rather than narrows.
-fn note_noattr_declaration(
-    reflection: &metal2vulkan::reflect::ShaderReflection,
-    index: u32,
-    span: u64,
-) {
-    use crate::runtime::drain::{note_store_route, note_store_route_n};
-    let Some(binding) = vertex_stage_buffer_declaration(reflection, index) else {
-        note_store_route("zcreach_noattr_unreflected");
-        note_store_route_n("zcreach_noattr_unreflected_kb", span / 1024);
-        return;
-    };
-    let Some(declared) = binding.declared_size.map(u64::from).filter(|&n| n > 0) else {
-        note_store_route("zcreach_noattr_undeclared");
-        note_store_route_n("zcreach_noattr_undeclared_kb", span / 1024);
-        return;
-    };
-    // A trailing `*` is AIR's own spelling of "this argument is a pointer", so
-    // the declared size describes the pointee and not the reach. Absent a type
-    // name there is nothing to rule the pointer case out, which is the same
-    // *answer* as knowing it is one — but not the same finding, so the two are
-    // counted apart. "The translator does not carry the name" is a gap that
-    // could be closed upstream; "the guest really passed a pointer" cannot.
-    match binding.type_name.as_deref().map(|n| n.trim_end()) {
-        Some(name) if name.ends_with('*') => {
-            note_store_route("zcreach_noattr_ptr");
-            note_store_route_n("zcreach_noattr_ptr_kb", span / 1024);
-            return;
-        }
-        None => {
-            note_store_route("zcreach_noattr_unnamed");
-            note_store_route_n("zcreach_noattr_unnamed_kb", span / 1024);
-            return;
-        }
-        Some(_) => {}
-    }
-    note_store_route("zcreach_noattr_declared");
-    note_store_route_n("zcreach_noattr_declared_kb", declared.min(span) / 1024);
-    note_store_route_n("zcreach_noattr_declared_span_kb", span / 1024);
-    note_store_route(match declared.min(span).saturating_mul(100) / span {
-        0 => "zcreach_noattr_d_lt1",
-        1..=4 => "zcreach_noattr_d_le5",
-        5..=9 => "zcreach_noattr_d_le10",
-        10..=24 => "zcreach_noattr_d_le25",
-        25..=49 => "zcreach_noattr_d_le50",
-        50..=98 => "zcreach_noattr_d_le99",
-        _ => "zcreach_noattr_d_full",
-    });
-}
-
-fn note_vertex_bind_reach(
-    req: &DrawEncodeRequest,
-    attributes: &[crate::runtime::decode::resource::VertexAttribute],
-    reflection: &metal2vulkan::reflect::ShaderReflection,
-    index: u32,
-    span: u64,
-) {
-    use crate::runtime::drain::{note_store_route, note_store_route_n};
-    if span == 0 {
-        return;
-    }
-    note_store_route_n("zcreach_span_kb", span / 1024);
-    // Clamped: a reach past the allocation is the guest's descriptor
-    // disagreeing with its own draw, and letting it exceed the span would make
-    // the ratio read above 100 % rather than saturating at "narrows nothing".
-    let reach = match vertex_bind_reach(req, attributes, index) {
-        Ok(reach) => reach.min(span),
-        Err(why) => {
-            let (count, kb) = why.route();
-            note_store_route("zcreach_unbounded");
-            note_store_route_n("zcreach_unbounded_kb", span / 1024);
-            note_store_route(count);
-            note_store_route_n(kb, span / 1024);
-            if why == BindReachUnbounded::NoAttribute {
-                note_noattr_declaration(reflection, index, span);
-            }
-            return;
-        }
-    };
-    note_store_route("zcreach_bounded");
-    note_store_route_n("zcreach_reach_kb", reach / 1024);
-    note_store_route(match reach.saturating_mul(100) / span {
-        0..=4 => "zcreach_le5",
-        5..=9 => "zcreach_le10",
-        10..=24 => "zcreach_le25",
-        25..=49 => "zcreach_le50",
-        50..=98 => "zcreach_le99",
-        _ => "zcreach_full",
-    });
 }
 
 /// Zero-copy linear sampled bind: resolve the texture's tight level-0 GVA
@@ -5302,18 +5061,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     },
                 ));
             };
-            // Only the zero-copy rail: `Bytes` was read by the CPU at the span
-            // the staging read chose, and banding it here would mix two
-            // populations under one ratio.
-            if let crate::backend::vulkan::engine::BufferContent::GuestRuns(ref src) = content {
-                note_vertex_bind_reach(
-                    req,
-                    &pd.vertex_attributes,
-                    &v_shader.reflection,
-                    b.index,
-                    src.total_len,
-                );
-            }
             vtx_storage.push((b.index, content));
         }
         drop(vertex_span);
@@ -7758,163 +7505,7 @@ fn gva_store_defer_eligible(req: &DrawEncodeRequest) -> bool {
 mod vulkan_split_tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
-    use crate::runtime::decode::resource::VertexAttribute;
     use crate::runtime::host::FakeHost;
-
-    /// `MTLVertexFormat.float2` — eight bytes, two 32-bit components. Named
-    /// rather than spelled `29` at four call sites below, and asserted against
-    /// the translate table so a renumbering fails here instead of silently
-    /// changing what the reach cases mean.
-    const FLOAT2: u32 = 29;
-    const FLOAT2_BYTES: u64 = 8;
-
-    fn attr(buffer_index: u32, offset: u32, stride: u32, step: Option<u32>) -> VertexAttribute {
-        VertexAttribute {
-            location: 0,
-            format: FLOAT2,
-            offset,
-            buffer_index,
-            stride,
-            declared_step_function: step,
-            ..VertexAttribute::default()
-        }
-    }
-
-    #[test]
-    fn the_float2_ordinal_this_files_reach_cases_use_is_still_float2() {
-        let f = translate::vertex::attribute_format(FLOAT2).expect("float2 must translate");
-        assert_eq!(
-            u64::from(translate::vertex::byte_size(f)),
-            FLOAT2_BYTES,
-            "the reach cases below are written against an eight-byte attribute"
-        );
-    }
-
-    /// A non-indexed per-vertex bind is bounded by `stride * (first + count)`,
-    /// which is the whole point: the gather asks for the rest of the allocation
-    /// and the draw can only reach this far into it.
-    #[test]
-    fn a_per_vertex_bind_reaches_exactly_its_last_elements_end() {
-        let req = DrawEncodeRequest {
-            vertex_count: 6,
-            first_vertex: 2,
-            instance_count: 1,
-            ..DrawEncodeRequest::default()
-        };
-        let attrs = [attr(0, 0, 16, Some(1))];
-        // Elements 0..=7 are fetchable (first_vertex is an offset into the
-        // stream, not a skip), so the last element starts at 7 * 16.
-        assert_eq!(
-            vertex_bind_reach(&req, &attrs, 0),
-            Ok(7 * 16 + FLOAT2_BYTES)
-        );
-    }
-
-    /// The attribute's own offset inside the stride counts, and several
-    /// attributes on one interleaved buffer take the furthest of them.
-    #[test]
-    fn an_interleaved_bind_reaches_the_furthest_attributes_end() {
-        let req = DrawEncodeRequest {
-            vertex_count: 4,
-            instance_count: 1,
-            ..DrawEncodeRequest::default()
-        };
-        let attrs = [attr(0, 0, 32, Some(1)), attr(0, 24, 32, Some(1))];
-        assert_eq!(
-            vertex_bind_reach(&req, &attrs, 0),
-            Ok(3 * 32 + 24 + FLOAT2_BYTES),
-            "the reach is the furthest attribute's end, not the first's"
-        );
-    }
-
-    /// An attribute on a *different* buffer index must not bound this one.
-    #[test]
-    fn a_bind_with_no_attribute_of_its_own_is_unbounded() {
-        let req = DrawEncodeRequest {
-            vertex_count: 4,
-            instance_count: 1,
-            ..DrawEncodeRequest::default()
-        };
-        let attrs = [attr(1, 0, 16, Some(1))];
-        assert_eq!(
-            vertex_bind_reach(&req, &attrs, 0),
-            Err(BindReachUnbounded::NoAttribute),
-            "nothing here knows buffer 0's stride"
-        );
-    }
-
-    /// The one that would lose guest work if it ever returned a number:
-    /// `vertex_count` counts indices, and the index values name arbitrary
-    /// vertices anywhere in the stream.
-    #[test]
-    fn an_indexed_draws_per_vertex_bind_is_unbounded() {
-        let req = DrawEncodeRequest {
-            vertex_count: 6,
-            instance_count: 1,
-            indexed: Some(IndexedDrawInfo::default()),
-            ..DrawEncodeRequest::default()
-        };
-        let attrs = [attr(0, 0, 16, Some(1))];
-        assert_eq!(
-            vertex_bind_reach(&req, &attrs, 0),
-            Err(BindReachUnbounded::Indexed),
-            "an index buffer can name any vertex in the stream"
-        );
-    }
-
-    /// A per-instance attribute is bounded by the instance range instead, and
-    /// an indexed draw does *not* unbound it — indices select vertices, not
-    /// instances.
-    #[test]
-    fn a_per_instance_bind_is_bounded_by_the_instance_range_even_when_indexed() {
-        let req = DrawEncodeRequest {
-            vertex_count: 999,
-            instance_count: 3,
-            base_instance: 1,
-            indexed: Some(IndexedDrawInfo::default()),
-            ..DrawEncodeRequest::default()
-        };
-        let attrs = [attr(0, 0, 64, Some(2))];
-        assert_eq!(
-            vertex_bind_reach(&req, &attrs, 0),
-            Ok(3 * 64 + FLOAT2_BYTES)
-        );
-    }
-
-    /// A `Constant`-step attribute abandons the bind. The engine prepends a CPU
-    /// base-instance prefix to those, so the span the gather would narrow is not
-    /// the span the bind ends up using.
-    #[test]
-    fn a_constant_step_bind_is_unbounded() {
-        let req = DrawEncodeRequest {
-            vertex_count: 4,
-            instance_count: 1,
-            ..DrawEncodeRequest::default()
-        };
-        let attrs = [attr(0, 0, 16, Some(0))];
-        assert_eq!(
-            vertex_bind_reach(&req, &attrs, 0),
-            Err(BindReachUnbounded::ConstantStep)
-        );
-    }
-
-    /// An untranslatable step function abandons the whole bind rather than
-    /// letting its neighbour's narrower number stand for the bind.
-    #[test]
-    fn an_untranslatable_step_function_abandons_the_bind() {
-        let req = DrawEncodeRequest {
-            vertex_count: 4,
-            instance_count: 1,
-            ..DrawEncodeRequest::default()
-        };
-        // 3 is per-patch, which this device declines to translate.
-        let attrs = [attr(0, 0, 16, Some(1)), attr(0, 0, 16, Some(3))];
-        assert_eq!(
-            vertex_bind_reach(&req, &attrs, 0),
-            Err(BindReachUnbounded::UntranslatableStep),
-            "a bind is bounded by every attribute on it or by none"
-        );
-    }
 
     /// The blank-with-host-entry loss must be reported as a subset of a
     /// population, not as a bare count.
