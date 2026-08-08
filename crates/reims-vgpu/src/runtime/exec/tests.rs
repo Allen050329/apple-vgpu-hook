@@ -4684,3 +4684,69 @@ fn a_visibility_count_lands_at_the_guest_offset_the_pass_named() {
         quiet + 1
     );
 }
+
+/// A render encoder's `updateFence:` and `waitForFence:` reach the render-fence
+/// domain.
+///
+/// The regression: this arm matched a *render* opcode against the blit
+/// encoder's fence constants. Each encoder numbers its selectors in its own
+/// space, so the comparison could never succeed, and every render fence the
+/// guest encoded went to the unknown-opcode arm and was dropped. The two pairs
+/// are far enough apart that no value collides, which is why this failed
+/// wholesale rather than intermittently.
+///
+/// Asserting on the generation store rather than on the absence of a log line:
+/// the store is what a later wait actually reads, so it is the thing whose loss
+/// costs the guest its ordering.
+#[test]
+fn a_render_encoder_fence_reaches_the_render_fence_domain() {
+    use crate::model::{FENCE_DOMAIN_BLIT, FENCE_DOMAIN_RENDER};
+    use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_RENDER};
+    use reims_vgpu_wire::ops::render as wire_render;
+
+    const FENCE_REF: u32 = 6464;
+    const STAGES_FRAGMENT: u32 = 2;
+
+    fn push_fence(buf: &mut Vec<u8>, opcode: u32, fence_ref: u32) {
+        let mut hdr = [0u8; 8];
+        st32(&mut hdr[0..4], opcode);
+        st32(&mut hdr[4..8], wire_render::FENCE_TOTAL_LEN);
+        buf.extend_from_slice(&hdr);
+        let mut payload = [0u8; 8];
+        st32(&mut payload[0..4], fence_ref);
+        st32(&mut payload[4..8], STAGES_FRAGMENT);
+        buf.extend_from_slice(&payload);
+    }
+
+    let mut records = Vec::new();
+    push_fence(&mut records, wire_render::OPCODE_UPDATE_FENCE, FENCE_REF);
+    push_fence(&mut records, wire_render::OPCODE_UPDATE_FENCE, FENCE_REF);
+    push_fence(&mut records, wire_render::OPCODE_WAIT_FOR_FENCE, FENCE_REF);
+
+    let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
+    let stream_len = stream.len() + records.len();
+    st32(&mut stream[0..4], stream_len as u32);
+    stream[4] = SEGMENT_TYPE_RENDER;
+    stream.extend_from_slice(&records);
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc);
+
+    // Two updates: the first seeds the generation, the second advances it. A
+    // dropped fence leaves `None` here, which is what this used to read.
+    assert_eq!(
+        state.fence_generation(1, FENCE_DOMAIN_RENDER, FENCE_REF),
+        Some(2),
+        "both updates landed on the render-fence domain"
+    );
+    // And they landed on the *render* domain specifically — the constants this
+    // arm used to compare against belong to the blit encoder.
+    assert_eq!(
+        state.fence_generation(1, FENCE_DOMAIN_BLIT, FENCE_REF),
+        None,
+        "a render fence does not touch the blit encoder's domain"
+    );
+}

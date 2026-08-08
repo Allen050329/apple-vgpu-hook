@@ -1999,9 +1999,17 @@ fn handle_render_record<M: HostMemory + HostOps>(
             });
         }
         RenderKind::Fence => {
+            // The render encoder's own fence opcodes, not the blit encoder's.
+            // Each encoder numbers its selectors in its own space and the two
+            // fence pairs are nowhere near each other, so matching a render
+            // opcode against `wire_blit`'s constants never succeeded and sent
+            // every render fence to the arm below. `updateFence:afterStages:`
+            // is what a guest uses to order work inside one render encoder
+            // against a later one, so what it dropped was encoder
+            // synchronisation on every pass that asked for it.
             let action = match cmd.opcode {
-                wire_blit::OPCODE_UPDATE_FENCE => FenceAction::Update,
-                wire_blit::OPCODE_WAIT_FOR_FENCE => FenceAction::Wait,
+                wire_render::OPCODE_UPDATE_FENCE => FenceAction::Update,
+                wire_render::OPCODE_WAIT_FOR_FENCE => FenceAction::Wait,
                 opcode => {
                     // A render fence record whose opcode is neither update nor
                     // wait drops the guest's encoder synchronisation. The
