@@ -169,6 +169,22 @@ clone_file() {
   cp -f "$src" "$dst"
 }
 
+# qemu-img's view of a file's format, for the -drive format= that QEMU must be told
+# explicitly. The provisioned images are whatever OSX-KVM produced and the paths here
+# are usually symlinks, so a name proves nothing: a raw OpenCore image reached through
+# an `OpenCore.qcow2` name and declared format=qcow2 fails with "Image is not in qcow2
+# format", which does not say that the name is what misled it.
+#
+# Matches the unindented `file format:` line, which qemu-img emits once for the image
+# itself; the indented ones under `Child node '/file'` describe the protocol layer
+# ("file") and would otherwise be picked up instead.
+image_format() {
+  local f="$1" fmt
+  fmt="$(qemu-img info -- "$f" 2>/dev/null | sed -n 's/^file format: *//p' | head -1)"
+  [ -n "$fmt" ] || die "cannot determine image format of $f (qemu-img info failed)"
+  printf '%s' "$fmt"
+}
+
 ensure_rust_tools() {
   if ! command -v cargo >/dev/null 2>&1 && [ -x "$HOME/.cargo/bin/cargo" ]; then
     export PATH="$HOME/.cargo/bin:$PATH"
@@ -275,6 +291,10 @@ else
   chmod u+w "$DISK" "$OPENCORE" "$OVMF_VARS"
 fi
 
+# Probed after the clone, so the format describes the file QEMU is actually handed.
+DISK_FORMAT="${DISK_FORMAT:-$(image_format "$DISK")}"
+OPENCORE_FORMAT="${OPENCORE_FORMAT:-$(image_format "$OPENCORE")}"
+
 # --- Network -------------------------------------------------------------------
 # SLIRP user-mode NAT; ipv6=off avoids a phantom IPv6 default that macOS prefers.
 NET="${NET:-user}"
@@ -313,9 +333,9 @@ QEMU_ARGS=(
   -device ich9-intel-hda
   -device hda-duplex
   -device ich9-ahci,id=sata
-  -drive "id=OpenCoreBoot,if=none,format=qcow2,file=$OPENCORE"
+  -drive "id=OpenCoreBoot,if=none,format=$OPENCORE_FORMAT,file=$OPENCORE"
   -device ide-hd,bus=sata.2,drive=OpenCoreBoot
-  -drive "id=MacHDD,if=none,format=qcow2,file=$DISK"
+  -drive "id=MacHDD,if=none,format=$DISK_FORMAT,file=$DISK"
   -device ide-hd,bus=sata.4,drive=MacHDD
   -qmp "unix:$QMP_SOCK,server=on,wait=off"
 )
