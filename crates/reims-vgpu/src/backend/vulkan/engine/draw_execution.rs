@@ -284,12 +284,16 @@ pub(super) fn identity_fields(identity: &TargetIdentity) -> Vec<(&'static str, S
             width,
             height,
             generation,
+            bgra,
         } => vec![
             ("identity_kind", "gva".into()),
             ("identity_gva", format!("{gva:#x}")),
             ("identity_width", width.to_string()),
             ("identity_height", height.to_string()),
             ("identity_generation", generation.to_string()),
+            // Part of the key, so two slots at one address differ by it and a
+            // decline naming only the address would not say which.
+            ("identity_order", if *bgra { "bgra" } else { "rgba" }.into()),
         ],
         TargetIdentity::Anonymous { slot } => vec![
             ("identity_kind", "anonymous".into()),
@@ -435,6 +439,7 @@ mod tests {
                     width: 80,
                     height: 60,
                     generation: 11,
+                    bgra: false,
                 },
                 "gva",
                 ("identity_gva", "0x1234"),

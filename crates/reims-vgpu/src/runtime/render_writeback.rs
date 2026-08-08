@@ -404,6 +404,12 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     };
     let want_bgra = order == TexelLayout::Bgra8;
     let resident_bgra = identity.is_bgra();
+    // A healthy zero on the rail as it stands: `gva_chain_identity` builds the
+    // key from this same `c0.format`, so the two agree by construction and this
+    // arm is the alarm for an identity that came from somewhere else. Kept
+    // rather than asserted because the answer it protects — whether the bytes
+    // about to be copied are the bytes the guest reads — is not one to take on
+    // trust from a caller.
     if resident_bgra != want_bgra {
         return Err(GvaWritebackDecline::OrderMismatch {
             resident_bgra,

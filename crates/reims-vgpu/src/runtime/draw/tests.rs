@@ -965,6 +965,7 @@ fn gva_chain_identity_rules() {
             width: 16,
             height: 16,
             generation: 0,
+            bgra: false,
         }),
         "color0 declares the extent"
     );
@@ -1021,6 +1022,7 @@ fn render_chain_identity_covers_type11_and_gva_targets() {
             width: 64,
             height: 32,
             generation: 0,
+            bgra: false,
         })
     );
 }
@@ -4122,6 +4124,7 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
         width: 64,
         height: 64,
         generation: 0,
+        bgra: false,
     };
 
     let mut host = crate::runtime::host::FakeHost::new();
@@ -4205,6 +4208,7 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
         width: 64,
         height: 64,
         generation: 0,
+        bgra: false,
     };
     let slot0 = ColorRtRequest {
         slot: 0,

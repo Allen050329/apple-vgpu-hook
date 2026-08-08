@@ -4278,6 +4278,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                     c.row_stride,
                     c.height,
                 ),
+                bgra: gva_resident_bgra(c.format),
             }
         } else if c.mapping_id != 0 {
             crate::runtime::present_identity::surface_identity(
@@ -6843,7 +6844,29 @@ pub(crate) fn gva_chain_identity(
         width: w,
         height: h,
         generation: req.gva_alloc_gen,
+        bgra: gva_resident_bgra(c0.format),
     })
+}
+
+/// Channel order the resident behind a GVA render target must hold: the one the
+/// guest declared for that attachment.
+///
+/// This is [`TargetIdentity::is_bgra`]'s rule applied to the one namespace that
+/// has a declaration to follow, and it is a function rather than an expression
+/// at each producer because the two producers key *the same registry slot*. A
+/// primary and a secondary attachment that spelled it differently would render
+/// into one identity claiming two orders, which `registry_ensure` answers by
+/// recreating the image every frame.
+///
+/// A format with no four-byte channel order — an `RGBA16_FLOAT` render target
+/// is the one a desktop boot names — answers RGBA. Its resident cannot be the
+/// destination's bytes at any order, so the Store converts on the CPU and the
+/// order is simply the engine's neutral one.
+fn gva_resident_bgra(format: u16) -> bool {
+    matches!(
+        pixel_format::store_texel_order(format),
+        Some(pixel_format::TexelLayout::Bgra8)
+    )
 }
 
 /// Read a resident render-pass chain back to host memory so the exec loop can
@@ -7473,6 +7496,7 @@ mod vulkan_split_tests {
             width: 64,
             height: 64,
             generation,
+            bgra: false,
         };
 
         assert_eq!(
@@ -8201,6 +8225,7 @@ mod vulkan_split_tests {
             width: 8,
             height: 8,
             generation: 0,
+            bgra: false,
         };
 
         let gen_of = |host: &mut FakeHost| {

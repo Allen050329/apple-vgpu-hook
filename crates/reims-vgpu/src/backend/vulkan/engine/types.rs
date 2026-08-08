@@ -1322,6 +1322,14 @@ pub enum TargetIdentity {
         width: u32,
         height: u32,
         generation: u64,
+        /// Channel order of this target's resident, from the pixel format the
+        /// guest declared for the attachment. See [`TargetIdentity::is_bgra`]
+        /// for why an order has to be part of the key rather than a per-draw
+        /// argument, and why this namespace is the one that carries it: a
+        /// surface is BGRA by its own contract and a pooled target has no
+        /// declaration to follow, but a GVA render target's declaration is the
+        /// whole answer.
+        bgra: bool,
     },
     /// Anonymous / no protocol identity (oracle / one-shot draws).
     Anonymous { slot: u64 },
@@ -1412,23 +1420,44 @@ impl TargetIdentity {
 
     /// Physical channel order of the resident image behind this identity.
     ///
-    /// A `Surface` resident backs a type-11 guest IOSurface, whose pages are
-    /// BGRA8 — so rendering it as `B8G8R8A8_UNORM` makes a raw image→buffer
-    /// readback land in guest scanout order and deletes the whole-frame CPU
-    /// swizzle the Store used to pay. Every other namespace stays RGBA.
+    /// The rule is one sentence: **a resident holds the bytes its destination
+    /// stores.** Rendering it that way makes a raw image→buffer copy land the
+    /// frame in guest memory unchanged, which is what deletes the whole-frame
+    /// CPU swizzle and the blocking readback in front of it.
+    ///
+    /// Each namespace answers it from what it knows:
+    ///
+    /// * `Surface` backs a type-11 guest IOSurface, whose pages are BGRA8 by
+    ///   that resource's own contract. Always BGRA.
+    /// * `Gva` is a render target the guest declared a pixel format for, and
+    ///   that declaration is the answer — carried in the key, from
+    ///   `pixel_format::store_texel_order`. Two allocations at one address
+    ///   declaring different formats are two keys and therefore two slots,
+    ///   which is what stops them recreating one image between them.
+    /// * `Texture` and `Anonymous` have no destination to follow — nothing
+    ///   copies them out to guest memory byte-for-byte — so they stay RGBA.
     ///
     /// This is a property of the *identity*, not of the draw, and that is the
     /// whole point: `ResourcePools::registry` is keyed by identity and
     /// `registry_ensure` destroys and recreates the image whenever a draw's
     /// requested order disagrees with the slot's. Several runtime paths render
-    /// into one surface identity in a frame — a composite Store, a chain
-    /// intermediate, an MRT primary — and deriving the order from the key they
-    /// already agree on is what makes them agree here too. A per-path
-    /// predicate would let one of them recreate the image every frame, which
-    /// reads as `target_evicts` climbing and costs a fresh allocation plus a
-    /// lost `content_ready` per composite.
+    /// into one identity in a frame — a composite Store, a chain intermediate,
+    /// an MRT primary — and deriving the order from the key they already agree
+    /// on is what makes them agree here too. A per-path predicate would let one
+    /// of them recreate the image every frame, which reads as `target_evicts`
+    /// climbing and costs a fresh allocation plus a lost `content_ready` per
+    /// composite.
+    ///
+    /// Nothing downstream of here assumes either order: the seed upload folds
+    /// an exchange into the staging copy when the seed and the attachment
+    /// disagree, and every readback reports the order it copied. The identity
+    /// is the only place the answer was pinned to a namespace.
     pub fn is_bgra(&self) -> bool {
-        matches!(self, Self::Surface { .. })
+        match self {
+            Self::Surface { .. } => true,
+            Self::Gva { bgra, .. } => *bgra,
+            Self::Texture { .. } | Self::Anonymous { .. } => false,
+        }
     }
 }
 
@@ -1665,20 +1694,23 @@ mod tests {
         assert!(compute.storage_images.is_empty());
     }
 
-    /// The order is a property of the identity's namespace, and the two halves
-    /// matter for different reasons.
+    /// The order is a property of the identity, and the three answers matter for
+    /// different reasons.
     ///
-    /// `Surface` must be BGRA: every CPU consumer of a type-11 composite Store is
-    /// declared in guest scanout order, so an RGBA resident costs a whole-frame
-    /// exchange per Store.
+    /// `Surface` must be BGRA whatever else is true: every CPU consumer of a
+    /// type-11 composite Store is declared in guest scanout order, so an RGBA
+    /// resident costs a whole-frame exchange per Store.
     ///
-    /// Everything else must *not* be, and that is the half a future edit is
-    /// likely to get wrong. `Gva` residents are read by
-    /// the GVA Store path into `write_gva_rgba8`, and `Anonymous`
-    /// covers the pooled path the parity suite uses as its semantic control —
-    /// flipping either silently exchanges R and B on a whole rail.
+    /// `Gva` must answer from its own field and from nothing else. That is the
+    /// half a future edit is likely to get wrong in either direction — pinning
+    /// it to `false` sends every BGRA-declared render target back through the
+    /// blocking readback, and pinning it to `true` silently exchanges R and B
+    /// on every RGBA-declared one.
+    ///
+    /// `Texture` and `Anonymous` must not be, and `Anonymous` in particular is
+    /// the pooled path the parity suite uses as its semantic control.
     #[test]
-    fn only_a_surface_identity_carries_guest_scanout_order() {
+    fn a_targets_order_follows_its_own_namespace() {
         assert!(TargetIdentity::Surface {
             id: 1,
             width: 8,
@@ -1686,13 +1718,17 @@ mod tests {
             generation: 0,
         }
         .is_bgra());
-        for other in [
-            TargetIdentity::Gva {
+        for bgra in [false, true] {
+            let gva = TargetIdentity::Gva {
                 gva: 0x1000,
                 width: 8,
                 height: 8,
                 generation: 0,
-            },
+                bgra,
+            };
+            assert_eq!(gva.is_bgra(), bgra, "{gva:?} must answer from its key");
+        }
+        for other in [
             TargetIdentity::Texture {
                 ref_: 2,
                 width: 8,
@@ -1703,5 +1739,30 @@ mod tests {
         ] {
             assert!(!other.is_bgra(), "{other:?} must stay semantic RGBA");
         }
+    }
+
+    /// Two allocations at one address declaring different formats are two keys.
+    ///
+    /// The order has to be *in* the key, not beside it. If it were not, both
+    /// would hash to one registry slot whose image can only be built one way,
+    /// and `registry_ensure` answers a requested order that disagrees with the
+    /// slot's by destroying and recreating the image — every frame, for as long
+    /// as both keep drawing.
+    #[test]
+    fn a_gva_targets_order_separates_it_from_the_same_address_in_the_other_order() {
+        let at = |bgra| TargetIdentity::Gva {
+            gva: 0x4000,
+            width: 64,
+            height: 64,
+            generation: 7,
+            bgra,
+        };
+        assert_ne!(at(true), at(false));
+        let mut seen = std::collections::HashSet::new();
+        assert!(seen.insert(at(true)));
+        assert!(
+            seen.insert(at(false)),
+            "the two orders must not collide in the registry's key space"
+        );
     }
 }
