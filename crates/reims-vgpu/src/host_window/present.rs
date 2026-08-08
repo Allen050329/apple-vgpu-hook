@@ -685,8 +685,10 @@ struct LoopCensus {
     window_started: std::time::Instant,
     /// `about_to_wait` entries: how often the loop woke at all.
     ticks: u64,
-    /// Ticks that asked the platform for a redraw, which is capped by
-    /// [`ENGINE_WINDOW_REDRAW_POLL`] rather than by the tick rate.
+    /// Ticks that asked the platform for a redraw. Bounded by published frames
+    /// plus [`ENGINE_WINDOW_REDRAW_BACKSTOP`] ticks rather than by the tick
+    /// rate, which is what [`redraw_due`] is for — a run where this tracks
+    /// `ticks` instead is a loop that has fallen back to polling.
     redraws_asked: u64,
     /// `RedrawRequested` deliveries. A gap between this and `redraws_asked` is
     /// the platform coalescing or delaying them, which the loop cannot see any

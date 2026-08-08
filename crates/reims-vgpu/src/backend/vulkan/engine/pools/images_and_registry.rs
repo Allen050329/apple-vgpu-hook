@@ -74,6 +74,41 @@ use super::*;
 /// at 1.0 s or at 1.9 s, and those are very different margins. This does not
 /// resolve it; it establishes that the question is live.
 ///
+/// # `past_cutoff` has since fired, and it does not mean what it was written to
+///
+/// Two later driven x86/PCI boots, window-drag probe, quiesced, the second on a
+/// guest running a page animation:
+///
+/// ```text
+///                        boot A     boot B
+///   resamples, all bands   48738     392534
+///   past_cutoff                1          4
+///   resample_peak_ms        2007       2005
+/// ```
+///
+/// So both signals the top of this doc and [`IDLE_TARGET_AGE_MS`] name as the
+/// argument for changing the drain are now non-zero, routinely, on ordinary
+/// desktop work. Read that as the margin being gone, which it is — and not as
+/// work being at risk, which it no longer is. Two things changed underneath the
+/// alarm since it was written:
+///
+/// - **The class it guarded is closed.** Every draw that stores into a target
+///   marks it sole-copy ([`ResourcePools::registry_mark_ready`]), and only a
+///   writeback clears it, so a resident the drain is *allowed* to take has
+///   demonstrably been copied out to the guest's own pages. What a reclaim costs
+///   is the re-fetch, not the pixels — and `sampled_resident_missing` was 0 on
+///   both boots above, as it must be.
+/// - **The re-fetch is the reading worth having**, and it is much larger than
+///   these four: `t11sample_reclaimed_from_pages` was 2085 and 1937 on the same
+///   two boots, with 88.5 % of boot A's coming back more than 8 s after the
+///   destroy. The drain is churning residents the workload returns to, while
+///   `peak_mib=81` and `slab_mib=39/136` say VRAM was under no pressure at all.
+///
+/// Neither of those is fixed by moving this cutoff, and
+/// [`IDLE_TARGET_AGE_MS`]'s own history says why a population gate is not the
+/// answer either. What they change is what a `past_cutoff` reading is evidence
+/// *of*: a cost, measurable in re-fetches, rather than an imminent loss.
+///
 /// # Reading the count against `resident_samples`
 ///
 /// The band total is about **twice** `sampled_gpu_binds` (25062 against 12531 on

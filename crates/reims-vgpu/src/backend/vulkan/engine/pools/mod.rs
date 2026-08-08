@@ -1329,6 +1329,14 @@ impl FreeTargetImage {
 /// `resample_peak_ms` reaching this value, both of which mean a resident
 /// survived only because the drain is throttled and had not reached it yet.
 ///
+/// **Both have since fired and neither reopened this.** Two driven x86/PCI
+/// boots, window-drag probe, quiesced: `past_cutoff` 1 of 48 738 resamples and
+/// 4 of 392 534, `resample_peak_ms` 2007 and 2005. `resident_resample_band`'s
+/// own doc carries why that is a cost rather than a risk — every resident the
+/// drain may take has been copied out to the guest's pages, so the reading to
+/// act on is `t11sample_reclaimed_from_pages` (2085 and 1937 on those boots) and
+/// not these four. Do not read a `past_cutoff` line as an imminent loss.
+///
 /// # Uncensored, this value is 3-5x too short — and the peak above could not
 /// have said so
 ///
