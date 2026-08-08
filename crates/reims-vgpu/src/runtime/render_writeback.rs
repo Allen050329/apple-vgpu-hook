@@ -15,8 +15,15 @@
 //! That coalescing was measured and it never occurred. Arms and lands were
 //! equal on every census line of an accumulated driven x86/Vulkan log — 193 458
 //! each across 1 780 lines, not one line differing — because no later Store
-//! ever fully covered a live window. A ratio pinned at 1.0 by the workload is
-//! not coalescing; it is the statement that none was available.
+//! ever fully covered a live window.
+//!
+//! **That 1.0 is a property of the land policy, not of the workload, and this
+//! doc used to read it the other way.** The window landed at the next completion
+//! stamp, and a stamp arrives so much more often than a repeat Store that no
+//! second Store could reach a window still live. A land point that frequent
+//! makes coalescing structurally impossible, so the ratio cannot distinguish "no
+//! coalescing was available" from "none was reachable". The measurement stands;
+//! the conclusion drawn from it does not, and the ablation below is what says so.
 //!
 //! # A second census agrees: this rail is close to one Store per surface
 //!
@@ -63,6 +70,62 @@
 //! which is what the two censuses above were each measuring. Whatever removes it
 //! has to look across the rails and across frames, not at the spacing of Stores
 //! inside one.
+//!
+//! # The contract does not ask for this copy at all
+//!
+//! Nothing in a render Store carries a region, and the search for one is over:
+//! the record has no origin, rect, row range or sequence field, and the guest
+//! driver's own dirty model has no sub-rect at any layer — a texture is dirtied
+//! by *(face, level)* and a buffer by *(start, length)*. The two candidate damage
+//! sources on our side were each measured and each said the same thing: the
+//! pass's stated render-target extent is the attachment restated (99.97 % `full`,
+//! see `exec::report::note_pass_extent_coverage`) and the union of a pass's
+//! scissors covers the attachment 99.92 % of the time
+//! (`draw::vulkan::note_pass_scissor_union`).
+//!
+//! The reason there is no region is that the reference host does not copy here.
+//! It builds the render target's own GPU resource directly over the guest's
+//! surface backing, so a Store makes the pixels guest-visible as a side effect of
+//! rendering, at no bandwidth. The only host-to-guest copy in the contract is a
+//! **whole-resource synchronize the guest asks for**, guarded per resource by a
+//! host-valid flag the guest also owns. This device already decodes both halves —
+//! the validity quad in `runtime::resource_validity`, and the synchronize command
+//! in `runtime::drain`.
+//!
+//! **A driven x86/Vulkan Safari-drag boot issues zero of them.** Not few: no
+//! resource-synchronize and no resource-invalidate command appears in the whole
+//! log. So on this workload the contract asks for no host-to-guest copy at all,
+//! and this device performs about 1 556 a second.
+//!
+//! # What ablating both rails measured
+//!
+//! A probe returned from the entry of each rail before writing anything, so no
+//! guest page was written and no copy was recorded, against the 67.8 Hz baseline
+//! of the same tree and machine that hour:
+//!
+//! | ablated | `present_hz` med | peak |
+//! |---|---|---|
+//! | nothing (shipping) | 67.8 | 71.9 |
+//! | the GVA Store only | 71.9 | 76.8 |
+//! | both rails | **86.0** | **108.3** |
+//!
+//! So ~4 Hz sits in the GVA rail's 928 Stores a second and ~14 Hz in this rail's
+//! 628 — this one is the smaller count and by far the larger cost.
+//!
+//! And the guest still draws. With **no** guest page written at all the desktop
+//! at rest is correct to the eye: menu bar, wallpaper, dock, and Safari's start
+//! page with every favicon. It degrades under a drag — the composite displaces
+//! and regions go black. Read that as "most of this traffic does not feed the
+//! display", not as "none of it does": the probe skipped the write *and* the
+//! bookkeeping a write publishes (`surface_cache::forget`, the residency-window
+//! invalidate, the write footprint), so some of the degradation is the probe's
+//! own and the split is not yet apportioned.
+//!
+//! The lever is therefore not a damage rect and not a different queue — see
+//! `backend::vulkan::engine::context`'s `dedicated_transfer_family` for the rail
+//! that was built to test the queue and measured nothing. It is landing this copy
+//! when something actually reads the bytes, which is what the contract does and
+//! what the deferred window above tried to do with the wrong land point.
 //!
 //! One caveat for whoever reads the witness this rail feeds:
 //! `MappingEntry::render_flush`'s doc quotes `render_flush_age_sub_ms` /
