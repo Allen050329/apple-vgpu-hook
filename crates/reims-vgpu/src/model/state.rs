@@ -89,6 +89,78 @@ impl ExecFault {
     }
 }
 
+/// A command the reference host dispatches to a handler, which this device
+/// decodes far enough to name but does not execute.
+///
+/// Kept apart from [`FailEvent::UnknownChildOpcode`] because the two say
+/// different things to whoever reads the log. An unknown opcode is a hole in
+/// this device's decode — nobody knows what the guest asked for. One of these is
+/// a command whose contract is known and whose effect this device has chosen not
+/// to implement, so the record names the command and the gap can be closed by
+/// writing the handler rather than by more reverse engineering.
+///
+/// The variants that carry no risk of losing guest work say so in their own
+/// docs. A reader ranking the fail log needs that distinction: the discard hint
+/// costs memory, the display-state commands cost a wrong panel state, and
+/// `DeleteObject` costs a leak of everything the guest asked to be torn down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnimplementedCommand {
+    /// `CmdDebug` (`0x00`). A host-side trace marker; nothing is owed.
+    Debug,
+    /// `CmdDisplaySleepState` (`0x09`). The guest's panel is entering or leaving
+    /// sleep and this device's display model does not move with it.
+    DisplaySleepState,
+    /// `CmdDisplaySetProperties` (`0x0a`). A display property the guest set and
+    /// this device does not apply.
+    DisplaySetProperties,
+    /// `CmdDelay` (`0x3d`). The guest asked the channel to be held; this device
+    /// continues immediately, which reorders nothing but can race a guest that
+    /// used the delay for settling.
+    Delay,
+    /// `CmdDeleteObject` (`0x28`). The guest's shared-object allocator is
+    /// retiring an object and this device keeps it — a leak, not a corruption,
+    /// but an unbounded one on a long boot.
+    DeleteObject,
+    /// The discard half of `CmdDiscardResources` (`0x3f`) and
+    /// `CmdSynchronizeAndDiscardResources` (`0x3e`). A hint that contents are no
+    /// longer needed; ignoring it costs memory and never correctness. The
+    /// synchronise half of `0x3e` *is* executed — see the drain's arm.
+    DiscardResources,
+    /// One of the reference host's retired opcodes. Its handler accepts the
+    /// packet and does nothing with the payload, so matching it is fidelity
+    /// rather than a gap — the record exists to say an old guest is still
+    /// emitting one.
+    Deprecated,
+}
+
+impl UnimplementedCommand {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Debug => "cmd_debug_unimplemented",
+            Self::DisplaySleepState => "cmd_display_sleep_state_unimplemented",
+            Self::DisplaySetProperties => "cmd_display_set_properties_unimplemented",
+            Self::Delay => "cmd_delay_unimplemented",
+            Self::DeleteObject => "cmd_delete_object_unimplemented",
+            Self::DiscardResources => "cmd_discard_resources_unimplemented",
+            Self::Deprecated => "cmd_deprecated",
+        }
+    }
+
+    /// Apple's own name for the command, so a reader can find it in the
+    /// dispatch table without going through this enum's spelling.
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::Debug => "CmdDebug",
+            Self::DisplaySleepState => "CmdDisplaySleepState",
+            Self::DisplaySetProperties => "CmdDisplaySetProperties",
+            Self::Delay => "CmdDelay",
+            Self::DeleteObject => "CmdDeleteObject",
+            Self::DiscardResources => "CmdDiscardResources",
+            Self::Deprecated => "CmdDeprecated",
+        }
+    }
+}
+
 /// How many leading payload words an unknown child opcode echoes. Four covers
 /// every unknown packet a driven boot has produced whole (the largest is 76
 /// bytes of which 64 are payload) while bounding the line for a command that
@@ -99,6 +171,41 @@ impl ExecFault {
 /// not the record has run out, which is why `plen` carries the true length
 /// beside it.
 const UNKNOWN_OPCODE_ECHO_WORDS_MAX: usize = 4;
+
+/// The wire fields a child packet this device did not execute reports, shared by
+/// the unknown-opcode and unimplemented-command records.
+///
+/// One spelling on purpose: the two records get read side by side and diffed
+/// against each other, so a copied field list here would become the next
+/// divergence the moment one of them grows a field.
+fn packet_echo_fields(
+    channel: u32,
+    opcode: u16,
+    total_size: u32,
+    stamp_count: u16,
+    payload: &[u8],
+) -> Vec<(&'static str, String)> {
+    let mut fields = vec![
+        ("ch", channel.to_string()),
+        ("opcode", format!("{opcode:#x}")),
+        ("total_size", total_size.to_string()),
+        ("stamps", stamp_count.to_string()),
+        ("plen", payload.len().to_string()),
+    ];
+    // Whole words only, in wire order, so a reader can line the echo up against
+    // the packet layout. A trailing sub-word tail is reported by `plen` rather
+    // than zero-padded into a word that the guest never wrote.
+    let words = payload
+        .chunks_exact(4)
+        .take(UNKNOWN_OPCODE_ECHO_WORDS_MAX)
+        .map(|word| format!("{:#010x}", crate::contract::endian::ld32(word)))
+        .collect::<Vec<_>>()
+        .join(":");
+    if !words.is_empty() {
+        fields.push(("payload", words));
+    }
+    fields
+}
 
 /// Fail-visible protocol event (unknown/malformed). Never invents semantics.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,6 +226,20 @@ pub enum FailEvent {
     /// beside this arm already reports for the opcodes it does decode.
     UnknownChildOpcode {
         channel: u32,
+        opcode: u16,
+        total_size: u32,
+        stamp_count: u16,
+        payload: Vec<u8>,
+    },
+    /// A command this device names but does not execute. See
+    /// [`UnimplementedCommand`] for why this is not the unknown-opcode arm.
+    ///
+    /// Carries the same wire fields as its neighbour above, because the two get
+    /// read side by side and a reader comparing them should not have to hold two
+    /// field lists in their head.
+    UnimplementedChildCommand {
+        channel: u32,
+        command: UnimplementedCommand,
         opcode: u16,
         total_size: u32,
         stamp_count: u16,
@@ -154,6 +275,10 @@ impl crate::observe::Decline for FailEvent {
         match self {
             Self::UnknownRootOpcode { .. } => "unknown_root_opcode",
             Self::UnknownChildOpcode { .. } => "unknown_child_opcode",
+            // Delegates for the same reason the malformed variants do: the
+            // command *is* the reason, so one slug per command beats one coarse
+            // slug the reader then has to disambiguate from the fields.
+            Self::UnimplementedChildCommand { command, .. } => command.slug(),
             // The malformed variants delegate: the specific check *is* the
             // fault, so forwarding keeps one slug per check instead of two
             // coarse ones that the reader would then have to disambiguate by
@@ -178,29 +303,21 @@ impl crate::observe::Decline for FailEvent {
                 total_size,
                 stamp_count,
                 payload,
+            } => packet_echo_fields(*channel, *opcode, *total_size, *stamp_count, payload),
+            Self::UnimplementedChildCommand {
+                channel,
+                command,
+                opcode,
+                total_size,
+                stamp_count,
+                payload,
             } => {
-                let mut fields = vec![
-                    ("ch", channel.to_string()),
-                    ("opcode", format!("{opcode:#x}")),
-                    ("total_size", total_size.to_string()),
-                    ("stamps", stamp_count.to_string()),
-                    ("plen", payload.len().to_string()),
-                ];
-                // Whole words only, in wire order, so a reader can line the echo
-                // up against the packet layout. A trailing sub-word tail is
-                // reported by `plen` rather than zero-padded into a word that
-                // the guest never wrote.
-                if !payload.is_empty() {
-                    let words = payload
-                        .chunks_exact(4)
-                        .take(UNKNOWN_OPCODE_ECHO_WORDS_MAX)
-                        .map(|word| format!("{:#010x}", crate::contract::endian::ld32(word)))
-                        .collect::<Vec<_>>()
-                        .join(":");
-                    if !words.is_empty() {
-                        fields.push(("payload", words));
-                    }
-                }
+                let mut fields =
+                    packet_echo_fields(*channel, *opcode, *total_size, *stamp_count, payload);
+                // Ahead of the wire fields: the command name is what a reader is
+                // scanning for, and it is the one thing this record has that the
+                // unknown-opcode record does not.
+                fields.insert(0, ("cmd", command.command().to_string()));
                 fields
             }
             Self::MalformedRootPacket { head, .. } => vec![("head", head.to_string())],

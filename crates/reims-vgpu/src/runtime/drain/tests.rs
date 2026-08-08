@@ -515,7 +515,7 @@ fn clear_only_present_captures_the_surface_the_transaction_names() {
         &mut state,
         &mut host,
         5,
-        &present_packet(CHILD_OP_PRESENT_X86, 2),
+        &present_packet(CHILD_OP_DISPLAY_TRANSACTION2, 2),
     );
 
     assert_eq!(state.present.present_mapping, 2, "guest names mid 2");
@@ -856,7 +856,7 @@ fn composite_named_present_captures_the_named_member_however_far_it_lags() {
     state.present.height = h;
 
     let present_named = |state: &mut DeviceState, host: &mut FakeHost, mid: u32| {
-        process_child_packet(state, host, 5, &present_packet(CHILD_OP_PRESENT_X86, mid));
+        process_child_packet(state, host, 5, &present_packet(CHILD_OP_DISPLAY_TRANSACTION2, mid));
     };
 
     // Healthy alternation: both members publish, the named member is captured.
@@ -1062,7 +1062,7 @@ fn composite_present_sets_frame_flush_boundary() {
     }
     state.note_surface_composite(4);
 
-    let pkt = present_packet(CHILD_OP_PRESENT_X86, 4);
+    let pkt = present_packet(CHILD_OP_DISPLAY_TRANSACTION2, 4);
     process_child_packet(&mut state, &mut host, 5, &pkt);
     assert!(state.present.frame_flush_seen);
     assert_coalesced_paint_action(&host, "composite sets flush boundary");
@@ -1127,7 +1127,7 @@ fn present_x86_op6_paints_surface_id_mapping() {
         &mut state,
         &mut host,
         5,
-        &present_packet(CHILD_OP_PRESENT_X86, 5),
+        &present_packet(CHILD_OP_DISPLAY_TRANSACTION2, 5),
     );
     assert_eq!(state.present.present_mapping, 5);
     assert!(state.present.frame_flush_seen);
@@ -1342,11 +1342,11 @@ fn child_drain_yields_after_present_for_display_consumer() {
     assert!(state.map_surface(4));
     assert!(state.set_mapping_geom(4, 2, 2, MTL_FORMAT_BGRA8_UNORM));
 
-    let mut payload = vec![0u8; display_txn_trailer_len(CHILD_OP_PRESENT_X86)];
-    payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
+    let mut payload = vec![0u8; display_txn_trailer_len(CHILD_OP_DISPLAY_TRANSACTION2)];
+    payload[DISPLAY_TRANSACTION2_SURFACE_ID..DISPLAY_TRANSACTION2_SURFACE_ID + 4]
         .copy_from_slice(&4u32.to_le_bytes());
-    let first = packet_bytes(CHILD_OP_PRESENT_X86, 21, &payload);
-    let second = packet_bytes(CHILD_OP_PRESENT_X86, 22, &payload);
+    let first = packet_bytes(CHILD_OP_DISPLAY_TRANSACTION2, 21, &payload);
+    let second = packet_bytes(CHILD_OP_DISPLAY_TRANSACTION2, 22, &payload);
     let mut ring = first.clone();
     ring.extend_from_slice(&second);
     host.write_gpa(ring_gpa, &ring).unwrap();
@@ -3668,7 +3668,7 @@ fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
     let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let fence = |plen: usize| Packet {
-        opcode: CHILD_OP_FLUSH_CHANNEL_EVENT,
+        opcode: CHILD_OP_NOP,
         stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + plen as u32,
         completion_stamp: 0,
@@ -3692,7 +3692,7 @@ fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
         !state.fails.iter().any(|e| matches!(
             e,
             FailEvent::UnknownChildOpcode {
-                opcode: CHILD_OP_FLUSH_CHANNEL_EVENT,
+                opcode: CHILD_OP_NOP,
                 ..
             }
         )),
@@ -3730,8 +3730,8 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
 
     // Every command at exactly its declared trailer is conformant and silent.
     let quiet = store_route_count("display_txn_payload_overlong");
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, 0x0c));
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_GAMMA_X86, 0x24));
+    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 0x0c));
+    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION3, 0x24));
     note_display_txn_payload(&mut state, 4, &packet(CHILD_OP_DISPLAY_SWAP, 0x0c));
     assert_eq!(
         store_route_count("display_txn_payload_overlong"),
@@ -3742,7 +3742,7 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
 
     // A payload past the trailer is the one thing that falsifies the decode.
     for _ in 0..8 {
-        note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, 64));
+        note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 64));
     }
     assert_eq!(
         store_route_count("display_txn_payload_overlong"),
@@ -3757,7 +3757,7 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
 
     // The gamma variant's trailer is larger, so 0x24 is conformant there while
     // the same length would be overlong for op6 - the sizes are per command.
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, 0x24));
+    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 0x24));
     assert_eq!(
         state.display.txn_payload_samples.len(),
         2,
@@ -3827,7 +3827,7 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
     // op6 does serialize a transaction, so the plane-list reading is its own
     // and must survive. Same alarm, different explanation.
     let cap = crate::observe::FailCapture::start();
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, vec![7u8; 64]));
+    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, vec![7u8; 64]));
     let lines = cap.lines();
     let line = lines
         .iter()
@@ -3845,7 +3845,7 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
     note_display_txn_payload(
         &mut state,
         5,
-        &packet(CHILD_OP_PRESENT_X86, vec![0u8; 4096]),
+        &packet(CHILD_OP_DISPLAY_TRANSACTION2, vec![0u8; 4096]),
     );
     let lines = cap.lines();
     let line = lines
@@ -3874,12 +3874,12 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
 fn display_txn_trailer_slots_follow_the_emitting_command() {
     // command 6: [pipe][surface][task] — surface in slot 1, task in slot 2.
     assert_eq!(
-        display_txn_trailer_slots(CHILD_OP_PRESENT_X86),
+        display_txn_trailer_slots(CHILD_OP_DISPLAY_TRANSACTION2),
         (1, Some(2))
     );
     // command 7: [pipe][task][surface][gamma…] — the two are swapped.
     assert_eq!(
-        display_txn_trailer_slots(CHILD_OP_PRESENT_GAMMA_X86),
+        display_txn_trailer_slots(CHILD_OP_DISPLAY_TRANSACTION3),
         (2, Some(1))
     );
     // command 8 `CmdDisplaySwapMapping` is not a transaction at all: it names
@@ -3892,8 +3892,8 @@ fn display_txn_trailer_slots_follow_the_emitting_command() {
     );
     // The present path reads the same field the census does, for every command.
     for (op, off) in [
-        (CHILD_OP_PRESENT_X86, PRESENT_X86_SURFACE_ID),
-        (CHILD_OP_PRESENT_GAMMA_X86, PRESENT_GAMMA_X86_SURFACE_ID),
+        (CHILD_OP_DISPLAY_TRANSACTION2, DISPLAY_TRANSACTION2_SURFACE_ID),
+        (CHILD_OP_DISPLAY_TRANSACTION3, DISPLAY_TRANSACTION3_SURFACE_ID),
         (CHILD_OP_DISPLAY_SWAP, DISPLAY_SWAP_MAPPING),
     ] {
         let mut p = vec![0u8; display_txn_trailer_len(op)];
@@ -3916,7 +3916,7 @@ fn display_txn_trailer_slots_follow_the_emitting_command() {
     gamma.extend_from_slice(&0x2au32.to_le_bytes()); // surface
     gamma.resize(0x24, 0);
     assert_eq!(
-        present_surface_id(CHILD_OP_PRESENT_GAMMA_X86, &gamma),
+        present_surface_id(CHILD_OP_DISPLAY_TRANSACTION3, &gamma),
         Some(0x2a),
         "gamma's surface is the third word; the second is its task"
     );
@@ -3927,7 +3927,7 @@ fn display_txn_trailer_slots_follow_the_emitting_command() {
     plain.extend_from_slice(&9u32.to_le_bytes()); // task
     plain.resize(0x0c, 0);
     assert_eq!(
-        present_surface_id(CHILD_OP_PRESENT_X86, &plain),
+        present_surface_id(CHILD_OP_DISPLAY_TRANSACTION2, &plain),
         Some(0x2a),
         "the plain command's surface is the second word; the third is its task"
     );
@@ -3941,8 +3941,8 @@ fn display_txn_trailer_slots_follow_the_emitting_command() {
 /// payload that does carry an inline plane list would still look trailer-only.
 #[test]
 fn display_txn_trailer_width_matches_the_emitting_command() {
-    assert_eq!(display_txn_trailer_len(CHILD_OP_PRESENT_X86), 0x0c);
-    assert_eq!(display_txn_trailer_len(CHILD_OP_PRESENT_GAMMA_X86), 0x24);
+    assert_eq!(display_txn_trailer_len(CHILD_OP_DISPLAY_TRANSACTION2), 0x0c);
+    assert_eq!(display_txn_trailer_len(CHILD_OP_DISPLAY_TRANSACTION3), 0x24);
     assert_eq!(display_txn_trailer_len(CHILD_OP_DISPLAY_SWAP), 0x0c);
 }
 
@@ -4286,7 +4286,7 @@ fn every_short_control_packet_names_itself() {
 
     for (opcode, need) in [
         (CHILD_OP_SET_OBJECT_LIST, SET_OBJECT_LIST_LEN),
-        (CHILD_OP_DELETE_OBJECT, 8),
+        (CHILD_OP_DELETE_RESOURCE, 8),
         (CHILD_OP_CURSOR_SHOW, 8),
         (CHILD_OP_SETUP_SHARED_STATE, CHILD_SHARED_STATE_LEN),
         // Both FIFOs carry DEFINE_TASK2 and one function handles both, so the
@@ -4797,5 +4797,267 @@ fn a_packets_stamp_records_are_decoded_and_the_payload_starts_after_them() {
         PacketError::BadSize,
         "a stamp count the packet cannot hold is refused before any record is \
          reached, which is what bounds the skip without a constant"
+    );
+}
+
+/// Every command the reference host dispatches names itself when this device
+/// declines it, instead of arriving as an undecodable opcode.
+///
+/// The host's FIFO drain bounds the header opcode at [`CHILD_OP_MAX`] and
+/// indexes one flat table, so each of these numbers reaches a real handler with
+/// a real contract. Landing them in the unknown-opcode arm said the opposite —
+/// that this device could not tell what the guest had asked for — and for
+/// `CmdDeleteObject` it said nothing at all, because that arm was a silent
+/// no-op named for a present it never performed.
+///
+/// The assertion is the pair: the typed record names the command, *and* no
+/// unknown-opcode record is raised for the same packet. Only checking the first
+/// would pass on a device that raised both.
+#[test]
+fn a_dispatched_command_this_device_declines_names_itself() {
+    let mut host = FakeHost::new();
+    for (opcode, expected) in [
+        (CHILD_OP_DEBUG, UnimplementedCommand::Debug),
+        (
+            CHILD_OP_DISPLAY_SLEEP_STATE,
+            UnimplementedCommand::DisplaySleepState,
+        ),
+        (
+            CHILD_OP_DISPLAY_SET_PROPERTIES,
+            UnimplementedCommand::DisplaySetProperties,
+        ),
+        (CHILD_OP_DELAY, UnimplementedCommand::Delay),
+        (CHILD_OP_DELETE_OBJECT, UnimplementedCommand::DeleteObject),
+    ] {
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        // Eight bytes is the payload floor the host checks for the two display
+        // commands, so the packets are conformant and the decline is about the
+        // execution and not about the shape.
+        let mut payload = vec![0u8; 8];
+        st32(&mut payload[0..], 0x11);
+        st32(&mut payload[4..], 0x22);
+        let pkt = Packet {
+            opcode,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + 8,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        };
+        assert_eq!(
+            process_child_packet(&mut state, &mut host, 2, &pkt),
+            ChildPacketDisposition::Complete,
+            "{opcode:#x}: the stamps still retire, or the guest waits forever"
+        );
+        assert!(
+            state.fails.iter().any(|e| matches!(
+                e,
+                FailEvent::UnimplementedChildCommand { command, opcode: op, .. }
+                    if *command == expected && *op == opcode
+            )),
+            "{opcode:#x} must be reported as {} and not swallowed; got {:?}",
+            expected.command(),
+            state.fails
+        );
+        assert!(
+            !state
+                .fails
+                .iter()
+                .any(|e| matches!(e, FailEvent::UnknownChildOpcode { .. })),
+            "{opcode:#x} is a command with a handler in the host's table, so it \
+             must not also read as undecodable"
+        );
+    }
+}
+
+/// The host's retired slots are reported as retired, not as undecodable.
+///
+/// Fifteen opcodes share one deprecated handler on the reference host: it
+/// accepts the packet, ignores the payload and retires the stamps. A guest still
+/// emitting one is an old guest, which is a different thing from a guest sending
+/// something this device cannot decode — and the two used to produce the same
+/// record.
+///
+/// Driven off [`CHILD_DEPRECATED_OPS`] rather than a second list, so a slot
+/// added there cannot be left without an arm.
+#[test]
+fn a_retired_slot_is_reported_as_retired_and_not_as_undecodable() {
+    let mut host = FakeHost::new();
+    for opcode in CHILD_DEPRECATED_OPS {
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        let pkt = Packet {
+            opcode,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN,
+            completion_stamp: 0,
+            payload: Vec::new(),
+            next_head: 0,
+        };
+        assert_eq!(
+            process_child_packet(&mut state, &mut host, 2, &pkt),
+            ChildPacketDisposition::Complete
+        );
+        assert!(
+            state.fails.iter().any(|e| matches!(
+                e,
+                FailEvent::UnimplementedChildCommand {
+                    command: UnimplementedCommand::Deprecated,
+                    opcode: op,
+                    ..
+                } if *op == opcode
+            )),
+            "{opcode:#x} is one of the host's retired slots; got {:?}",
+            state.fails
+        );
+        assert!(
+            !state
+                .fails
+                .iter()
+                .any(|e| matches!(e, FailEvent::UnknownChildOpcode { .. })),
+            "{opcode:#x} has a handler on the host, so it is not undecodable"
+        );
+    }
+}
+
+/// `CmdSynchronizeAndDiscardResources` and `CmdDiscardResources` carry the same
+/// record layout as `CmdSynchronizeResources`, and this device reads all three
+/// with one decoder.
+///
+/// The reference host validates the three with byte-for-byte the same check —
+/// `{u32 task, u32 count}` then `count` four-byte object ids — so a payload that
+/// is well-formed for one is well-formed for all of them. The way to prove these
+/// two reach that decoder rather than being waved through is to hand them a
+/// payload that *fails* it: a count the packet has no room for. A swallowed
+/// command would report nothing.
+///
+/// The synchronise half of `0x3e` is not asserted here because it is a no-op
+/// when no writeback is outstanding, which is every unit test; what is asserted
+/// is that the packet went through the arm that performs it.
+#[test]
+fn the_discarding_commands_share_the_synchronize_record_layout() {
+    use crate::runtime::decode::fifo::ResourceListDecodeError;
+    let mut host = FakeHost::new();
+    // One record: header plus a single four-byte object id.
+    let mut good = vec![0u8; 12];
+    st32(&mut good[0..], 7); // task
+    st32(&mut good[4..], 1); // count
+    st32(&mut good[8..], 0x2a); // object id
+    // The same header claiming four records in a packet that holds one.
+    let mut liar = good.clone();
+    st32(&mut liar[4..], 4);
+
+    for opcode in [
+        CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES,
+        CHILD_OP_DISCARD_RESOURCES,
+    ] {
+        let packet = |payload: &Vec<u8>| Packet {
+            opcode,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload: payload.clone(),
+            next_head: 0,
+        };
+
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        assert_eq!(
+            process_child_packet(&mut state, &mut host, 2, &packet(&good)),
+            ChildPacketDisposition::Complete
+        );
+        assert!(
+            state.fails.iter().any(|e| matches!(
+                e,
+                FailEvent::UnimplementedChildCommand {
+                    command: UnimplementedCommand::DiscardResources,
+                    ..
+                }
+            )),
+            "{opcode:#x}: the discard this device does not act on must be visible"
+        );
+        assert!(
+            !state
+                .fails
+                .iter()
+                .any(|e| matches!(e, FailEvent::UnknownChildOpcode { .. })),
+            "{opcode:#x} has a handler on the host and a decoder here"
+        );
+
+        // The malformed one proves the payload reached the decoder.
+        let cap = crate::observe::FailCapture::start();
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        process_child_packet(&mut state, &mut host, 2, &packet(&liar));
+        let line = cap.one("map_family");
+        assert!(
+            line.contains(&format!(
+                "reason={}",
+                crate::observe::Decline::slug(&ResourceListDecodeError::Truncated {
+                    count: 4,
+                    plen: 12,
+                    need: 24,
+                })
+            )),
+            "{opcode:#x}: a record layout the guest and this device disagree on \
+             must name the check that refused; got {line}"
+        );
+    }
+}
+
+/// An opcode above the host's dispatch ceiling is reported apart from one that
+/// is merely unassigned.
+///
+/// Both leave the guest's work undone, and both raise the unknown-opcode record,
+/// so on their own they read identically. They are not the same event: an
+/// unassigned slot in range is a guest asking for a command this host generation
+/// does not have, while a value the reference host refuses before it indexes its
+/// table means the header itself is wrong — a desynced ring or a corrupt packet,
+/// which is a transport bug and not a missing feature.
+#[test]
+fn an_opcode_past_the_dispatch_ceiling_is_reported_apart_from_an_unassigned_slot() {
+    let mut host = FakeHost::new();
+    let packet = |opcode: u16| Packet {
+        opcode,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN,
+        completion_stamp: 0,
+        payload: Vec::new(),
+        next_head: 0,
+    };
+
+    // 0x0b is inside the ceiling and has no handler on the reference host.
+    let cap = crate::observe::FailCapture::start();
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    process_child_packet(&mut state, &mut host, 2, &packet(0x0b));
+    assert!(
+        state
+            .fails
+            .iter()
+            .any(|e| matches!(e, FailEvent::UnknownChildOpcode { opcode: 0x0b, .. })),
+        "an unassigned in-range slot is still an unknown opcode"
+    );
+    assert!(
+        !cap.lines()
+            .iter()
+            .any(|l| l.starts_with("child_opcode_out_of_range")),
+        "an in-range opcode is not a malformed header; got {:?}",
+        cap.lines()
+    );
+    drop(cap);
+
+    let cap = crate::observe::FailCapture::start();
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    process_child_packet(&mut state, &mut host, 2, &packet(CHILD_OP_MAX + 1));
+    let line = cap.one("child_opcode_out_of_range");
+    assert!(
+        line.contains(&format!("opcode={:#x}", CHILD_OP_MAX + 1))
+            && line.contains(&format!("max={CHILD_OP_MAX:#x}")),
+        "the line has to carry both the value and the ceiling it broke; got {line}"
+    );
+    assert!(
+        state
+            .fails
+            .iter()
+            .any(|e| matches!(e, FailEvent::UnknownChildOpcode { .. })),
+        "the guest's work is still lost, so the record it shares with an \
+         unassigned slot is still raised"
     );
 }

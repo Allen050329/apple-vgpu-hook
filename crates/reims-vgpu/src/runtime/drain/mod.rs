@@ -9,7 +9,7 @@ use crate::contract::iosurface_pages::{
     MAPPER_REQUEST_UNMAP,
 };
 use crate::model::*;
-use crate::model::{DeviceState, ExecFault, FailEvent, PacketFault};
+use crate::model::{DeviceState, ExecFault, FailEvent, PacketFault, UnimplementedCommand};
 use crate::observe::Emit;
 use crate::runtime::decode::fifo::{
     display_refresh_hz_1616, display_timing_entry_offset, encode_display_timing_entry,
@@ -346,7 +346,7 @@ fn define_task_length(payload: &[u8]) -> u64 {
 /// resource list: `[pipe][task][surface][gamma…]` for the gamma command,
 /// `[pipe][surface][task]` otherwise.
 fn display_txn_trailer_len(opcode: u16) -> usize {
-    if opcode == CHILD_OP_PRESENT_GAMMA_X86 {
+    if opcode == CHILD_OP_DISPLAY_TRANSACTION3 {
         0x24
     } else {
         0x0c
@@ -359,9 +359,11 @@ fn display_txn_trailer_len(opcode: u16) -> usize {
 /// These are three different FIFO commands, not one shape with variations, so
 /// nothing here may be assumed from one opcode to another:
 ///
-/// - op6 `CmdDisplayTransaction3` — `[pipe][surface][task]`.
-/// - op7, its gamma variant — `[pipe][task][surface][gamma…]`; the first two
-///   words are swapped relative to op6.
+/// - op6 `CmdDisplayTransaction2_DEPRECATED` — `[pipe][surface][task]`.
+/// - op7 `CmdDisplayTransaction3` — `[pipe][task][surface][gamma…]`; the first
+///   two words are swapped relative to op6, and the gamma table follows. The two
+///   are separate commands with separate handlers, not one command with a
+///   variant flag, which is why the trailer differs at all.
 /// - op8 `CmdDisplaySwapMapping` — `[display][_][mapping]`. This one names a
 ///   single mapping instead of serializing a transaction, so its surface word
 ///   is `DISPLAY_SWAP_MAPPING` (0x08), *not* op6's 0x04, and it has no known
@@ -374,9 +376,9 @@ fn display_txn_trailer_len(opcode: u16) -> usize {
 /// differently.
 fn display_txn_trailer_slots(opcode: u16) -> (usize, Option<usize>) {
     match opcode {
-        CHILD_OP_PRESENT_GAMMA_X86 => (PRESENT_GAMMA_X86_SURFACE_ID / 4, Some(1)),
+        CHILD_OP_DISPLAY_TRANSACTION3 => (DISPLAY_TRANSACTION3_SURFACE_ID / 4, Some(1)),
         CHILD_OP_DISPLAY_SWAP => (DISPLAY_SWAP_MAPPING / 4, None),
-        _ => (PRESENT_X86_SURFACE_ID / 4, Some(2)),
+        _ => (DISPLAY_TRANSACTION2_SURFACE_ID / 4, Some(2)),
     }
 }
 
@@ -411,9 +413,10 @@ fn present_surface_id(opcode: u16, payload: &[u8]) -> Option<u32> {
 /// transaction by taking **plane 0's** IOSurface and writing that one id into a
 /// fixed-size command. There is no plane list on the wire, so decoding one
 /// surface is the whole contract rather than a first approximation of it. The
-/// command is 12 bytes for `CmdDisplayTransaction3` and 36 for its gamma
-/// variant, which is what [`display_txn_trailer_len`] returns, and the field
-/// order differs between them exactly as [`display_txn_trailer_slots`] says.
+/// command is 12 bytes for `CmdDisplayTransaction2_DEPRECATED` and 36 for
+/// `CmdDisplayTransaction3`, which is what [`display_txn_trailer_len`] returns,
+/// and the field order differs between them exactly as
+/// [`display_txn_trailer_slots`] says.
 ///
 /// The same reading settles the third word. It is the id of the paravirt task
 /// that owns the presented surface, taken from the display pipe's own resource
@@ -433,8 +436,8 @@ fn present_surface_id(opcode: u16, payload: &[u8]) -> Option<u32> {
 ///
 /// # The plane-list reading is op6/op7's, and only op6/op7's
 ///
-/// Everything above is about `submitTransaction`, which is what op6
-/// `CmdDisplayTransaction3` and its gamma variant op7 emit. **op8
+/// Everything above is about `submitTransaction`, whose two legs emit op6
+/// `CmdDisplayTransaction2_DEPRECATED` and op7 `CmdDisplayTransaction3`. **op8
 /// `CmdDisplaySwapMapping` does not serialize a transaction at all** — it names
 /// a single mapping, as [`display_txn_trailer_slots`] says — so it has no plane
 /// list to grow and "a plane list may have appeared" cannot be true of it.
@@ -758,7 +761,7 @@ fn packet_snapshot_len(header: &[u8], available: u32, ring_capacity: u32) -> u32
 /// **The ten commands that carry one are not a random ten.** They are work
 /// submission (`CHILD_OP_EXEC_INDIRECT2`), explicit synchronisation
 /// (`CHILD_OP_SYNCHRONIZE_RESOURCES`), presentation, and then the teardown
-/// set — `CHILD_OP_DELETE_TASK`, `CHILD_OP_DELETE_OBJECT`,
+/// set — `CHILD_OP_DELETE_TASK`, `CHILD_OP_DELETE_RESOURCE`,
 /// `CHILD_OP_UNMAP_MEMORY`. That is the list of commands whose ordering
 /// *against GPU work* is the thing that matters, and three of them free or
 /// unmap memory the GPU may still be reading. A record on an unmap is either
@@ -804,7 +807,7 @@ fn packet_snapshot_len(header: &[u8], available: u32, ring_capacity: u32) -> u32
 /// **So skipping them is an ordering bug, and the opcode list above is exactly
 /// its blast radius.** The stamps do eventually get written, so this is not a
 /// hang; it is work running ahead of the work it was ordered behind.
-/// `CHILD_OP_DELETE_TASK`, `CHILD_OP_DELETE_OBJECT` and
+/// `CHILD_OP_DELETE_TASK`, `CHILD_OP_DELETE_RESOURCE` and
 /// `CHILD_OP_UNMAP_MEMORY` tear down memory the GPU may still be sourcing, which
 /// makes ignoring their records a use-after-free of guest pages — the same class
 /// as the completion-stamp ordering [`write_stamp`] already carries a flush for,
@@ -2496,7 +2499,8 @@ fn log_present_page_identity(state: &DeviceState, mapping: u32, w: u32, h: u32) 
     }
 }
 
-/// Present a named mapping to the host console (DisplaySwap / x86 present op6/7).
+/// Present a named mapping to the host console (op8 DisplaySwapMapping, or the
+/// x86 display pipe's op6/op7 transactions).
 fn present_named_mapping<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -2848,7 +2852,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
         CHILD_OP_SET_OBJECT_LIST => {
             apply_set_object_list(state, &packet.payload, Some(channel_id));
         }
-        CHILD_OP_DELETE_OBJECT => {
+        CHILD_OP_DELETE_RESOURCE => {
             if !packet_short("delete_object", Some(channel_id), packet.payload.len(), 8) {
                 let task_id = ld32(&packet.payload[0..]);
                 let id = ld32(&packet.payload[4..]);
@@ -2905,15 +2909,18 @@ fn process_child_packet<H: HostMemory + HostOps>(
          * - Early boot: front type-11 writebacks paint while !frame_flush_seen
          *   and job W×H matches established console (no mid-switch thrash).
          * - After first boundary: display presents paint (op8 DisplaySwap on
-         *   arm ch4, **or** op6/7 on x86 Ventura/Tahoe display ch5).
-         * - ch2 PRESENT_FRAME 0x28 / FLUSH 0x3b: bookkeeping only (mid-composite).
+         *   arm ch4, **or** the op6/op7 transactions on x86 Ventura/Tahoe
+         *   display ch5).
+         * - Nothing on ch2 paints: 0x28 is CmdDeleteObject and 0x3b is
+         *   CmdGetComputeInfo, and neither is a present however mid-composite
+         *   the moment it arrives in.
          */
         // The three display present commands. op8 `CmdDisplaySwapMapping` is
         // the arm/EFI-era path; x86 Ventura/Tahoe drives the display pipe with
-        // op6 `CmdDisplayTransaction3` and its gamma variant op7. They differ
-        // only in where the surface word sits, which
-        // `display_txn_trailer_slots` owns for all three.
-        opcode @ (CHILD_OP_DISPLAY_SWAP | CHILD_OP_PRESENT_X86 | CHILD_OP_PRESENT_GAMMA_X86) => {
+        // op6 `CmdDisplayTransaction2_DEPRECATED` and op7
+        // `CmdDisplayTransaction3`. They differ only in where the surface word
+        // sits, which `display_txn_trailer_slots` owns for all three.
+        opcode @ (CHILD_OP_DISPLAY_SWAP | CHILD_OP_DISPLAY_TRANSACTION2 | CHILD_OP_DISPLAY_TRANSACTION3) => {
             note_display_txn_payload(state, channel_id, packet);
             let Some(mapping) = present_surface_id(opcode, &packet.payload) else {
                 crate::observe::fail(format!(
@@ -2949,15 +2956,57 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 return ChildPacketDisposition::Deferred;
             }
         }
-        CHILD_OP_PRESENT_FRAME => {
-            // PVG: CmdDeleteObject on some maps; arm misread as present. Never
-            // paint. x86 present is op6/7 on display channel.
-            let _ = packet;
+        // `CmdDeleteObject`, the guest's shared-object allocator retiring an
+        // object. This device does not act on it — and it is *not* the arm that
+        // retires an entry from the object table, which is
+        // `CHILD_OP_DELETE_RESOURCE` two slots down.
+        //
+        // This arm used to be a silent no-op named for a present, on a reading
+        // that had it painting frames. It never painted, but it also never said
+        // anything, so a real teardown command has been arriving and being
+        // dropped without a line. It is fail-visible now because what it drops
+        // is unbounded: every object the guest asks to retire through this
+        // command stays in this device's tables for the life of the boot.
+        CHILD_OP_DELETE_OBJECT => {
+            note_unimplemented(state, channel_id, UnimplementedCommand::DeleteObject, packet);
+        }
+        // `CmdDebug`, a host-side trace marker. Nothing is owed to the guest, but
+        // the payload is what the guest wanted recorded, so the record echoes it
+        // rather than swallowing the command.
+        CHILD_OP_DEBUG => {
+            note_unimplemented(state, channel_id, UnimplementedCommand::Debug, packet);
+        }
+        // The display-state pair. Both carry a payload floor of 8 bytes, and
+        // neither moves anything in this device's display model: sleep state is
+        // not tracked and no display property is applied. A guest that sleeps a
+        // panel and finds it still lit is looking at this arm.
+        CHILD_OP_DISPLAY_SLEEP_STATE => {
+            note_unimplemented(
+                state,
+                channel_id,
+                UnimplementedCommand::DisplaySleepState,
+                packet,
+            );
+        }
+        CHILD_OP_DISPLAY_SET_PROPERTIES => {
+            note_unimplemented(
+                state,
+                channel_id,
+                UnimplementedCommand::DisplaySetProperties,
+                packet,
+            );
+        }
+        // `CmdDelay`: the guest asking the channel to be held before the next
+        // command runs. This device continues immediately. That reorders nothing
+        // — the stamps still retire in submission order — but a guest that used
+        // the delay to let something settle does not get it.
+        CHILD_OP_DELAY => {
+            note_unimplemented(state, channel_id, UnimplementedCommand::Delay, packet);
         }
         // PVG / Monterey: 0x3b = CmdGetComputeInfo (query). Must write reply
         // before stamp or createComputePipeline stalls (texture-ref 29-06-26).
-        // `CHILD_OP_PRESENT_FRAME_FLUSH` is the recovered legacy name for the
-        // same wire opcode.
+        // `present-frame-flush` is the recovered legacy name for the same wire
+        // opcode, and it is wrong.
         CHILD_OP_GET_COMPUTE_INFO => {
             if packet.payload.len() >= 24 {
                 let _ = reply_compute_info(state, host, &packet.payload);
@@ -3047,7 +3096,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 }
             }
         }
-        CHILD_OP_CONFIG_40 => {
+        CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN => {
             let _ = reply_heap_texture_size_and_align(state, host, &packet.payload);
         }
         // The one packet that says a cached page list has gone stale, and the
@@ -3112,6 +3161,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
         | CHILD_OP_MAP_MEMORY2
         | CHILD_OP_INVALIDATE_RESOURCES
         | CHILD_OP_SYNCHRONIZE_RESOURCES
+        | CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES
         | CHILD_OP_DELETE_IOSURFACE_BACKING2 => {
             // Every branch below stamps the packet complete whatever it did with
             // it: the guest is waiting on the stamp, and a lifecycle event this
@@ -3125,6 +3175,9 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 CHILD_OP_UNMAP_MEMORY => "UnmapMemory",
                 CHILD_OP_INVALIDATE_RESOURCES => "InvalidateResources",
                 CHILD_OP_SYNCHRONIZE_RESOURCES => "SynchronizeResources",
+                CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES => {
+                    "SynchronizeAndDiscardResources"
+                }
                 CHILD_OP_DELETE_IOSURFACE_BACKING2 => "DeleteIOSurfaceBacking2",
                 _ => "map_family",
             };
@@ -3335,7 +3388,17 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         e,
                     ),
                 }
-            } else if packet.opcode == CHILD_OP_SYNCHRONIZE_RESOURCES {
+            } else if matches!(
+                packet.opcode,
+                CHILD_OP_SYNCHRONIZE_RESOURCES | CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES
+            ) {
+                // Two opcodes, one arm, because the reference host validates
+                // both with byte-for-byte the same check — `{u32 task, u32
+                // count}` then `count` 4-byte object ids — and the synchronise
+                // obligation they name is the same one. `0x3e` adds a discard of
+                // the named resources' contents on top, which this device does
+                // not act on and reports below.
+                //
                 // The command carries `{task, count}` and a list of object ids,
                 // and nothing else — no region, no direction. It is the guest
                 // saying "I am about to touch these resources with the CPU", so
@@ -3360,7 +3423,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         let oid = cmd.object_ids.first().copied().unwrap_or(0);
                         if crate::observe::draw_log_enabled() {
                             crate::observe::line(format!(
-                                "map_family op=SynchronizeResources opcode={:#x} ch={channel_id} plen={plen} task={} count={} oid={oid:#x}",
+                                "map_family op={name} opcode={:#x} ch={channel_id} plen={plen} task={} count={} oid={oid:#x}",
                                 packet.opcode, cmd.task_id, cmd.count
                             ));
                         }
@@ -3378,12 +3441,18 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     // A refused Synchronize lets the guest CPU-read pages whose
                     // submitted writeback has not executed, which is a stale or
                     // black frame the guest has no way to notice.
-                    Err(e) => note_resource_list_decode_fail(
-                        "SynchronizeResources",
-                        packet.opcode,
+                    Err(e) => note_resource_list_decode_fail(name, packet.opcode, channel_id, e),
+                }
+                // The half of `0x3e` that is not the synchronise. Reported after
+                // the synchronise has run, so the record cannot be read as the
+                // whole command having been dropped.
+                if packet.opcode == CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES {
+                    note_unimplemented(
+                        state,
                         channel_id,
-                        e,
-                    ),
+                        UnimplementedCommand::DiscardResources,
+                        packet,
+                    );
                 }
             } else {
                 let w0 = if plen >= 4 {
@@ -3402,11 +3471,34 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 ));
             }
         }
+        // `CmdDiscardResources`: the discard half of `0x3e` on its own, with the
+        // same payload contract, and nothing owed to the guest — a discard this
+        // device ignores costs memory and never correctness.
+        //
+        // The payload is still decoded, with `0x35`'s decoder because the host
+        // validates all three with the same check. A malformed one is worth a
+        // line even though a well-formed one would have been ignored: it says
+        // the guest and this device disagree about the record layout, which the
+        // two commands that *do* act on it share.
+        CHILD_OP_DISCARD_RESOURCES => {
+            use crate::runtime::decode::fifo::decode_synchronize_resources;
+            match decode_synchronize_resources(&packet.payload) {
+                Ok(_) => note_unimplemented(
+                    state,
+                    channel_id,
+                    UnimplementedCommand::DiscardResources,
+                    packet,
+                ),
+                Err(e) => {
+                    note_resource_list_decode_fail("DiscardResources", packet.opcode, channel_id, e)
+                }
+            }
+        }
         // A fence with no payload. The guest emits it from a present's failure
         // and teardown legs to order work it is abandoning, and retiring its
         // stamps — which the drain does for every accepted packet — is the whole
         // contract. Named so it stops being reported as an unknown opcode.
-        CHILD_OP_FLUSH_CHANNEL_EVENT => {
+        CHILD_OP_NOP => {
             crate::runtime::drain::note_store_route("child_flush_channel_event");
             // The command allocates no bytes, so payload is the one thing that
             // can falsify this reading. Bytes here would mean the command grew a
@@ -3421,7 +3513,32 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 ));
             }
         }
+        // The reference host's retired slots. Its shared handler accepts the
+        // packet, does nothing with the payload and retires the stamps, which is
+        // exactly what this arm does — so matching them is fidelity, and the
+        // record exists only to say a guest is still emitting one.
+        op if is_deprecated_child_opcode(op) => {
+            note_unimplemented(state, channel_id, UnimplementedCommand::Deprecated, packet);
+        }
+        // Everything left is an opcode with no handler at all. Two different
+        // things end up here and the record has to keep them apart: an opcode
+        // inside `CHILD_OP_MAX` is an unassigned slot — a guest asking for a
+        // command this host generation does not have — while one above it is a
+        // value the reference host refuses before it ever reaches a table, so a
+        // packet carrying it is a corrupt header or a desynced ring and not a
+        // missing feature.
         _ => {
+            if packet.opcode > CHILD_OP_MAX {
+                crate::observe::fail(format!(
+                    "child_opcode_out_of_range ch={channel_id} opcode={:#x} max={CHILD_OP_MAX:#x} \
+                     total_size={} stamps={} plen={} (above the dispatch ceiling: this is a \
+                     malformed header or a desynced ring, not an unimplemented command)",
+                    packet.opcode,
+                    packet.total_size,
+                    packet.stamp_count(),
+                    packet.payload.len()
+                ));
+            }
             state.record_fail(FailEvent::UnknownChildOpcode {
                 channel: channel_id,
                 opcode: packet.opcode,
@@ -3432,6 +3549,27 @@ fn process_child_packet<H: HostMemory + HostOps>(
         }
     }
     ChildPacketDisposition::Complete
+}
+
+/// Record a command this device names but does not execute.
+///
+/// One call site per command, and one place the record is built: the fields are
+/// the packet's, so a second spelling would be a second chance to report the
+/// wrong opcode beside the right command name.
+fn note_unimplemented(
+    state: &mut DeviceState,
+    channel_id: u32,
+    command: UnimplementedCommand,
+    packet: &Packet,
+) {
+    state.record_fail(FailEvent::UnimplementedChildCommand {
+        channel: channel_id,
+        command,
+        opcode: packet.opcode,
+        total_size: packet.total_size,
+        stamp_count: packet.stamp_count(),
+        payload: packet.payload.clone(),
+    });
 }
 
 /// Drain one child channel.
@@ -3572,7 +3710,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
         let peek_opcode = ld16(&header[PACKET_OPCODE..]);
         if matches!(
             peek_opcode,
-            CHILD_OP_DISPLAY_SWAP | CHILD_OP_PRESENT_X86 | CHILD_OP_PRESENT_GAMMA_X86
+            CHILD_OP_DISPLAY_SWAP | CHILD_OP_DISPLAY_TRANSACTION2 | CHILD_OP_DISPLAY_TRANSACTION3
         ) && state.present.unpainted_presents >= MAX_UNPAINTED_PRESENTS
         {
             note_present_backpressure_hold(state, channel_id, head, tail);
