@@ -119,6 +119,207 @@ fn release_translation_order_holds(state: &mut DeviceState) {
 ///
 /// `site` separates the two rings on the census line the way
 /// [`apply_define_task2`] does, since the same opcode arrives on both.
+/// `CmdNOP` (`0x1e`) arrived carrying a payload.
+///
+/// The command allocates no command-space bytes, so a payload is the one thing
+/// that can falsify this device's reading of it: bytes here mean the command has
+/// grown a form this arm does not decode, and dropping them silently is the
+/// failure the unknown-opcode arm was at least loud about.
+///
+/// Typed rather than a formatted string so the check owns a slug of its own.
+/// This is the same rule that keeps two commands from sharing one decline — a
+/// reader who greps the slug has to be able to tell which check fired.
+pub(crate) struct NopCarriedPayload {
+    pub(crate) channel: u32,
+    pub(crate) plen: usize,
+}
+
+impl crate::observe::Decline for NopCarriedPayload {
+    fn slug(&self) -> &'static str {
+        "cmd_nop_unexpected_payload"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("ch", self.channel.to_string()),
+            ("plen", self.plen.to_string()),
+        ]
+    }
+}
+
+crate::observe::decline_display!(NopCarriedPayload);
+
+/// `CmdDeleteObject` (`0x28`) carried something that is not a destroy record.
+///
+/// The command's payload is a task id and one serializer record naming the
+/// object to retire. Each variant is a distinct way that record can fail to name
+/// one, and each owns its slug: a reader who sees the reason has to be able to
+/// tell a truncated record from a well-formed record of the wrong family, since
+/// only the second means this device is meeting a command shape it has not
+/// decoded.
+pub(crate) enum DeleteObjectDecline {
+    /// The bytes after the task id are not a well-formed record.
+    RecordMalformed { task: u32, plen: usize },
+    /// A well-formed record whose opcode is not one of the destroy family.
+    ///
+    /// Membership is tested against the family, never a range: numbers inside
+    /// the destroy span belong to no destroy selector, and retiring an object on
+    /// one would destroy something the record never named.
+    NotADestroy { task: u32, opcode: u32 },
+    /// A destroy record whose payload is not the single object ref it must be.
+    RefUnreadable { task: u32, opcode: u32 },
+}
+
+impl crate::observe::Decline for DeleteObjectDecline {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::RecordMalformed { .. } => "delete_object_record_malformed",
+            Self::NotADestroy { .. } => "delete_object_not_a_destroy_record",
+            Self::RefUnreadable { .. } => "delete_object_ref_unreadable",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::RecordMalformed { task, plen } => {
+                vec![("task", task.to_string()), ("plen", plen.to_string())]
+            }
+            Self::NotADestroy { task, opcode } | Self::RefUnreadable { task, opcode } => {
+                vec![
+                    ("task", task.to_string()),
+                    ("record_opcode", format!("{opcode:#x}")),
+                ]
+            }
+        }
+    }
+}
+
+crate::observe::decline_display!(DeleteObjectDecline);
+
+/// The object kind a destroy record names, as a route-counter name.
+///
+/// The kind lives in the record's own opcode and nowhere else, so this is the
+/// only place it can be read from. Each kind gets its own counter because the
+/// distribution is the open question this arm leaves behind: which kinds a guest
+/// actually retires this way is what decides whether tracking serializer refs
+/// would be worth anything, and one merged counter cannot answer it.
+///
+/// Spelled against the wire crate's constants rather than against literals, so
+/// a renumbering there fails the build here instead of silently re-labelling a
+/// counter.
+fn delete_object_kind_route(opcode: u32) -> &'static str {
+    use reims_vgpu_wire::ops::destroy as d;
+    match opcode {
+        d::OPCODE_DELETE_BUFFER => "child_delete_object_buffer",
+        d::OPCODE_DELETE_TEXTURE => "child_delete_object_texture",
+        d::OPCODE_DELETE_DEPTH_STENCIL_STATE => "child_delete_object_depth_stencil_state",
+        d::OPCODE_DELETE_SAMPLER_STATE => "child_delete_object_sampler_state",
+        d::OPCODE_DELETE_FUNCTION => "child_delete_object_function",
+        d::OPCODE_DELETE_COMPUTE_PIPELINE_STATE => "child_delete_object_compute_pipeline_state",
+        d::OPCODE_DELETE_RENDER_PIPELINE_STATE => "child_delete_object_render_pipeline_state",
+        d::OPCODE_DELETE_FENCE => "child_delete_object_fence",
+        d::OPCODE_DELETE_HEAP => "child_delete_object_heap",
+        d::OPCODE_DELETE_RASTERIZATION_RATE_MAP => "child_delete_object_rasterization_rate_map",
+        d::OPCODE_DELETE_INDIRECT_COMMAND_BUFFER => "child_delete_object_indirect_command_buffer",
+        // `is_delete` gates every caller, so this is unreachable rather than a
+        // silent bucket. It is named so that if the family ever grows a kind
+        // this table has not learned, the counter says which.
+        _ => "child_delete_object_unnamed_kind",
+    }
+}
+
+/// `CmdDeleteObject` (`0x28`): decode the record, name the kind, retire nothing.
+///
+/// The payload is `{u32 task}` then one serializer destroy record. Every kind in
+/// that family writes the identical twelve-byte body — a single object ref — and
+/// carries the kind in the record's own opcode.
+///
+/// # Why the ref is decoded and then not acted on
+///
+/// The ref is in the **serializer's per-kind ref space**, which this device does
+/// not track. Nothing here is a matter of taste: the object table is keyed by
+/// the *kernel object-list* ref, established by `0x33 CmdSetObjectList` and
+/// populated when a decoded command resolves an entry out of that list, and the
+/// caches holding the kinds this command actually names — samplers and pipeline
+/// states — are keyed by the object's own **state**, not by a ref, so they have
+/// no ref to retire by even in principle.
+///
+/// Keying the object table with a number from the other namespace was measured
+/// and is worse than declining. On a driven boot the guest sent 1 988 of these
+/// in 25 s, every sampled one a sampler-state destroy, and not one named a ref
+/// the object table held — against 112 466 successful lookups on that same
+/// `(task, ref)` key from the resource-table path in the same boot. So the table
+/// was healthy and the namespace was wrong. The two do overlap numerically —
+/// 22 of those refs existed under a *different* task — so the only effect the
+/// call could ever have had is destroying an unrelated object that happened to
+/// share the integer.
+///
+/// This costs the guest nothing. The kinds named are content-keyed and
+/// deduplicated, so there is no per-object allocation to leak; what is lost is
+/// the chance to drop a cache entry slightly earlier, which is why the decline
+/// is a decline and not a loss.
+///
+/// The per-kind counters are what would justify revisiting it: a kind this
+/// device *does* hold by ref appearing here is the finding, and nothing else is.
+/// There is exactly one such kind today. `DeviceState::fence_generations` is
+/// keyed `(task, domain, fence_ref)` and nothing ever removes an entry, so a
+/// `child_delete_object_fence` reading above zero would be both a real leak and
+/// the one place this command has something to retire. The driven boot measured
+/// it at zero — every sampled record was a sampler state — so wiring it now
+/// would be building a handler for traffic no boot has produced. Read that
+/// counter before deciding otherwise.
+fn apply_delete_object(state: &mut DeviceState, channel_id: u32, payload: &[u8], packet: &Packet) {
+    let task_id = ld32(&payload[0..]);
+    let record = &payload[4..];
+    let Ok(op) = reims_vgpu_wire::op::op(record, 0) else {
+        Emit::decline(
+            "child_delete_object",
+            &DeleteObjectDecline::RecordMalformed {
+                task: task_id,
+                plen: record.len(),
+            },
+        )
+        .field("ch", channel_id)
+        .fail();
+        return;
+    };
+    if !reims_vgpu_wire::ops::destroy::is_delete(op.opcode()) {
+        Emit::decline(
+            "child_delete_object",
+            &DeleteObjectDecline::NotADestroy {
+                task: task_id,
+                opcode: op.opcode(),
+            },
+        )
+        .field("ch", channel_id)
+        .fail();
+        return;
+    }
+    let Ok(rec) = reims_vgpu_wire::ops::destroy::delete(&op) else {
+        Emit::decline(
+            "child_delete_object",
+            &DeleteObjectDecline::RefUnreadable {
+                task: task_id,
+                opcode: op.opcode(),
+            },
+        )
+        .field("ch", channel_id)
+        .fail();
+        return;
+    };
+    // Read so the record is proved decodable and the kind is countable. It is
+    // deliberately not used as a key: see this function's doc for the boot that
+    // measured what keying the object table with it would have done.
+    let _object_ref = rec.object_ref.get();
+    note_store_route(delete_object_kind_route(op.opcode()));
+    note_unimplemented(
+        state,
+        channel_id,
+        UnimplementedCommand::DeleteObject,
+        packet,
+    );
+}
+
 fn packet_short(op: &'static str, channel: Option<u32>, have: usize, need: usize) -> bool {
     if have >= need {
         return false;
@@ -2956,17 +3157,16 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 return ChildPacketDisposition::Deferred;
             }
         }
-        // `CmdDeleteObject`, the guest's shared-object allocator retiring an
-        // object. This device does not act on it — and it is *not* the arm that
-        // retires an entry from the object table, which is
-        // `CHILD_OP_DELETE_RESOURCE` two slots down.
+        // `CmdDeleteObject`, the guest retiring one serializer-allocated object.
+        // This device decodes the record and declines it — and this is *not* the
+        // arm that retires an entry from the object table, which is
+        // `CHILD_OP_DELETE_RESOURCE` two slots down. The two look alike and name
+        // different namespaces; `apply_delete_object`'s doc has the boot that
+        // measured the difference.
         //
         // This arm used to be a silent no-op named for a present, on a reading
-        // that had it painting frames. It never painted, but it also never said
-        // anything, so a real teardown command has been arriving and being
-        // dropped without a line. It is fail-visible now because what it drops
-        // is unbounded: every object the guest asks to retire through this
-        // command stays in this device's tables for the life of the boot.
+        // that had it painting frames. It never painted and it never spoke, so a
+        // real teardown command was arriving and being dropped without a line.
         CHILD_OP_DELETE_OBJECT => {
             // The payload is `{u32 task}` then a self-describing record whose
             // own byte length sits at offset 8. Both bounds are checked before
@@ -2986,12 +3186,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     plen,
                     record_len.saturating_add(4),
                 ) {
-                    note_unimplemented(
-                        state,
-                        channel_id,
-                        UnimplementedCommand::DeleteObject,
-                        packet,
-                    );
+                    apply_delete_object(state, channel_id, &packet.payload, packet);
                 }
             }
         }
@@ -3475,7 +3670,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     note_unimplemented(
                         state,
                         channel_id,
-                        UnimplementedCommand::DiscardResources,
+                        UnimplementedCommand::SynchronizeAndDiscardResources,
                         packet,
                     );
                 }
@@ -3535,12 +3730,14 @@ fn process_child_packet<H: HostMemory + HostOps>(
             // form this arm does not decode, and dropping them silently is what
             // the unknown-opcode arm was at least loud about.
             if !packet.payload.is_empty() {
-                crate::observe::fail(format!(
-                    "child_nop fail reason=unexpected_payload ch={channel_id} \
-                     plen={} (this command carries stamps only; a payload means it has grown \
-                     a form this arm does not decode)",
-                    packet.payload.len()
-                ));
+                crate::observe::Emit::decline(
+                    "child_nop",
+                    &NopCarriedPayload {
+                        channel: channel_id,
+                        plen: packet.payload.len(),
+                    },
+                )
+                .fail();
             }
         }
         // The reference host's retired slots. Its shared handler accepts the

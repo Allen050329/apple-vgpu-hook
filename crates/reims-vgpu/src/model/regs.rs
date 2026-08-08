@@ -479,18 +479,26 @@ pub const CHILD_OP_DELETE_RESOURCE: u16 = 0x25;
 /// before the command is declined so a corrupt one is not reported as an
 /// unimplemented command.
 ///
-/// A driven x86 Safari-drag boot sends **1 931** of these in about forty seconds
-/// — which is what makes this device's not acting on the command a leak worth
-/// naming rather than a curiosity. Only the first was printed (the record
-/// latches; the rate lives in the `store_routes` counter of the same name), and
-/// that one carried 16 bytes: task 1, a 12-byte record whose length word read
-/// 12, exactly filling the payload.
+/// The record is one **object-destroy record**: an 8-byte header of
+/// `{u32 opcode, u32 length}` then the object ref, twelve bytes in all. The
+/// opcode names the object *kind* and every kind writes the identical body, so
+/// the ref is read from one place whatever the kind is. The observed 16-byte
+/// packet decodes exactly under this: task 1, a sampler-state destroy record
+/// whose length word reads 12, naming ref 32.
 ///
-/// Retiring the object needs more than this layout. The record is a *tagged*
-/// descriptor — its first word is a class tag the guest validates against the
-/// object it names — so acting on the command means interpreting that tag, and
-/// deleting the wrong object costs more than the leak does. Declining is
-/// deliberate until the tag's meaning is contract rather than inference.
+/// The ref is decoded and the kind is counted; the object is **not** retired.
+/// That ref is in the serializer's per-kind ref space, which this device does
+/// not track, and it is a different namespace from the kernel object-list ref
+/// the object table is keyed by — the two overlap numerically, so acting on it
+/// could only ever have destroyed an unrelated object that shared the integer.
+/// A driven x86 Safari-drag boot sends about 1 990 of these in 25 s, none of
+/// which named a ref the object table held, against 112 466 successful lookups
+/// on that same key in the same boot. `runtime::drain::apply_delete_object` has
+/// the full reading.
+///
+/// Membership in the destroy family is tested against the family and never
+/// against a range: numbers inside the span belong to no destroy kind, and
+/// treating one as a delete would act on a record whose meaning is unmeasured.
 pub const CHILD_OP_DELETE_OBJECT: u16 = 0x28;
 pub const CHILD_OP_SET_OBJECT_LIST: u16 = 0x33;
 /// PVG `CmdInvalidateResources`: `{u32 task_id, u32 count}` then `count`

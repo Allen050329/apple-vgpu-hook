@@ -100,13 +100,32 @@ impl ExecFault {
 /// writing the handler rather than by more reverse engineering.
 ///
 /// The variants that carry no risk of losing guest work say so in their own
-/// docs. A reader ranking the fail log needs that distinction: the discard hint
-/// costs memory, the display-state commands cost a wrong panel state, and
-/// `DeleteObject` costs a leak of everything the guest asked to be torn down.
+/// docs. A reader ranking the fail log needs that distinction: the discard hints
+/// cost memory and the display-state commands cost a wrong panel state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnimplementedCommand {
     /// `CmdDebug` (`0x00`). A host-side trace marker; nothing is owed.
     Debug,
+    /// `CmdDeleteObject` (`0x28`). The guest is retiring one object named by a
+    /// serializer destroy record, and this device holds nothing that record can
+    /// name.
+    ///
+    /// The record's ref lives in the **serializer's per-kind ref space**: the
+    /// kind comes from the record's own opcode and each kind numbers its refs
+    /// independently. This device tracks no object in that space. Its object
+    /// table is keyed by the *kernel object-list* ref, a different namespace
+    /// reached through a different command (`0x33 CmdSetObjectList`), and the
+    /// caches that do hold the kinds this command names — samplers and pipeline
+    /// states — are keyed by the object's own *state*, not by any ref, so they
+    /// cannot be retired by one either.
+    ///
+    /// So nothing is owed and nothing leaks: acting on the ref would key the
+    /// object-list namespace with a number from the serializer's, and the two
+    /// overlap, so the only reachable effect is destroying an unrelated object
+    /// that happens to share the integer. Declining is the correct behaviour
+    /// until this device tracks serializer refs, not a gap to be closed by
+    /// wiring the existing teardown call to it.
+    DeleteObject,
     /// `CmdDisplaySleepState` (`0x09`). The guest's panel is entering or leaving
     /// sleep and this device's display model does not move with it.
     DisplaySleepState,
@@ -117,15 +136,20 @@ pub enum UnimplementedCommand {
     /// continues immediately, which reorders nothing but can race a guest that
     /// used the delay for settling.
     Delay,
-    /// `CmdDeleteObject` (`0x28`). The guest's shared-object allocator is
-    /// retiring an object and this device keeps it — a leak, not a corruption,
-    /// but an unbounded one on a long boot.
-    DeleteObject,
-    /// The discard half of `CmdDiscardResources` (`0x3f`) and
-    /// `CmdSynchronizeAndDiscardResources` (`0x3e`). A hint that contents are no
-    /// longer needed; ignoring it costs memory and never correctness. The
-    /// synchronise half of `0x3e` *is* executed — see the drain's arm.
+    /// `CmdDiscardResources` (`0x3f`). A hint that the named resources' contents
+    /// are no longer needed; ignoring it costs memory and never correctness.
+    /// Nothing of this command is executed.
     DiscardResources,
+    /// The discard half of `CmdSynchronizeAndDiscardResources` (`0x3e`).
+    ///
+    /// Its own variant rather than a second use of [`Self::DiscardResources`],
+    /// because the two declines do not mean the same thing and a shared slug
+    /// cannot say which fired: on `0x3f` the whole command was dropped, while
+    /// here the synchronise half **did** run and only the discard hint was
+    /// ignored. A reader ranking the log needs that difference — the first is a
+    /// resource the guest expected to be released, the second is only memory
+    /// held longer than asked.
+    SynchronizeAndDiscardResources,
     /// One of the reference host's retired opcodes. Its handler accepts the
     /// packet and does nothing with the payload, so matching it is fidelity
     /// rather than a gap — the record exists to say an old guest is still
@@ -137,11 +161,14 @@ impl UnimplementedCommand {
     pub fn slug(self) -> &'static str {
         match self {
             Self::Debug => "cmd_debug_unimplemented",
+            Self::DeleteObject => "cmd_delete_object_unimplemented",
             Self::DisplaySleepState => "cmd_display_sleep_state_unimplemented",
             Self::DisplaySetProperties => "cmd_display_set_properties_unimplemented",
             Self::Delay => "cmd_delay_unimplemented",
-            Self::DeleteObject => "cmd_delete_object_unimplemented",
             Self::DiscardResources => "cmd_discard_resources_unimplemented",
+            Self::SynchronizeAndDiscardResources => {
+                "cmd_synchronize_and_discard_resources_discard_unimplemented"
+            }
             Self::Deprecated => "cmd_deprecated",
         }
     }
@@ -151,11 +178,12 @@ impl UnimplementedCommand {
     pub fn command(self) -> &'static str {
         match self {
             Self::Debug => "CmdDebug",
+            Self::DeleteObject => "CmdDeleteObject",
             Self::DisplaySleepState => "CmdDisplaySleepState",
             Self::DisplaySetProperties => "CmdDisplaySetProperties",
             Self::Delay => "CmdDelay",
-            Self::DeleteObject => "CmdDeleteObject",
             Self::DiscardResources => "CmdDiscardResources",
+            Self::SynchronizeAndDiscardResources => "CmdSynchronizeAndDiscardResources",
             Self::Deprecated => "CmdDeprecated",
         }
     }
