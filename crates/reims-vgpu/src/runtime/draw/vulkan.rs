@@ -2670,62 +2670,99 @@ fn load_buffer_content<M: HostMemory + HostOps>(
     Some(crate::backend::vulkan::engine::BufferContent::from(bytes))
 }
 
-/// Upper bound on the bytes this draw can read out of vertex buffer `index`,
-/// measured from the bind's own offset. `None` when the decoded contract does
-/// not bound it and the whole remaining allocation is the only safe answer.
+/// Upper bound on the bytes this draw can read out of vertex-stage buffer
+/// `index`, measured from the bind's own offset. `Err` when the decoded contract
+/// does not bound it and the whole remaining allocation is the only safe answer;
+/// the variant says which, because on a driven boot that is where nearly all of
+/// the bytes are — see [`BindReachUnbounded`].
 ///
 /// This is a *bound*, not an estimate, and every approximation in it is taken in
 /// the widening direction: a per-instance step rate above 1 is ignored (fewer
 /// elements are actually fetched than counted here), and an attribute whose
 /// format or step function does not translate abandons the whole bind rather
 /// than contributing a narrower number than its neighbours.
-///
-/// The three ways the contract declines to bound a bind, all of which must stay
-/// `None`:
-///
-/// * **An indexed draw's per-vertex attributes.** The fetched element is the
-///   index buffer's value, which is an arbitrary `u16`/`u32` this function has
-///   not read. `vertex_count` counts *indices*, not the highest vertex they name.
-/// * **A `Constant` step function.** Those never reach the zero-copy rail —
-///   `constant_step_bufs` excludes them because the engine prepends a CPU
-///   base-instance prefix — so a bound here would describe a population that
-///   does not exist.
-/// * **No attribute naming this buffer index.** The buffer is bound but the
-///   vertex descriptor does not say how it is fetched, so nothing here knows
-///   the stride.
 fn vertex_bind_reach(
     req: &DrawEncodeRequest,
     attributes: &[crate::runtime::decode::resource::VertexAttribute],
     index: u32,
-) -> Option<u64> {
+) -> Result<u64, BindReachUnbounded> {
     let mut reach: Option<u64> = None;
     for a in attributes.iter().filter(|a| a.buffer_index == index) {
         if a.format == 0 {
             continue;
         }
-        let elements = match translate::vertex::step_function(a.declared_step_function).ok()? {
+        let step = translate::vertex::step_function(a.declared_step_function)
+            .map_err(|_| BindReachUnbounded::UntranslatableStep)?;
+        let elements = match step {
             crate::backend::vulkan::engine::VertexStepFunction::PerVertex => {
                 if req.indexed.is_some() {
-                    return None;
+                    return Err(BindReachUnbounded::Indexed);
                 }
                 u64::from(req.first_vertex) + u64::from(req.vertex_count)
             }
             crate::backend::vulkan::engine::VertexStepFunction::PerInstance => {
                 u64::from(req.base_instance) + u64::from(req.instance_count)
             }
-            crate::backend::vulkan::engine::VertexStepFunction::Constant => return None,
+            crate::backend::vulkan::engine::VertexStepFunction::Constant => {
+                return Err(BindReachUnbounded::ConstantStep)
+            }
         };
         if elements == 0 {
             continue;
         }
-        let format = translate::vertex::attribute_format(a.format).ok()?;
+        let format = translate::vertex::attribute_format(a.format)
+            .map_err(|_| BindReachUnbounded::UntranslatableFormat)?;
         let element_end = u64::from(a.offset) + u64::from(translate::vertex::byte_size(format));
         let this = u64::from(a.stride)
             .saturating_mul(elements - 1)
             .saturating_add(element_end);
         reach = Some(reach.map_or(this, |r: u64| r.max(this)));
     }
-    reach
+    reach.ok_or(BindReachUnbounded::NoAttribute)
+}
+
+/// Why the decoded contract does not bound a vertex-stage buffer bind.
+///
+/// Split out because the *reason* is the whole finding. A first driven boot put
+/// 98.7 % of the gathered bytes in one undifferentiated `unbounded` bucket, and
+/// that number is worth nothing on its own: `Indexed` says the index buffer
+/// would have to be read to narrow anything, while `NoAttribute` says the bind
+/// is not a vertex stream at all — a buffer the guest bound to the vertex stage
+/// through `setVertexBuffer:offset:atIndex:` that the pipeline's vertex
+/// descriptor never mentions, which is where a shader-declared size and not a
+/// stride is the bound. Those are different pieces of work with different risk,
+/// and one counter cannot tell them apart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BindReachUnbounded {
+    /// A per-vertex attribute on an indexed draw. `vertex_count` counts indices
+    /// and an index names any vertex in the stream.
+    Indexed,
+    /// The engine prepends a CPU base-instance prefix to a `Constant`-step
+    /// stream, so the narrowed span is not the span the bind uses.
+    ConstantStep,
+    /// No attribute in the vertex descriptor names this buffer index, so
+    /// nothing here knows a stride. Typically a vertex-stage *constant* buffer
+    /// rather than a vertex stream.
+    NoAttribute,
+    /// The step function decoded to something this device declines to
+    /// translate — per-patch, or unknown.
+    UntranslatableStep,
+    /// The attribute format decoded to something outside the translate table.
+    UntranslatableFormat,
+}
+
+impl BindReachUnbounded {
+    /// Census slug. `&'static str` because that is what the route family takes,
+    /// and one arm per variant so a new reason cannot land in another's bucket.
+    fn route(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Indexed => ("zcreach_unb_indexed", "zcreach_unb_indexed_kb"),
+            Self::ConstantStep => ("zcreach_unb_constant", "zcreach_unb_constant_kb"),
+            Self::NoAttribute => ("zcreach_unb_noattr", "zcreach_unb_noattr_kb"),
+            Self::UntranslatableStep => ("zcreach_unb_step", "zcreach_unb_step_kb"),
+            Self::UntranslatableFormat => ("zcreach_unb_format", "zcreach_unb_format_kb"),
+        }
+    }
 }
 
 /// Band a zero-copy vertex bind's *gathered* span against the reach the draw's
@@ -2763,10 +2800,16 @@ fn note_vertex_bind_reach(
     // Clamped: a reach past the allocation is the guest's descriptor
     // disagreeing with its own draw, and letting it exceed the span would make
     // the ratio read above 100 % rather than saturating at "narrows nothing".
-    let Some(reach) = vertex_bind_reach(req, attributes, index).map(|r| r.min(span)) else {
-        note_store_route("zcreach_unbounded");
-        note_store_route_n("zcreach_unbounded_kb", span / 1024);
-        return;
+    let reach = match vertex_bind_reach(req, attributes, index) {
+        Ok(reach) => reach.min(span),
+        Err(why) => {
+            let (count, kb) = why.route();
+            note_store_route("zcreach_unbounded");
+            note_store_route_n("zcreach_unbounded_kb", span / 1024);
+            note_store_route(count);
+            note_store_route_n(kb, span / 1024);
+            return;
+        }
     };
     note_store_route("zcreach_bounded");
     note_store_route_n("zcreach_reach_kb", reach / 1024);
@@ -7636,7 +7679,7 @@ mod vulkan_split_tests {
         // stream, not a skip), so the last element starts at 7 * 16.
         assert_eq!(
             vertex_bind_reach(&req, &attrs, 0),
-            Some(7 * 16 + FLOAT2_BYTES)
+            Ok(7 * 16 + FLOAT2_BYTES)
         );
     }
 
@@ -7652,7 +7695,7 @@ mod vulkan_split_tests {
         let attrs = [attr(0, 0, 32, Some(1)), attr(0, 24, 32, Some(1))];
         assert_eq!(
             vertex_bind_reach(&req, &attrs, 0),
-            Some(3 * 32 + 24 + FLOAT2_BYTES),
+            Ok(3 * 32 + 24 + FLOAT2_BYTES),
             "the reach is the furthest attribute's end, not the first's"
         );
     }
@@ -7668,7 +7711,7 @@ mod vulkan_split_tests {
         let attrs = [attr(1, 0, 16, Some(1))];
         assert_eq!(
             vertex_bind_reach(&req, &attrs, 0),
-            None,
+            Err(BindReachUnbounded::NoAttribute),
             "nothing here knows buffer 0's stride"
         );
     }
@@ -7687,7 +7730,7 @@ mod vulkan_split_tests {
         let attrs = [attr(0, 0, 16, Some(1))];
         assert_eq!(
             vertex_bind_reach(&req, &attrs, 0),
-            None,
+            Err(BindReachUnbounded::Indexed),
             "an index buffer can name any vertex in the stream"
         );
     }
@@ -7707,7 +7750,7 @@ mod vulkan_split_tests {
         let attrs = [attr(0, 0, 64, Some(2))];
         assert_eq!(
             vertex_bind_reach(&req, &attrs, 0),
-            Some(3 * 64 + FLOAT2_BYTES)
+            Ok(3 * 64 + FLOAT2_BYTES)
         );
     }
 
@@ -7722,7 +7765,10 @@ mod vulkan_split_tests {
             ..DrawEncodeRequest::default()
         };
         let attrs = [attr(0, 0, 16, Some(0))];
-        assert_eq!(vertex_bind_reach(&req, &attrs, 0), None);
+        assert_eq!(
+            vertex_bind_reach(&req, &attrs, 0),
+            Err(BindReachUnbounded::ConstantStep)
+        );
     }
 
     /// An untranslatable step function abandons the whole bind rather than
@@ -7738,7 +7784,7 @@ mod vulkan_split_tests {
         let attrs = [attr(0, 0, 16, Some(1)), attr(0, 0, 16, Some(3))];
         assert_eq!(
             vertex_bind_reach(&req, &attrs, 0),
-            None,
+            Err(BindReachUnbounded::UntranslatableStep),
             "a bind is bounded by every attribute on it or by none"
         );
     }
