@@ -2840,18 +2840,15 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 let id = ld32(&packet.payload[4..]);
                 // Which references resolved through this object is not knowable
                 // from the packet, so the task's resolutions go together.
-                // Measured the largest source of re-walks on this device: one
-                // driven boot retired 54 109 resolutions here, 95% of every
-                // bind miss. The whole task goes because this rule was written
-                // before anything counted it — but the packet's second word is
-                // the reference itself (`delete_object(task_id, ref_)`, and the
-                // object map is keyed the same way), so a per-reference retire
-                // is available and would drop ~32 entries where this drops the
-                // task. Narrowing a retirement is the direction that can serve
-                // stale bytes, so it wants its own change and its own test.
+                // Scoped to the reference the packet names, like every other
+                // response to this opcode — `objects`, the host copies and
+                // `texture_to_mapping` are all keyed `(task, ref)`. Retiring
+                // the whole task here was the outlier and the device's largest
+                // source of re-walks: 54 109 resolutions dropped on one driven
+                // boot, 95% of every bind miss.
                 note_bb_retired(
                     "bb_retire_delete_object",
-                    state.retire_bound_buffers_for_task(task_id),
+                    state.retire_bound_buffers_for_ref(task_id, id),
                 );
                 let _ = state.delete_object(task_id, id);
             }

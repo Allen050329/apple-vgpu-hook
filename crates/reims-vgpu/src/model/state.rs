@@ -2270,6 +2270,23 @@ impl DeviceState {
     /// Drop the held bind resolutions for `task_id` covering `[gva, gva+len)`.
     ///
     /// The map/unmap answer, which names the exact range the guest moved. See
+    /// Drop the held bind resolutions for one reference, at every offset.
+    ///
+    /// The `CmdDeleteObject` rule. See
+    /// [`crate::runtime::bound_buffers::BoundBuffers::retire_ref`] for why this
+    /// is scoped to the reference rather than the task.
+    pub fn retire_bound_buffers_for_ref(&mut self, task_id: u32, ref_: u32) -> usize {
+        #[cfg(feature = "backend-vulkan")]
+        {
+            self.bound_buffers.retire_ref(task_id, ref_)
+        }
+        #[cfg(not(feature = "backend-vulkan"))]
+        {
+            let _ = (task_id, ref_);
+            0
+        }
+    }
+
     /// [`Self::retire_bound_buffers_for_task`] for the gating.
     pub fn retire_bound_buffers_in_range(&mut self, task_id: u32, gva: u64, len: u64) -> usize {
         #[cfg(feature = "backend-vulkan")]

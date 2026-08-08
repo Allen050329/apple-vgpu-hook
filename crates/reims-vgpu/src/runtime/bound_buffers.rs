@@ -201,6 +201,38 @@ impl BoundBuffers {
         before - self.held.len()
     }
 
+    /// Drop everything held for one reference, at every offset.
+    ///
+    /// The `CmdDeleteObject` answer. That packet names the reference —
+    /// `delete_object(task_id, ref_)` — and the rest of the device already
+    /// scopes its response to it: `objects`, `invalidate_object_host_copies`
+    /// and `texture_to_mapping` are all keyed `(task, ref)`. This registry
+    /// retiring the whole task was the outlier, and a measured expensive one:
+    /// one driven boot dropped 54 109 resolutions there, 95% of every bind miss
+    /// on the device.
+    ///
+    /// # Why the narrower rule is sound
+    ///
+    /// A held resolution for reference `R` is built from three things: the
+    /// object-list entry at index `R`, the descriptor that entry names, and the
+    /// task page-table walk over the span the descriptor declares. Deleting
+    /// object `X` where `X != R` touches none of them — the list is indexed by
+    /// reference so entries do not shift, `X`'s descriptor is at its own
+    /// address, and no page table changes. So no resolution but `R`'s own can
+    /// be stale because of this packet.
+    ///
+    /// Two references aliasing one allocation are safe for the same reason:
+    /// deleting one does not free the pages or move the other's descriptor. If
+    /// the guest then reuses that address the announcement is a different
+    /// packet — `CmdMapMemory2`, `CmdUnmapMemory` or `CmdReplacePhysical` — and
+    /// those rules still retire by range or by task.
+    pub fn retire_ref(&mut self, task_id: u32, buffer_ref: u32) -> usize {
+        let before = self.held.len();
+        self.held
+            .retain(|(t, r, _), _| *t != task_id || *r != buffer_ref);
+        before - self.held.len()
+    }
+
     /// Drop everything held for `task_id` whose bytes overlap `[gva, gva+len)`.
     ///
     /// The map/unmap answer, which carries the exact range that moved.
@@ -325,6 +357,39 @@ mod tests {
         assert_eq!(b.retire_range(1, 0x2000, 0x1000), 0, "starts where it ends");
         assert_eq!(b.retire_range(1, 0x0000, 0x1000), 0, "ends where it starts");
         assert_eq!(b.len(), 1);
+    }
+
+    /// A reference retire takes that reference at **every** offset, and nothing
+    /// else.
+    ///
+    /// Both halves matter and they fail in opposite directions. Leaving one of
+    /// the deleted reference's offsets behind serves bytes from an object the
+    /// guest destroyed; taking a neighbour's is the whole-task rule this
+    /// replaced, which is merely expensive. The offsets are the ones a driven
+    /// boot actually produces — a single reference is held at 233 of them.
+    #[test]
+    fn a_reference_retire_takes_every_offset_of_that_reference_only() {
+        let mut b = BoundBuffers::default();
+        for off in [0u64, 0x400, 0x1000, 0x9000] {
+            b.insert(1, 7, off, bound(0x1000 + off, 0x400));
+        }
+        // A neighbouring reference on the same task, and the same reference
+        // under another task: neither is named by this packet.
+        b.insert(1, 8, 0, bound(0x8000, 0x400));
+        b.insert(2, 7, 0, bound(0x1000, 0x400));
+        assert_eq!(b.len(), 6);
+
+        assert_eq!(b.retire_ref(1, 7), 4, "every offset of reference 7");
+        assert!(b.get(1, 7, 0).is_none());
+        assert!(b.get(1, 7, 0x9000).is_none());
+        assert!(b.get(1, 8, 0).is_some(), "a sibling reference survives");
+        assert!(b.get(2, 7, 0).is_some(), "another task's survives");
+        assert_eq!(b.len(), 2);
+
+        // A reference nothing is held for is not an error, and takes nothing.
+        assert_eq!(b.retire_ref(1, 7), 0);
+        assert_eq!(b.retire_ref(1, 99), 0);
+        assert_eq!(b.len(), 2);
     }
 
     /// The shape separates entries from the `(task, reference)` pairs behind
