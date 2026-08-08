@@ -1277,7 +1277,7 @@ impl ResourcePools {
     }
 
     /// Record that a submitted command buffer **writes** guest RAM when it
-    /// executes, and take over `identity`'s pin until it has.
+    /// executes, and hold `identity`'s image against reclaim until it has.
     ///
     /// Both halves are one call because they are one fact: this copy has not
     /// happened yet. Whoever asked for it may not read those guest bytes and the
@@ -1285,11 +1285,33 @@ impl ResourcePools {
     /// site that recorded the debt without taking the pin would satisfy the first
     /// while breaking the second.
     ///
-    /// Called only once the copy is known submitted, so a rail that failed to
-    /// record one still owns its pin and unpins it the way it always did.
+    /// # The pin is taken here, not handed in
+    ///
+    /// It used to be handed in: the deferred-Store rail pinned the resident,
+    /// then gave that pin to this ledger to release at the settle. That rail was
+    /// removed with `runtime::storage_flush`, and it held every product caller
+    /// of [`ResourcePools::pin_resident_target`]`(_, true)` — so this ledger went
+    /// on releasing a pin nobody had taken, once per GPU-direct writeback, and
+    /// the guard in `pin_resident_target` reported each one.
+    ///
+    /// Nothing else covered the window it left. `gpu_only_content` is what both
+    /// reclaim paths actually skip on, and the render writeback clears it the
+    /// moment `copy_target_to_guest_pages` returns — while the copy is submitted
+    /// and not yet executed. The pin is the only thing holding the image from
+    /// there to the settle.
+    ///
+    /// Taking it here rather than trusting a caller makes that unrepresentable:
+    /// the ledger releases exactly the pins it took, so a handoff cannot be
+    /// mismatched by a caller that forgets, and a second holder (the host
+    /// window's present pin is the live one) can no longer have its pin released
+    /// on its behalf. A pin that cannot be taken — no slot, or content not ready
+    /// — records the debt and nothing else, because there is then no image for
+    /// the reclaim to take.
     pub(crate) fn note_guest_write_recorded(&mut self, identity: &TargetIdentity) {
         self.guest_writes_in_flight = true;
-        self.unpin_on_settle.push(identity.clone());
+        if self.pin_resident_target(identity, true) {
+            self.unpin_on_settle.push(identity.clone());
+        }
     }
 
     /// Clear the guest-write debt and answer whether there was one. The mirror
@@ -3806,14 +3828,19 @@ mod recycle_tests {
         assert!(!pools.take_guest_write_debt());
     }
 
-    /// A submitted-but-unsettled copy reads its resident's image, so the pin
-    /// that licenses that read may not be dropped at the call which issued the
-    /// copy — which is where the rail used to drop it, safely, because the copy
-    /// had already executed by then.
+    /// A submitted-but-unsettled copy reads its resident's image, so the ledger
+    /// takes a pin that outlives the call which issued the copy.
+    ///
+    /// The pin is taken by the ledger rather than handed to it. This test used
+    /// to pin first and assert the count stayed at one across the handoff, which
+    /// passed just as well when no caller pinned at all — and that is what
+    /// happened: `storage_flush` held every product pinner, its removal left the
+    /// writeback recording the debt with no pin, and the settle then released
+    /// one that was never taken.
     ///
     /// Device-free: `quiesce_guest_writes` needs a `DeviceContext` for the wait,
-    /// so this drives the two halves it composes — that the ledger holds the pin
-    /// across the submit, and that taking the debt is what releases it.
+    /// so this drives the two halves it composes — that recording the copy pins,
+    /// and that the settle releases exactly what it pinned.
     #[test]
     fn a_submitted_writeback_holds_its_residents_pin_until_the_settle() {
         let mut pools = ResourcePools::new();
@@ -3829,20 +3856,16 @@ mod recycle_tests {
                 identity.clone(),
                 crate::backend::vulkan::engine::pools::images_and_registry::pin_count_tests::ready_slot(),
             );
-        assert!(pools.pin_resident_target(&identity, true), "the flush's pin");
-        assert_eq!(pools.registry[&identity].pin_count, 1);
+        assert_eq!(pools.registry[&identity].pin_count, 0, "nobody has pinned");
 
-        // The copy is issued: the flush hands its pin over rather than dropping
-        // it, so the image stays out of the reclaim's reach.
+        // Recording the copy is what pins: the caller holds nothing.
         pools.note_guest_write_recorded(&identity);
         assert_eq!(
             pools.registry[&identity].pin_count, 1,
-            "issuing the copy must not unpin — the GPU has not read the image yet"
+            "the submitted copy must hold the image against reclaim"
         );
 
-        // Two more windows on the same resident inside one pass each hand over
-        // their own pin, and each is released once.
-        assert!(pools.pin_resident_target(&identity, true));
+        // A second window on the same resident inside one pass takes its own.
         pools.note_guest_write_recorded(&identity);
         assert_eq!(pools.registry[&identity].pin_count, 2);
 
@@ -3855,11 +3878,73 @@ mod recycle_tests {
         }
         assert_eq!(
             pools.registry[&identity].pin_count, 0,
-            "every handed-over pin is released exactly once"
+            "every pin the ledger took is released exactly once"
         );
         assert!(
             pools.unpin_on_settle.is_empty(),
             "a settled pin must not be released a second time at the next stamp"
+        );
+    }
+
+    /// Another holder's pin survives a writeback's settle.
+    ///
+    /// The hazard the ledger's own pin closes, and the one its guard could not
+    /// report: an unpin at zero is logged, but an unpin that lands on *someone
+    /// else's* count is silent and leaves them reading an image the reclaim may
+    /// now take. The host window's present pin is the live second holder.
+    #[test]
+    fn a_writeback_settle_does_not_release_another_holders_pin() {
+        let mut pools = ResourcePools::new();
+        let identity = TargetIdentity::Surface {
+            id: 9,
+            width: 16,
+            height: 16,
+            generation: 1,
+        };
+        pools
+            .registry
+            .insert(
+                identity.clone(),
+                crate::backend::vulkan::engine::pools::images_and_registry::pin_count_tests::ready_slot(),
+            );
+        // The window pins for its present blit and still holds it.
+        assert!(pools.pin_resident_target(&identity, true), "the window's pin");
+
+        pools.note_guest_write_recorded(&identity);
+        assert_eq!(pools.registry[&identity].pin_count, 2);
+
+        assert!(pools.take_guest_write_debt());
+        for held in std::mem::take(&mut pools.unpin_on_settle) {
+            pools.pin_resident_target(&held, false);
+        }
+        assert_eq!(
+            pools.registry[&identity].pin_count, 1,
+            "the window is still reading this image and must still hold it"
+        );
+    }
+
+    /// A resident the ledger cannot pin records the debt and queues no release.
+    ///
+    /// The other half of the same rule: pushing an identity the pin refused is
+    /// how the settle came to release pins that were never taken.
+    #[test]
+    fn a_writeback_on_an_unpinnable_resident_queues_no_release() {
+        let mut pools = ResourcePools::new();
+        let identity = TargetIdentity::Surface {
+            id: 11,
+            width: 16,
+            height: 16,
+            generation: 0,
+        };
+        // No slot at all: nothing to pin, and nothing for a reclaim to take.
+        pools.note_guest_write_recorded(&identity);
+        assert!(
+            pools.unpin_on_settle.is_empty(),
+            "no pin was taken, so none may be released"
+        );
+        assert!(
+            pools.take_guest_write_debt(),
+            "the copy is still in flight and the stamp must still wait for it"
         );
     }
 

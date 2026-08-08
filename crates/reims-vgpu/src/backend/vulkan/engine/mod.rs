@@ -2160,8 +2160,13 @@ pub fn copy_target_to_guest_pages(
         counters.note_target_read(u64::from(dst.width) * u64::from(dst.height) * 4);
     }
     // Past the last fallible step, so this runs exactly when the copy is on the
-    // queue — which is what makes "an `Err` leaves the pin with the caller" true
-    // without a second outcome for the caller to branch on.
+    // queue. The ledger takes the resident's pin itself here — the caller holds
+    // none, and `finish` clears `gpu_only_content` as soon as this returns, so
+    // between that and the settle the pin is all that keeps the reclaim off an
+    // image the submitted copy still reads. Safe to leave until the end rather
+    // than guarding every early return above, because the whole body runs under
+    // the engine lock and a reclaim needs the same lock: nothing can take the
+    // image while this function is running, only after it returns.
     pools.note_guest_write_recorded(identity);
     // Published after the ledger entry and while the engine lock is still held,
     // so no thread can observe the flag clear while a copy is outstanding.
