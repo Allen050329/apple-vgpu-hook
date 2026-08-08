@@ -475,6 +475,41 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     false
                 }
             } else if c0.target_gva != 0 {
+                // What this Store would cost if it were served the way the
+                // type-11 surface Store is served.
+                //
+                // That rail lands its frame with `copy_target_to_guest_pages` —
+                // the GPU writes the guest's pages and no byte crosses host
+                // memory. This one reads the whole resident back to the host
+                // first (`read_resident_chain`, a blocking fence) and then
+                // writes it out again row by row. On a driven Safari drag the
+                // split is 14 330 Stores here against 9 870 there, so the
+                // copying rail carries 59 % of them.
+                //
+                // A buffer→image copy converts nothing, so the GPU rail can
+                // only ever serve a destination whose bytes are already the
+                // resident's — which for a GVA/pooled target means RGBA8,
+                // since those residents stay in RGBA order. `format` is the
+                // gate, and it is recorded rather than assumed: whether this
+                // class is worth a GPU rail at all is exactly the question of
+                // how many of the 14 330 clear it, and `convert_rgba8_to_row`
+                // below is a per-row conversion for every one that does not.
+                crate::runtime::drain::note_store_route(
+                    if c0.format == pixel_format::MTL_FORMAT_RGBA8_UNORM
+                        || c0.format == pixel_format::MTL_FORMAT_RGBA8_UNORM_SRGB
+                    {
+                        "gva_store_fmt_byte_identical"
+                    } else {
+                        "gva_store_fmt_needs_conversion"
+                    },
+                );
+                if crate::observe::first_sight("gva_store_fmt", u64::from(c0.format)) {
+                    crate::observe::off(format!(
+                        "gva_store_fmt fmt={:#x} {}x{} stride={} \
+                         (destination format of a GVA render Store)",
+                        c0.format, c0.width, c0.height, c0.row_stride
+                    ));
+                }
                 // Bounded to the pages resolved before the GPU round trip
                 // above. `None` only when that walk could not name the span,
                 // which is the pre-existing behaviour for a target this device
