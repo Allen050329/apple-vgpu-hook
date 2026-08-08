@@ -4919,8 +4919,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // A bind that declines from inside here charges its remainder
                 // to `Resolve`, because the span commits on `Drop`.
                 let (tw, th, loaded) = {
-                    let _s = crate::runtime::sampled_phase::Span::open(
-                        crate::runtime::sampled_phase::Part::Resolve,
+                    // The probe is charged to the alias part it belongs to, and
+                    // the span is handed off to `ResolveSource` on the branch
+                    // where the probe found nothing — so the two parts partition
+                    // this scope rather than overlapping it.
+                    let alias_span = crate::runtime::sampled_phase::Span::open(
+                        crate::runtime::sampled_phase::Part::ResolveAlias,
                     );
                     let attachment_alias = frag_stage
                         .then(|| fragment_attachment_alias_sample(req, index, texture_ref))
@@ -4974,6 +4978,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             }
                         }
                     } else {
+                        drop(alias_span);
+                        let _s = crate::runtime::sampled_phase::Span::open(
+                            crate::runtime::sampled_phase::Part::ResolveSource,
+                        );
                         let Some(loaded) = resolve_sampled_source(
                             state,
                             host,

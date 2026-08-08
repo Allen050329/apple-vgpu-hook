@@ -51,10 +51,34 @@
 //!
 //! | part | us/s | % | what it brackets | what would fix it |
 //! |---|---|---|---|---|
-//! | [`Part::Resolve`] | 15498 | 72.1 | the attachment-alias branch and `resolve_sampled_source`, per texture bind | the sampled content cache and the gather witness |
+//! | `Resolve` | 15498 | 72.1 | the attachment-alias branch and `resolve_sampled_source`, per texture bind | the sampled content cache and the gather witness |
 //! | [`Part::Reflect`] | 2556 | 11.9 | the AIR constexpr static-sampler walk and the residual SPIR-V `sampler_bindings` scan | computing both at translate time and holding them in `m2v_cache` |
 //! | [`Part::Lookup`] | 1526 | 7.1 | `lookup_list_entry` + `resolve_texture_view`, per texture bind | caching the guest object-list walk and the type-8 view descriptor read |
 //! | [`Part::Samplers`] | 1263 | 5.9 | `load_vulkan_sampler` over the record's own sampler binds | a sampler object cache keyed on the guest sampler ref |
+//!
+//! # That table is a light second, and the phase does not stay fourth
+//!
+//! Everything above is a clean boot whose whole chain cost 249 ms/s. A clean
+//! driven **Safari title-bar drag** on the same tree runs a 610 ms/s chain, and
+//! the phase does not scale with it — it overtakes everything:
+//!
+//! ```text
+//!                   engine_us  binds_us  store_us  sampled_us   chain
+//! light second         106083     51234     38314       21487   249 ms
+//! drag second          190004      8025     57080      314037   610 ms
+//! ```
+//!
+//! `sampled_us` goes from 8.6 % of the chain to **51 %** — 15x the absolute
+//! cost against a 2.5x heavier chain — and `resolve_us` carries 97 % of it. So
+//! the table's ranking is a property of the drive and not of the device, and the
+//! phase is first, not fourth, on the workload this device is trying to make
+//! smooth. Neither reading is wrong; quoting either without its drive is.
+//!
+//! That is what split `Resolve` in two. One 306 ms/s bar could not say whether a
+//! drag pays it in [`Part::ResolveAlias`], where a draw sampling the target it
+//! is drawing into materialises a fresh `w * h` buffer per bind, or in
+//! [`Part::ResolveSource`], where the rung ladder reads guest pages — and those
+//! have nothing in common but a line number.
 //!
 //! The last two are one part on purpose. They are different data structures —
 //! a small reflection `Vec` and a full SPIR-V word array — but they answer the
@@ -100,19 +124,31 @@ pub enum Part {
     /// object-list entry, and `resolve_texture_view` for a type-8 view's
     /// channel remap.
     Lookup = 0,
-    /// Where the bound texture's texels come from: the fragment
-    /// attachment-alias branch, or `resolve_sampled_source`.
-    Resolve = 1,
+    /// The fragment attachment-alias branch: the `req.colors` probe, plus
+    /// materialising whatever it found. Both of its byte-producing arms build a
+    /// fresh `Vec` per bind — a `w * h` RGBA8 fill for a Clear attachment, a
+    /// `to_vec` of the prior record's seed for a Load one — so this is where a
+    /// draw sampling the target it is drawing into pays for the copy.
+    ResolveAlias = 1,
+    /// `resolve_sampled_source`: the type-11 rung ladder and the linear guest
+    /// rungs, for every bind the alias branch above did not claim.
+    ResolveSource = 2,
     /// `load_vulkan_sampler` over the record's vertex and fragment sampler
     /// binds.
-    Samplers = 2,
+    Samplers = 3,
     /// The two per-shader walks that provision what the guest did not name:
     /// AIR constexpr static samplers out of reflection, then the residual
     /// SPIR-V `sampler_bindings` scan.
-    Reflect = 3,
+    Reflect = 4,
 }
 
-const PARTS: usize = 4;
+impl Part {
+    /// Highest ordinal, so [`PARTS`] is derived from the enum rather than
+    /// hand-counted beside it.
+    const LAST: Part = Part::Reflect;
+}
+
+const PARTS: usize = Part::LAST as usize + 1;
 
 /// Nanoseconds, per [`crate::observe::phase_clock`]. The lookup is the reason:
 /// it is a pair of map reads per bind at tens of thousands of binds a second,
@@ -125,6 +161,7 @@ static SAMPLED: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SampledPhaseWindow {
     pub lookup_us: u64,
+    pub alias_us: u64,
     pub resolve_us: u64,
     pub samplers_us: u64,
     pub reflect_us: u64,
@@ -138,7 +175,8 @@ pub fn take_window() -> Option<SampledPhaseWindow> {
     let sampled = SAMPLED.swap(0, Ordering::Relaxed);
     let w = SampledPhaseWindow {
         lookup_us: to_us(ACC[Part::Lookup as usize].swap(0, Ordering::Relaxed)),
-        resolve_us: to_us(ACC[Part::Resolve as usize].swap(0, Ordering::Relaxed)),
+        alias_us: to_us(ACC[Part::ResolveAlias as usize].swap(0, Ordering::Relaxed)),
+        resolve_us: to_us(ACC[Part::ResolveSource as usize].swap(0, Ordering::Relaxed)),
         samplers_us: to_us(ACC[Part::Samplers as usize].swap(0, Ordering::Relaxed)),
         reflect_us: to_us(ACC[Part::Reflect as usize].swap(0, Ordering::Relaxed)),
         sampled,
@@ -202,7 +240,7 @@ mod tests {
         let _ = take_window();
         note_sampled();
         {
-            let _s = Span::open(Part::Resolve);
+            let _s = Span::open(Part::ResolveSource);
             std::thread::sleep(std::time::Duration::from_millis(4));
         }
         {
@@ -212,9 +250,27 @@ mod tests {
         let w = take_window().expect("a sampled phase was noted");
         assert_eq!(w.sampled, 1);
         assert!(w.resolve_us >= 3_000, "{w:?}");
+        assert_eq!(w.alias_us, 0, "{w:?}");
         assert_eq!(w.samplers_us, 0, "{w:?}");
         assert_eq!(w.reflect_us, 0, "{w:?}");
         assert!(w.lookup_us >= 1_000 && w.lookup_us < w.resolve_us, "{w:?}");
+    }
+
+    /// The two halves of the old `Resolve` must not both be charged for one
+    /// bind. They are a partition of one lexical scope, and the hand-off is a
+    /// `drop` on one branch — the shape where a forgotten `drop` reads as a
+    /// phase that got slower rather than as a span that stayed open.
+    #[test]
+    fn the_two_resolve_halves_are_charged_apart() {
+        let _ = take_window();
+        note_sampled();
+        {
+            let _s = Span::open(Part::ResolveAlias);
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+        let w = take_window().expect("a sampled phase was noted");
+        assert!(w.alias_us >= 3_000, "{w:?}");
+        assert_eq!(w.resolve_us, 0, "{w:?}");
     }
 
     /// The denominator counts phases entered, not spans opened. A draw that
@@ -226,7 +282,7 @@ mod tests {
         note_sampled();
         note_sampled();
         {
-            let _s = Span::open(Part::Resolve);
+            let _s = Span::open(Part::ResolveSource);
         }
         let w = take_window().expect("sampled phases were noted");
         assert_eq!(w.sampled, 2);
