@@ -1403,6 +1403,11 @@ pub(crate) unsafe fn execute_draw_inner(
     // can never alias a still-in-flight CB. Blocks (retire) only when every
     // slot is still in flight; the wait lands in retire_wait_us. A batch
     // joiner reuses the open batch's slot instead (its CB is still recording).
+    // Everything above this point is bookkeeping over the request; the claim
+    // below is the only part of `Prep` that can block on the GPU. Charged apart
+    // so a boot can tell "the CPU is ahead of the ring" from "preparing a draw
+    // got slower", which `prep_us` alone cannot.
+    phase.enter(super::draw_phase::Phase::Slot);
     let (cb, fence) = if joins {
         let target = batch_target.as_ref().expect("joins requires identity");
         pools.batch_slot(target).expect("joins checked batch_slot")
