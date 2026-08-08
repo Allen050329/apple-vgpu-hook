@@ -552,6 +552,7 @@ pub(super) fn load_linear_texture_rgba_host<M: HostMemory + HostOps>(
     texture_ref: u32,
     level: u32,
     format_override: Option<u16>,
+    site: crate::runtime::render_writeback::SettleSite,
 ) -> Option<Vec<u8>> {
     load_linear_texture_impl(
         state,
@@ -561,6 +562,7 @@ pub(super) fn load_linear_texture_rgba_host<M: HostMemory + HostOps>(
         level,
         format_override,
         false,
+        site,
     )
     .ok()
     .map(|(bytes, _)| bytes)
@@ -600,6 +602,11 @@ fn note_srgb_upload_downgrade(site: &'static str, sample_format: u16) {
     }
 }
 
+// Eight, because the last one is the caller's identity and the whole point of
+// it is that this leaf cannot derive it. Grouping the descriptor selectors into
+// a struct would hide which of them a call site varies, which is what the
+// wrappers above exist to make obvious.
+#[allow(clippy::too_many_arguments)]
 fn load_linear_texture_impl<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -608,6 +615,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     level: u32,
     format_override: Option<u16>,
     native_bgra8: bool,
+    site: crate::runtime::render_writeback::SettleSite,
 ) -> Result<(Vec<u8>, TexelLayout), LinearLoadRefusal> {
     use LinearLoadRefusal as R;
     let (_entry, desc_bytes) = objects::resolve_descriptor(
@@ -678,7 +686,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // the trailing padding it never touches.
     let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
     crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
-        crate::runtime::render_writeback::SettleSite::LinearTextureLoad,
+        site,
         || {
             let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
             let gpas = gva_mem::task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift);

@@ -4779,7 +4779,15 @@ fn seed_color_load<M: HostMemory + HostOps>(
     // `scanout::paint_mapping` behind `load_type11_mapping_rgba`, and
     // `draw::texture_view::load_linear_texture_impl` for the linear arm. The
     // buffer leaf had no settle at all before that, on any of its four callers.
-    let rgba = load_sampled_rgba_static(state, host, task_id, texture_ref)?;
+    // The seed arm: this leaf is shared with the sampled resolve and the two
+    // want opposite repairs, so it is charged separately.
+    let rgba = load_sampled_rgba_static(
+        state,
+        host,
+        task_id,
+        texture_ref,
+        crate::runtime::render_writeback::SettleSite::LinearTextureSeed,
+    )?;
     Some(rgba)
 }
 
@@ -4793,6 +4801,7 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
+    site: crate::runtime::render_writeback::SettleSite,
 ) -> Option<Vec<u8>> {
     // Opcode-9 buffer-backed texture (type-8): sample the source buffer directly.
     if let Some(bt) = buffer_texture_descriptor(state, host, task_id, texture_ref, None) {
@@ -4820,7 +4829,7 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
         }
         return load_type11_mapping_rgba(state, host, mid, fmt_override).map(|(_, _, r)| r);
     }
-    load_linear_texture_rgba_host(state, host, task_id, tex_ref, level, fmt_override)
+    load_linear_texture_rgba_host(state, host, task_id, tex_ref, level, fmt_override, site)
 }
 
 /// Size a recycled scratch buffer to `span` for a `filled`-byte rect, without

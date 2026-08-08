@@ -1452,7 +1452,13 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     // `None` into a typed `DrawPreparationDecline::TextureResolveMissing`, which
     // names the ref and the stage. `TextureDescriptor::extent` owns the second
     // check and says what clamping the two fields up would have bound instead.
-    let mut rgba = load_sampled_rgba_static(state, host, task_id, texture_ref)?;
+    let mut rgba = load_sampled_rgba_static(
+        state,
+        host,
+        task_id,
+        texture_ref,
+        crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
+    )?;
     let (_entry, desc) = sampled_texture_descriptor(state, host, task_id, texture_ref)?;
     let (w, h) = decode_texture_descriptor(&desc).ok()?.extent()?;
     let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);

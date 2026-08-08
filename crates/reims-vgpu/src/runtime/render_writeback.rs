@@ -138,8 +138,19 @@ macro_rules! settle_sites {
 
 settle_sites! {
     /// `draw::texture_view::load_linear_texture_impl` — CPU read of a linear
-    /// texture's guest pages for the host cache.
+    /// texture's guest pages, reached from the Metal-only `load_sampled_rgba`
+    /// ladder. The two arms that reach it on the Vulkan pathway name themselves
+    /// below.
     LinearTextureLoad => "settle_linear_texture_load",
+    /// The same leaf, reached from `draw::seed_color_load` — the colour LOAD
+    /// seed reading the attachment's own guest pages to seed a
+    /// `MTLLoadActionLoad`. Split out because it and the sampled arm below want
+    /// opposite repairs: this one is elided by proving the pass is about to
+    /// overwrite what it is seeding, and that one by not reading at all.
+    LinearTextureSeed => "settle_linear_texture_seed",
+    /// The same leaf, reached from `draw::vulkan::resolve_sampled_source`'s
+    /// last-resort arm, after every rung above it declined.
+    LinearTextureSampled => "settle_linear_texture_sampled",
     /// `draw::vulkan::load_linear_guest_memoized` — the memoized full-span CPU
     /// re-read behind every linear sampled bind the gather rail declines.
     LinearMemoRead => "settle_linear_memo_read",
