@@ -1402,9 +1402,32 @@ pub(crate) unsafe fn execute_draw_inner(
     // common, but `batch_eligible` alone folds seven conditions before any of
     // these are reached.
     //
+    // # What it read
+    //
+    // Driven Safari drag, 95 694 draws, and only four of the twelve refusals
+    // ever fire:
+    //
+    //   join_appended                41 654   43.5 %
+    //   nojoin_samples_own_target    28 431   29.7 %
+    //   nojoin_not_load_from_target  14 332   15.0 %
+    //   nojoin_no_open_batch         11 277   11.8 %
+    //
+    // **All seven `batch_eligible` terms read zero.** Nothing here is refused
+    // for a device-lost force, a driver quirk, MRT, a depth attachment, a
+    // readback, an occlusion query or a missing identity — they are real
+    // conditions this workload does not present, and a firing one is news.
+    //
+    // So the batching ceiling is one term: a draw sampling the target it renders
+    // into. Letting those append would take the join rate from 43.5 % to ~73 %
+    // and roughly halve the submissions the ring blocks on. It is not free —
+    // the engine snapshots on self-alias, and inside an open batch that snapshot
+    // has to be recorded at this draw's position in the command buffer rather
+    // than taken from the image as it stood before the batch opened, or the
+    // draw samples content from the wrong point in the stream.
+    //
     // The seven terms of `batch_eligible` are spelled out here rather than
-    // folded, because "ineligible" is the answer for most of the population and
-    // would be the least useful thing this census could say. `joins` still reads
+    // folded, because "ineligible" would otherwise have been the one bucket
+    // hiding whether any of them mattered — and the answer is that none does. `joins` still reads
     // `batch_eligible` through the first seven arms, so the two cannot diverge:
     // an arm added to one without the other changes what `joins` means and the
     // debug assertion below fails.
