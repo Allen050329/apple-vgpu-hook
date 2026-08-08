@@ -536,6 +536,12 @@ pub const DISPLAY_MODE2_H: u16 = 1024;
 /// changes to run the desktop at 4K — see [[scanout-bridge]] mode-switch contract.
 pub const DISPLAY_MODE3_W: u16 = 3840;
 pub const DISPLAY_MODE3_H: u16 = 2160;
+/// 21:9 ultrawide. A host panel at this size has no mode to select without it,
+/// and the guest cannot invent one — the list here is the whole menu. 3440 <
+/// `MAX_SCANOUT_DIM` (8192) and a 3440x1440 BGRA8 surface is 18.9 MiB, under the
+/// 4K entry above, so it costs nothing the 4K mode does not already cost.
+pub const DISPLAY_MODE4_W: u16 = 3440;
+pub const DISPLAY_MODE4_H: u16 = 1440;
 pub const DISPLAY_SERIAL_NUMBER: u32 = 1;
 pub const DISPLAY_WIDTH_MM: u16 = 400;
 pub const DISPLAY_HEIGHT_MM: u16 = 300;
@@ -1572,10 +1578,28 @@ mod tests {
             (DISPLAY_MODE1_W, DISPLAY_MODE1_H),
             (DISPLAY_MODE2_W, DISPLAY_MODE2_H),
             (DISPLAY_MODE3_W, DISPLAY_MODE3_H),
+            (DISPLAY_MODE4_W, DISPLAY_MODE4_H),
         ] {
             assert!(u32::from(width) <= MAX_SCANOUT_DIM);
             assert!(u32::from(height) <= MAX_SCANOUT_DIM);
         }
         assert_eq!(DISPLAY_PRODUCT_NAME.last(), Some(&0));
+    }
+
+    /// The descriptor writer drops any mode whose timing slot runs past the
+    /// shared page, and it drops it in silence — the guest simply never sees
+    /// that resolution. Pin the slot arithmetic against the smallest page the
+    /// device runs on, so growing the mode list cannot quietly lose the tail.
+    #[test]
+    fn every_advertised_mode_gets_a_timing_slot_on_a_4k_page() {
+        use crate::runtime::decode::fifo::display_timing_entry_offset;
+        const MODE_COUNT: u32 = 5;
+        const SMALLEST_PAGE: u64 = 1 << PAGE_SHIFT_X86;
+        for index in 0..MODE_COUNT {
+            assert!(
+                display_timing_entry_offset(index, SMALLEST_PAGE).is_some(),
+                "mode {index} has no timing slot on a {SMALLEST_PAGE}-byte page"
+            );
+        }
     }
 }
