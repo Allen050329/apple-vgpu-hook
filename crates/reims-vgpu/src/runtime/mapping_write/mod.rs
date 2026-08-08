@@ -916,7 +916,9 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     // list is read: this can invalidate the mapping — that is exactly what its
     // own drift check does — and every value taken after it is taken against
     // whatever it left behind.
-    crate::runtime::render_writeback::settle_guest_writes();
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::MappingGpuStore,
+    );
     // Nothing below can land a frame on a host whose GPU cannot import guest
     // RAM, so the walks below are skipped rather than run and discarded. Asked
     // *after* `flush_intersecting` and not before it: that call is a side effect
@@ -1113,7 +1115,9 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     };
     // Deferred-writeback flush-on-access: land pending resident content in
     // these pages before touching them.
-    crate::runtime::render_writeback::settle_guest_writes();
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::MappingBgra8Write,
+    );
     // Taken after the flush, because the flush can invalidate this mapping, and
     // once for the whole frame, because the loop below writes a row at a time.
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "bgra8") else {
@@ -1540,7 +1544,9 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     // contiguous, and landing after puts an older frame on top of this one —
     // which `mapper::write_mapping_bytes_only` states as its own reason for
     // flushing here.
-    crate::runtime::render_writeback::settle_guest_writes();
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::MappingRgba8Write,
+    );
     // One proof for the whole image: the changed-span loop below writes each
     // differing row separately, and the walk is a translation per page.
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "rgba8_changed") else {
@@ -1737,7 +1743,9 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
     }
     // Deferred-writeback flush-on-access (coarse: whole mapping — this entry
     // resolves its window only later and is off the hot compute path).
-    crate::runtime::render_writeback::settle_guest_writes();
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::MappingRawRowsWrite,
+    );
     let Some(m) = state.mappings.get(&mapping_id) else {
         return refuse(mapping_id, SurfaceWriteRefusal::MappingAbsent);
     };
@@ -1819,7 +1827,9 @@ pub fn read_raw_rows<M: HostMemory + HostOps>(
     }
     // Deferred-writeback flush-on-access (coarse: whole mapping — this entry
     // resolves its window only later and is off the hot compute path).
-    crate::runtime::render_writeback::settle_guest_writes();
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::MappingRawRowsRead,
+    );
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
     };
@@ -1993,7 +2003,9 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     // `flush_intersecting` returns immediately when nothing is armed, so this
     // costs a map-empty check per read. It must also precede `contig_for_span`:
     // the flush writes through the mapping and can retire the cached view.
-    crate::runtime::render_writeback::settle_guest_writes();
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::MappingRectRead,
+    );
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
     };
@@ -2301,7 +2313,9 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     // surfaces only. Safe to call from inside a flush — the storage rail reaches
     // this function through `write_full_rect_raw_at`, and `flush_intersecting`
     // removes intersecting windows up front so the nested call finds nothing.
-    crate::runtime::render_writeback::settle_guest_writes();
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::MappingRectWrite,
+    );
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "rect_raw") else {
         return false;
     };

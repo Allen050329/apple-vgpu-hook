@@ -1244,8 +1244,9 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     // not yet "landed" until this returns. One settle for every window the pass
     // issued, taken after all of them are on the queue, rather than one blocking
     // fence per window taken between them.
-    #[cfg(feature = "backend-vulkan")]
-    crate::backend::vulkan::engine::quiesce_guest_writes();
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::CompletionStamp,
+    );
     // And the other half of that sentence: everything this device is still
     // *reading* out of guest RAM has to be done reading. A draw that binds guest
     // pages through the imported RAMBlock reads them when its command buffer
@@ -1957,8 +1958,9 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                         // no presents. Any future attempt here must leave
                         // `completed` false and let the completion thread
                         // announce.
-                        #[cfg(feature = "backend-vulkan")]
-                        crate::backend::vulkan::engine::quiesce_guest_writes();
+                        crate::runtime::render_writeback::settle_guest_writes(
+                            crate::runtime::render_writeback::SettleSite::RootStamp,
+                        );
                         let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;
                         if gpa_map::write_u32(
                             host,
@@ -3350,7 +3352,9 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         // The guest is about to CPU-read these mappings, so
                         // every guest-page write this device submitted has to
                         // have executed first.
-                        crate::runtime::render_writeback::settle_guest_writes();
+                        crate::runtime::render_writeback::settle_guest_writes(
+                            crate::runtime::render_writeback::SettleSite::ChildStamp,
+                        );
                         let flushed = 0u32;
                         let flush_ok = true;
                         let oid = cmd.object_ids.first().copied().unwrap_or(0);

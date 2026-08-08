@@ -887,7 +887,9 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
     // raw contig view below, which bypasses the hooked readers — land any
     // resident-authoritative window (compute or render Store) first.
     //
-    crate::runtime::render_writeback::settle_guest_writes();
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::ScanoutPaint,
+    );
 
     let Some(m) = state.mappings.get(&mapping_id) else {
         return fail(CaptureDecline::NoMapping);

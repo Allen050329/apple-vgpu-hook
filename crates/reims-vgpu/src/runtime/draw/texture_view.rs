@@ -671,7 +671,9 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // Deferred-writeback flush-on-access: the reads below walk raw task GVAs
     // and bypass the mapping-keyed hooks — land any resident-authoritative
     // window whose physical pages alias the sampled span first.
-    crate::runtime::render_writeback::settle_guest_writes();
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::LinearTextureLoad,
+    );
     // Tight display textures are the common compositor source. Read the whole
     // image with one task-root/cache lifetime: the row loop below otherwise
     // rebuilds the GVA walker cache once per row (1,080 times for the live

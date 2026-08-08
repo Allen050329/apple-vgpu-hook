@@ -2283,7 +2283,9 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
     }
     // Deferred-writeback flush-on-access: land any pending resident content
     // in these pages first so this write applies on top of it, not under it.
-    crate::runtime::render_writeback::settle_guest_writes();
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::MappingBytesWrite,
+    );
     // Exact-window residency invalidation: guest pages in this range no
     // longer mirror any resident storage image (disjoint windows survive).
     state.invalidate_storage_residency_window(
@@ -2328,7 +2330,9 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
     }
     // Deferred-writeback flush-on-access: this read must observe the resident
     // content, not the stale pre-dispatch guest bytes.
-    crate::runtime::render_writeback::settle_guest_writes();
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::MappingBytesRead,
+    );
     copy_mapping_runs(
         state,
         host,

@@ -56,6 +56,105 @@ use crate::model::DeviceState;
 #[cfg(feature = "backend-vulkan")]
 use crate::runtime::host::{HostMemory, HostOps};
 
+/// Declare the settle sites once, and derive both census route names from one
+/// slug each: `concat!` builds `<slug>_us` from `<slug>`, so the count route
+/// and the cost route cannot drift into naming different sites.
+macro_rules! settle_sites {
+    ($($(#[$doc:meta])* $variant:ident => $slug:literal,)*) => {
+        /// Which host-side toucher of guest bytes is settling.
+        ///
+        /// # Why the settle names its caller
+        ///
+        /// The settle blocks this thread until every submitted guest-page
+        /// writeback has executed on the GPU, and on a driven boot that block is
+        /// the largest single item in the drain worker's wall clock — a
+        /// Safari-drag boot spent 15.6 of the worker's 24.7 busy seconds inside
+        /// it. It has eighteen call sites and, until this enum, one flag and one
+        /// `fence_us` total served all of them, so no boot could say which site
+        /// paid it. A fix aimed at that number was aimed by guess.
+        ///
+        /// Counting *calls* would rank the sites by how often they ask, which is
+        /// the wrong ranking: the flag is clear on most calls and those return
+        /// without touching a queue. [`settle_guest_writes`] therefore counts
+        /// only the calls that actually waited, and charges the microseconds to
+        /// the same site, because a site that settles rarely and expensively and
+        /// a site that settles constantly and cheaply read identically in a bare
+        /// count and want opposite fixes.
+        ///
+        /// The per-site microseconds and the `readback_split` `fence_us` total
+        /// are the same wait attributed twice, and that is the identity worth
+        /// checking: every settle in the device comes through here, so
+        /// `sum(settle_*_us)` and `fence_us` must agree to within the sampling
+        /// window. Their diverging means a new caller reached
+        /// `engine::quiesce_guest_writes` directly.
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub enum SettleSite {
+            $($(#[$doc])* $variant,)*
+        }
+
+        impl SettleSite {
+            /// Every site, for the tests that must be exhaustive over them.
+            pub const ALL: &'static [SettleSite] = &[$(SettleSite::$variant,)*];
+
+            /// Census route counting the settles at this site that waited.
+            pub fn route(self) -> &'static str {
+                match self { $(Self::$variant => $slug,)* }
+            }
+
+            /// Census cost charged to this site, in microseconds blocked.
+            pub fn route_us(self) -> &'static str {
+                match self { $(Self::$variant => concat!($slug, "_us"),)* }
+            }
+        }
+    };
+}
+
+settle_sites! {
+    /// `draw::texture_view::load_linear_texture_impl` — CPU read of a linear
+    /// texture's guest pages for the host cache.
+    LinearTextureLoad => "settle_linear_texture_load",
+    /// `draw::vulkan::load_linear_guest_memoized` — the memoized full-span CPU
+    /// re-read behind every linear sampled bind the gather rail declines.
+    LinearMemoRead => "settle_linear_memo_read",
+    /// `draw::vulkan::mapping_window_guest_runs` — resolving a type-11 gather
+    /// window over a mapping's pages.
+    Type11GatherWindow => "settle_type11_gather_window",
+    /// `draw::seed_color_load` — reading a render target's guest pages to seed
+    /// an attachment that will be loaded rather than cleared.
+    SeedColorLoad => "settle_seed_color_load",
+    /// `compute_exec::stage_texture_raw` — staging a compute texture's guest
+    /// bytes.
+    ComputeStageTexture => "settle_compute_stage_texture",
+    /// `scanout::paint_mapping` — the host console reading a mapping to paint.
+    ScanoutPaint => "settle_scanout_paint",
+    /// `drain::write_stamp` — the completion stamp's blocking fallback, taken
+    /// when the GPU-ordered stamp path declined.
+    CompletionStamp => "settle_completion_stamp",
+    /// `drain::drain_main_fifo` — the root packet's completion stamp.
+    RootStamp => "settle_root_stamp",
+    /// `drain::process_child_packet` — a child packet's completion stamp.
+    ChildStamp => "settle_child_stamp",
+    /// `mapping_write::write_bgra8_from_resident_gpu` — the GPU-direct type-11
+    /// Store, before it re-points the guest's pages.
+    MappingGpuStore => "settle_mapping_gpu_store",
+    /// `mapping_write::write_bgra8_inner` — the copying type-11 Store.
+    MappingBgra8Write => "settle_mapping_bgra8_write",
+    /// `mapping_write::write_rgba8_image_changed`.
+    MappingRgba8Write => "settle_mapping_rgba8_write",
+    /// `mapping_write::write_raw_rows`.
+    MappingRawRowsWrite => "settle_mapping_raw_rows_write",
+    /// `mapping_write::read_raw_rows`.
+    MappingRawRowsRead => "settle_mapping_raw_rows_read",
+    /// `mapping_write::read_rect_raw_at`.
+    MappingRectRead => "settle_mapping_rect_read",
+    /// `mapping_write::write_rect_raw_at_impl`.
+    MappingRectWrite => "settle_mapping_rect_write",
+    /// `mapper::write_mapping_bytes_only`.
+    MappingBytesWrite => "settle_mapping_bytes_write",
+    /// `mapper::read_mapping_bytes`.
+    MappingBytesRead => "settle_mapping_bytes_read",
+}
+
 /// Block until every guest-page write this device has submitted has executed.
 ///
 /// The writes above are recorded into the engine's command stream and not
@@ -69,10 +168,31 @@ use crate::runtime::host::{HostMemory, HostOps};
 /// copies (`engine::write_stamp_after_guest_writes`).
 ///
 /// Free when nothing is outstanding — the engine keeps a debt flag and this
-/// returns without touching a queue when it is clear.
-pub fn settle_guest_writes() {
+/// returns without touching a queue when it is clear. `site` is what a boot
+/// reads to find which caller pays for the waits that are not free; see
+/// [`SettleSite`].
+pub fn settle_guest_writes(site: SettleSite) {
     #[cfg(feature = "backend-vulkan")]
-    crate::backend::vulkan::engine::quiesce_guest_writes();
+    {
+        // The flag read is one relaxed-acquire load and clear is the common
+        // answer, so the census below runs only on the calls that cost
+        // something. It can race a writeback armed on another thread between
+        // this load and the wait, which makes the site's count a lower bound by
+        // at most one per race — the engine re-reads the flag under its own
+        // lock and the ordering is unaffected.
+        if !crate::backend::vulkan::engine::guest_writes_outstanding() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        crate::backend::vulkan::engine::quiesce_guest_writes();
+        crate::runtime::drain::note_store_route(site.route());
+        crate::runtime::drain::note_store_route_us(
+            site.route_us(),
+            started.elapsed().as_micros() as u64,
+        );
+    }
+    #[cfg(not(feature = "backend-vulkan"))]
+    let _ = site;
 }
 
 /// Release the engine residents of linear cache entries whose task or object
@@ -479,4 +599,33 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     // `store_render_frame` performs in `finish`.
     crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
     Ok(extent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SettleSite;
+
+    /// Two sites sharing a slug would silently sum their waits into one census
+    /// line, and the reading would name the wrong caller as the device's largest
+    /// cost — which is the exact mistake [`SettleSite`] exists to stop. Walks
+    /// [`SettleSite::ALL`], so a variant added without a slug of its own fails
+    /// here rather than at the next boot's ranking.
+    #[test]
+    fn every_settle_site_carries_its_own_census_route() {
+        let mut seen = std::collections::BTreeSet::new();
+        for site in SettleSite::ALL {
+            assert!(
+                seen.insert(site.route()),
+                "{:?} reuses the route {}",
+                site,
+                site.route()
+            );
+            assert_eq!(
+                site.route_us(),
+                format!("{}_us", site.route()),
+                "{site:?}"
+            );
+        }
+        assert_eq!(seen.len(), SettleSite::ALL.len());
+    }
 }

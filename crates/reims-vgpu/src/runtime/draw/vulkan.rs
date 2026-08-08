@@ -2464,7 +2464,9 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
     if !guest_run_alias_available(host) {
         return None;
     }
-    crate::runtime::render_writeback::settle_guest_writes();
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::Type11GatherWindow,
+    );
     let gpas = mapper::mapping_page_gpas(state, host, mid)?;
     let page = state.page_size();
     if (gpas.len() as u64).saturating_mul(page) < base_off.checked_add(span)? {
@@ -3127,7 +3129,9 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     }
     // Same coherence rule as the general loader: land any resident-
     // authoritative writeback aliasing the sampled span before reading it.
-    crate::runtime::render_writeback::settle_guest_writes();
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::LinearMemoRead,
+    );
     let mut scratch = std::mem::take(&mut state.guest_linear_scratch);
     scratch.resize(native_len, 0);
     let read = gva_mem::read_task_gva_by_id(

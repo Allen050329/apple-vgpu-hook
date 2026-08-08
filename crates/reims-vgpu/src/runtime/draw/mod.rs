@@ -4599,7 +4599,9 @@ fn seed_color_load<M: HostMemory + HostOps>(
 ) -> Option<Vec<u8>> {
     // The guest reads below may be served by pages a Store wrote through the
     // GPU, whose copy is submitted and not waited on.
-    crate::runtime::render_writeback::settle_guest_writes();
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::SeedColorLoad,
+    );
     // Discrete GPU: exact target GVA is the strongest identity across object-ref
     // recycling. Fall back to the type-2/3 texture namespace, never the
     // unrelated type-4 surface_id namespace. Guest memory is last.
