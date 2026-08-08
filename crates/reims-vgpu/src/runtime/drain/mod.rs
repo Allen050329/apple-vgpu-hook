@@ -1212,7 +1212,16 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     // no later check can tell that memory apart from the target it used to be —
     // which is why the page-set guard passed on 810 of 810 landings and the heap
     // corruption continued.
-    crate::runtime::render_writeback::settle_guest_writes();
+    //
+    // **Nothing may settle those writes before the GPU rail below is offered
+    // one.** That rail's first question is whether anything is still
+    // outstanding, because ordering behind nothing is a submission and a thread
+    // hop for an ordering that already holds. A settle here answers that
+    // question "no" every time, by blocking — which is the whole cost the rail
+    // exists to remove — and leaves `engine_delta` reporting `gpu_stamps=0`
+    // beside a `readback_split` `fence` that tracks the flush count exactly.
+    // Both quiesces below are reached only when the rail declines, and there
+    // they are the settle this comment used to describe.
     // The stamp word ordered behind the copies by the GPU rather than by this
     // thread blocking. Tried before either quiesce because when it takes,
     // neither is owed: its leading barrier names every command submitted before
@@ -1924,8 +1933,11 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                     if let Some(off) = stamp_slot_offset(0, state.page_size()) {
                         // The root stamp is a completion the guest waits on, so
                         // every deferred rail owes guest RAM its bytes here, not
-                        // only at `write_stamp`'s child slots.
-    crate::runtime::render_writeback::settle_guest_writes();
+                        // only at `write_stamp`'s child slots. The settle is the
+                        // `quiesce_guest_writes` below — one call, not two, since
+                        // the first would clear the debt the second then finds
+                        // clear.
+                        //
                         // Root slot 0 stays on the blocking rail, and the
                         // measurement is the reason rather than caution. Routing
                         // it through the GPU rail as well was booted and scored
