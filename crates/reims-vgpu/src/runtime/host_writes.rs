@@ -177,6 +177,31 @@ pub struct HostWrites {
 /// first.
 const RING: usize = 64;
 
+/// Census route banding how far back one ask reaches, in ring entries.
+///
+/// This is the distribution [`RING`]'s doc asks for, and the bands are multiples
+/// of [`RING`] rather than round numbers so a reading answers the sizing
+/// question directly: everything in `hw_reach_le4x` is a question a ring four
+/// times this one would have answered, and everything in `hw_reach_over64x` is
+/// one no affordable ring reaches, which is the reading that says the repair is
+/// writers naming their pages instead.
+///
+/// The first band is `<= RING` and not `< RING`: a reader whose mark is exactly
+/// [`RING`] entries back is asking about the [`RING`] writes the full ring still
+/// holds, so it is answerable. Below that boundary `Aged` cannot occur, and a
+/// non-zero `hw_reach_in_ring` beside a non-zero `gw_hw_aged` would mean the
+/// ring is being trimmed by something other than its own bound.
+fn reach_band(reach: u64) -> &'static str {
+    const R: u64 = RING as u64;
+    match reach {
+        r if r <= R => "hw_reach_in_ring",
+        r if r <= R * 4 => "hw_reach_le4x",
+        r if r <= R * 16 => "hw_reach_le16x",
+        r if r <= R * 64 => "hw_reach_le64x",
+        _ => "hw_reach_over64x",
+    }
+}
+
 impl HostWrites {
     /// The stamp a reader records beside a copy it has just taken.
     pub fn epoch(&self) -> u64 {
@@ -231,6 +256,7 @@ impl HostWrites {
         since: u64,
         pages: &[u64],
     ) -> HostWriteVerdict {
+        crate::runtime::drain::note_store_route(reach_band(self.epoch.saturating_sub(since)));
         if since < self.answers_from {
             return HostWriteVerdict::Aged;
         }
@@ -347,6 +373,35 @@ mod tests {
             w.wrote_any_since(&state, fresh, &[3 * P]),
             HostWriteVerdict::Quiet
         );
+    }
+
+    /// The band that reads "the ring answered this" has to end exactly where the
+    /// ring stops answering, or a boot's reading says a bigger ring is needed by
+    /// a margin that is really an off-by-one in the census.
+    ///
+    /// Walks the boundary from both sides against the live [`HostWrites`] rather
+    /// than against a second copy of the arithmetic, so the two cannot drift.
+    #[test]
+    fn the_first_reach_band_ends_where_the_ring_stops_answering() {
+        let state =
+            crate::model::DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let mut w = HostWrites::default();
+        // Fill well past the bound so `answers_from` is set by eviction and not
+        // by an empty ring.
+        for i in 0..(RING as u64 * 3) {
+            w.note_pages(vec![(100 + i) * P]);
+        }
+        let now = w.epoch();
+        for reach in 0..=(RING as u64 + 2) {
+            let aged = w.wrote_any_since(&state, now - reach, &[3 * P]) == HostWriteVerdict::Aged;
+            assert_eq!(
+                reach_band(reach) == "hw_reach_in_ring",
+                !aged,
+                "reach {reach} bands as {} but the ring {} it",
+                reach_band(reach),
+                if aged { "refused" } else { "answered" }
+            );
+        }
     }
 
     /// A mapping-named write is resolved through the mapping's live page list, so
