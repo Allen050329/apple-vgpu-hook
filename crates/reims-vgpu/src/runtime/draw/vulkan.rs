@@ -2925,6 +2925,16 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
 /// recomposite run over a live Wikipedia article scored **PATCHED none,
 /// UNSCOREABLE none** with both its gates satisfied, on five CLEAN offsets and
 /// one CHURN.
+///
+/// # The copying arm never reaches this, and that is the design
+///
+/// `gva_store_witness` is armed only by the GPU-direct Store rail, so a host
+/// without the guest-RAM import stamps nothing and this can never answer yes.
+/// Confirmed rather than argued: a `REIMS_VGPU_GUEST_IMPORT=off` boot reads
+/// `gvaseed_not_quiet` **3 246 against `load_seed_ok_color` 3 246** — every
+/// seed built, none elided — with `gvaseed_elided` and `gvarung_resident` both
+/// absent and zero bound imports. That arm keeps the behaviour it had before
+/// either rung existed.
 pub(super) fn gva_load_seed_elidable<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
