@@ -3676,7 +3676,7 @@ fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
         next_head: 0,
     };
 
-    let n = store_route_count("child_flush_channel_event");
+    let n = store_route_count("child_nop");
     let disposition = process_child_packet(&mut state, &mut host, 4, &fence(0));
     assert_eq!(
         disposition,
@@ -3684,7 +3684,7 @@ fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
         "the stamps must retire, or the guest waits on this fence forever"
     );
     assert_eq!(
-        store_route_count("child_flush_channel_event"),
+        store_route_count("child_nop"),
         n + 1,
         "the command is counted like every other decoded one"
     );
@@ -3701,7 +3701,7 @@ fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
 
     // A payload is the one thing that would falsify the stamps-only reading.
     process_child_packet(&mut state, &mut host, 4, &fence(4));
-    assert_eq!(store_route_count("child_flush_channel_event"), n + 2);
+    assert_eq!(store_route_count("child_nop"), n + 2);
 }
 
 /// A display-transaction command longer than its declared trailer must alarm,

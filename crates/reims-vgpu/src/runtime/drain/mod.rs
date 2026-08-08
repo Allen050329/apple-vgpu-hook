@@ -3519,19 +3519,24 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 }
             }
         }
-        // A fence with no payload. The guest emits it from a present's failure
-        // and teardown legs to order work it is abandoning, and retiring its
-        // stamps — which the drain does for every accepted packet — is the whole
-        // contract. Named so it stops being reported as an unknown opcode.
+        // `CmdNOP`, a fence with no payload. The guest emits it from a present's
+        // failure and teardown legs to order work it is abandoning, and retiring
+        // its stamps — which the drain does for every accepted packet — is the
+        // whole contract. Named so it stops being reported as an unknown opcode.
+        //
+        // The route is keyed on the command, not on that use. Naming it for the
+        // channel flush the display pipe happens to want is how the constant
+        // itself came to be misnamed, and it leaves a reader grepping the log
+        // for the command with nothing under it.
         CHILD_OP_NOP => {
-            crate::runtime::drain::note_store_route("child_flush_channel_event");
+            crate::runtime::drain::note_store_route("child_nop");
             // The command allocates no bytes, so payload is the one thing that
             // can falsify this reading. Bytes here would mean the command grew a
             // form this arm does not decode, and dropping them silently is what
             // the unknown-opcode arm was at least loud about.
             if !packet.payload.is_empty() {
                 crate::observe::fail(format!(
-                    "child_flush_channel_event fail reason=unexpected_payload ch={channel_id} \
+                    "child_nop fail reason=unexpected_payload ch={channel_id} \
                      plen={} (this command carries stamps only; a payload means it has grown \
                      a form this arm does not decode)",
                     packet.payload.len()

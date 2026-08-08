@@ -337,6 +337,26 @@ pub const ROOT_OP_DEVICE_INFO_TAHOE: u16 = 0x3a;
 
 /// The highest opcode that names a command.
 ///
+/// # Commands that are not FIFO opcodes
+///
+/// Three command names in this protocol are **not** in this space, and each has
+/// been looked for here and does not belong. They are listed so the next reader
+/// does not add a constant for one:
+///
+/// - `CmdOptimizeForGPUAccess` and `CmdOptimizeImageForGPUAccess` are
+///   **blit command-stream** commands, not FIFO packets. They live in the
+///   serialized command-buffer opcode space that
+///   [`crate::runtime::decode::blit`] decodes, where the `Image` form is the
+///   slice/level variant, and this device already decodes both. A FIFO constant
+///   for either would be a second, wrong home for a command that has one.
+/// - `CmdSetProperty` is not a command at all. It is the label the
+///   [`CHILD_OP_DISPLAY_SET_PROPERTIES`] (`0x0a`) handler uses when it reports
+///   an exception forwarding a property to the display nub, so it names a
+///   failure *inside* an opcode this device already has.
+///
+/// The general rule the three share: a `Cmd*` name is not evidence of a FIFO
+/// opcode. This space is exactly the slots below, and it is full.
+///
 /// The reference host bounds the header's 16-bit opcode with `opcode <= 0x40`
 /// before indexing its dispatch table, so `0x41` and above are not commands that
 /// went unimplemented — they are values no handler exists for at all, and a
@@ -360,7 +380,7 @@ pub const CHILD_OP_MAX: u16 = 0x40;
 /// device cannot decode" — the first is expected of an older guest and the
 /// second is a gap in this device.
 ///
-/// `0x2d` is in this set on the host that was read, and is also
+/// `0x2d` is in this set on the reference host, and is also
 /// [`ROOT_OP_DEVICE_INFO_MONTEREY`]. Both are true: the Monterey-era device-info
 /// command was retired in favour of [`ROOT_OP_DEVICE_INFO_TAHOE`] (`0x3a`), and
 /// this device still answers it for a guest old enough to ask. The root arm runs
