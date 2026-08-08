@@ -2451,9 +2451,22 @@ pub(super) fn strided_window_extent(w: u32, h: u32, bpp: u64, bpr: u64) -> Optio
 /// [`task_gva_guest_run_window`] does.
 ///
 /// Shared by the type-11 and type-5 sampled rails, which reach the same pages
-/// through different window math. The flush is the coherence rule the CPU
-/// loaders obey: a resident-authoritative window covering this mapping must
-/// land before the GPU reads, or the gather sees the pre-Store bytes.
+/// through different window math.
+///
+/// # No settle, for the reason its linear twin already states
+///
+/// This produced a settle until it was measured at 945 waits and 0.63 s on a
+/// driven boot, justified as "the coherence rule the CPU loaders obey: a
+/// resident-authoritative window covering this mapping must land before the GPU
+/// reads, or the gather sees the pre-Store bytes". That rule is the CPU
+/// loaders', and this is not one of them. Nothing here reads a pixel byte: it
+/// resolves a page list and coalesces it into runs, and the *GPU* reads those
+/// runs when the draw's command buffer executes.
+///
+/// A guest-page writeback is a GPU command on the same single queue, submitted
+/// before this call can return, so queue order already puts it ahead of the
+/// gather. [`try_linear_sample_zero_copy`] states the same argument for the
+/// linear gather and has never taken a settle; this is the arm that diverged.
 fn mapping_window_guest_runs<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2464,9 +2477,6 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
     if !guest_run_alias_available(host) {
         return None;
     }
-    crate::runtime::render_writeback::settle_guest_writes(
-        crate::runtime::render_writeback::SettleSite::Type11GatherWindow,
-    );
     let gpas = mapper::mapping_page_gpas(state, host, mid)?;
     let page = state.page_size();
     if (gpas.len() as u64).saturating_mul(page) < base_off.checked_add(span)? {

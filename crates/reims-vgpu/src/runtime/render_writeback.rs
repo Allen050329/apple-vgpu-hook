@@ -69,7 +69,7 @@ macro_rules! settle_sites {
         /// writeback has executed on the GPU, and on a driven boot that block is
         /// the largest single item in the drain worker's wall clock — a
         /// Safari-drag boot spent 15.6 of the worker's 24.7 busy seconds inside
-        /// it. It has seventeen call sites and, until this enum, one flag and one
+        /// it. It has sixteen call sites and, until this enum, one flag and one
         /// `fence_us` total served all of them, so no boot could say which site
         /// paid it. A fix aimed at that number was aimed by guess.
         ///
@@ -143,9 +143,6 @@ settle_sites! {
     /// `draw::vulkan::load_linear_guest_memoized` — the memoized full-span CPU
     /// re-read behind every linear sampled bind the gather rail declines.
     LinearMemoRead => "settle_linear_memo_read",
-    /// `draw::vulkan::mapping_window_guest_runs` — resolving a type-11 gather
-    /// window over a mapping's pages.
-    Type11GatherWindow => "settle_type11_gather_window",
     /// `draw::read_buffer_bytes_resolved` — the one CPU read of a buffer's
     /// guest bytes, reached by buffer-backed sampled textures, the indirect
     /// command buffer decode and the CPU buffer fallback.
