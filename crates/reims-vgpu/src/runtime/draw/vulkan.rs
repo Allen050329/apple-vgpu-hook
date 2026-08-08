@@ -2767,6 +2767,148 @@ fn load_buffer_content<M: HostMemory + HostOps>(
 /// UNSCOREABLE none** across six anchors with its reload and movement gates
 /// both satisfied. A second workload (page loads and scrolling) served 11 103
 /// binds off the rung with no loss on the fail channel.
+/// The guest bytes one GVA render target occupies, as the rails that ask about
+/// it name them.
+///
+/// One value rather than five parameters because the five only mean anything
+/// together — a stride belongs to a height, and a format decides the channel
+/// order the registry keys a resident on — and because two callers assembling
+/// the same five by hand is how they come to disagree about one of them.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct GvaSpan {
+    pub gva: u64,
+    pub row_stride: u32,
+    pub width: u32,
+    pub height: u32,
+    /// The guest's declared pixel format, not a host one:
+    /// [`gva_resident_bgra`] turns it into the `bgra` half of the key.
+    pub format: u16,
+}
+
+/// Why a GVA span's resident may not stand in for its guest pages.
+///
+/// Kept apart from a bare `None` because the three have nothing in common: one
+/// is a span with no identity at all, one is a target something has written
+/// since the Store, and one is a target the engine no longer holds. Each caller
+/// names them on its own census routes — the rule is shared, the vocabulary is
+/// not, so a reading says which rung refused as well as why.
+pub(super) enum GvaResidentRefusal {
+    /// The page walk came up short, so the span has no key to look up. The same
+    /// refusal the Store itself takes; a target that never got a key was never a
+    /// candidate.
+    NoGeneration,
+    /// The witness will not call the pages quiet.
+    Wrote(crate::runtime::gva_store_witness::GvaWriteReach),
+    /// Quiet, but the engine is not holding an image under this identity.
+    NoResident,
+}
+
+/// The one currency test behind every GVA resident shortcut: does the engine
+/// still hold, under this span's own identity, what the render Store published
+/// into these guest pages?
+///
+/// Two rails ask it — the sampled bind below and the colour LOAD seed — and it
+/// is written once because a copied version of this rule is the next
+/// divergence. The callers differ only in what they do with the answer.
+///
+/// The generation is recomputed from the span's *current* page set rather than
+/// read out of whatever witness entry sits at this address. The map can hold an
+/// orphan, a target whose pages have since moved keyed under the hash they had,
+/// and an orphan's token still answers about pages that now belong to something
+/// else. Recomputing makes a moved page list miss, which is
+/// [`crate::runtime::gva_store_witness`]'s own rule: the wrong answer is
+/// unreachable rather than guarded.
+pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    span: GvaSpan,
+) -> Result<crate::backend::vulkan::engine::TargetIdentity, GvaResidentRefusal> {
+    use crate::runtime::gva_store_witness::{reach, GvaTargetKey};
+
+    let GvaSpan {
+        gva,
+        row_stride,
+        width: w,
+        height: h,
+        format,
+    } = span;
+    if gva == 0 || w == 0 || h == 0 {
+        return Err(GvaResidentRefusal::NoGeneration);
+    }
+    let generation = gva_span_alloc_generation(state, host, task_id, gva, row_stride, h);
+    if generation == 0 {
+        return Err(GvaResidentRefusal::NoGeneration);
+    }
+    let bgra = gva_resident_bgra(format);
+    let verdict = reach(
+        state,
+        host,
+        GvaTargetKey {
+            gva,
+            generation,
+            width: w,
+            height: h,
+            bgra,
+        },
+    );
+    if !verdict.is_quiet() {
+        return Err(GvaResidentRefusal::Wrote(verdict));
+    }
+    let identity = crate::backend::vulkan::engine::TargetIdentity::Gva {
+        gva,
+        width: w,
+        height: h,
+        generation,
+        bgra,
+    };
+    if !crate::backend::vulkan::engine::resident_content_ready(&identity) {
+        return Err(GvaResidentRefusal::NoResident);
+    }
+    Ok(identity)
+}
+
+/// Could the colour LOAD seed at this GVA attachment have been elided? Counted,
+/// answer discarded.
+///
+/// # Why this is a probe and not the rung
+///
+/// `settle_linear_texture_seed` is the device's largest remaining wait — 4 701
+/// per driven drag, **4 692 of them genuine overlaps**, because a
+/// `MTLLoadActionLoad` over a GVA target reads the attachment's own guest pages
+/// on the CPU while the render Store that published them is still writing. The
+/// sampled twin of that wait was removed by `try_gva_resident_sample`, and the
+/// same currency test applies here.
+///
+/// A cross-pass version of this rung existed and was **deleted for reading
+/// zero**. That zero was an artifact of where it was sampled: it sat downstream
+/// of `mrt_draw_request`, which produces the seed *eagerly* for every GVA LOAD,
+/// so by the time it ran no draw had a seedless GVA LOAD target and its
+/// denominator was empty by construction. It could not have fired whatever the
+/// guest did.
+///
+/// So the question has never actually been asked, and it is asked here — at the
+/// production site, before `seed_color_load` reads anything. Nothing is elided
+/// yet: eliding means threading a "load from the resident" decision back into
+/// the encode path, and this class renders a *plausible* frame when it is wrong,
+/// so the population is worth knowing before the plumbing is built.
+pub(super) fn note_gva_load_seed_probe<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    span: GvaSpan,
+) {
+    use crate::runtime::drain::note_store_route;
+    note_store_route(
+        match gva_resident_if_current(state, host, task_id, span) {
+            Ok(_) => "gvaseed_could_elide",
+            Err(GvaResidentRefusal::NoGeneration) => "gvaseed_no_generation",
+            Err(GvaResidentRefusal::Wrote(_)) => "gvaseed_not_quiet",
+            Err(GvaResidentRefusal::NoResident) => "gvaseed_no_resident",
+        },
+    );
+}
+
 pub(super) fn try_gva_resident_sample<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2774,44 +2916,33 @@ pub(super) fn try_gva_resident_sample<M: HostMemory + HostOps>(
     tex: &TextureDescriptor,
 ) -> Option<(u32, u32, SampledSourceRequest)> {
     use crate::runtime::drain::note_store_route;
-    use crate::runtime::gva_store_witness::{reach, GvaTargetKey};
 
     let (gva, layout) = tex.level_gva(0, state.page_shift)?;
     let (w, h) = (layout.width, layout.height);
-    if gva == 0 || w == 0 || h == 0 {
-        return None;
-    }
     let row_stride = u32::try_from(layout.row_stride).ok()?;
-    let generation = gva_span_alloc_generation(state, host, task_id, gva, row_stride, h);
-    if generation == 0 {
-        // The page walk came up short, so this span has no identity to look up.
-        // Not counted against the rung: it is the same refusal the Store itself
-        // takes, and a target that never got a key was never a candidate.
-        return None;
-    }
-    let key = GvaTargetKey {
-        gva,
-        generation,
-        width: w,
-        height: h,
-        bgra: gva_resident_bgra(tex.pixel_format),
+    let identity = match gva_resident_if_current(
+        state,
+        host,
+        task_id,
+        GvaSpan {
+            gva,
+            row_stride,
+            width: w,
+            height: h,
+            format: tex.pixel_format,
+        },
+    ) {
+        Ok(identity) => identity,
+        Err(GvaResidentRefusal::NoGeneration) => return None,
+        Err(GvaResidentRefusal::Wrote(verdict)) => {
+            note_store_route(verdict.route());
+            return None;
+        }
+        Err(GvaResidentRefusal::NoResident) => {
+            note_store_route("gvarung_resident_absent");
+            return None;
+        }
     };
-    let verdict = reach(state, host, key);
-    if !verdict.is_quiet() {
-        note_store_route(verdict.route());
-        return None;
-    }
-    let identity = crate::backend::vulkan::engine::TargetIdentity::Gva {
-        gva,
-        width: w,
-        height: h,
-        generation,
-        bgra: key.bgra,
-    };
-    if !crate::backend::vulkan::engine::resident_content_ready(&identity) {
-        note_store_route("gvarung_resident_absent");
-        return None;
-    }
     note_store_route("gvarung_resident");
     Some((w, h, SampledSourceRequest::Target(identity)))
 }

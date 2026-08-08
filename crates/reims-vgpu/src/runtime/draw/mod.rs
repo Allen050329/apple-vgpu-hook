@@ -4105,6 +4105,23 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             // refused. Seeding here would need the mapping read twice.
             //
             {
+                // Before the read, not after it: the seed this is about to build
+                // is the one a resident rung would replace, and a probe placed
+                // downstream of here measures an empty population by
+                // construction — see `note_gva_load_seed_probe`.
+                #[cfg(feature = "backend-vulkan")]
+                vulkan::note_gva_load_seed_probe(
+                    state,
+                    host,
+                    task_id,
+                    vulkan::GvaSpan {
+                        gva,
+                        row_stride: bpr,
+                        width: mw,
+                        height: mh,
+                        format: mfmt,
+                    },
+                );
                 seed = seed_color_load(state, host, task_id, att.texture_ref, gva, mw, mh);
                 if seed.is_none() {
                     crate::observe::fail(format!(
