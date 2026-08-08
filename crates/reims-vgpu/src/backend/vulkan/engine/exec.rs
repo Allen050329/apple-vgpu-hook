@@ -1390,15 +1390,69 @@ pub(crate) unsafe fn execute_draw_inner(
         height: req.height,
         bgra: output_bgra,
     });
-    let joins = batch_eligible
-        && req.load_from_target
-        && req.target_rgba8.is_none()
-        && req.seed_from_target.is_none()
-        && !samples_own_target
-        && batch_target
-            .as_ref()
-            .and_then(|t| pools.batch_slot(t))
-            .is_some();
+    // Why this draw does not append to the open batch, named by its first
+    // refusing term.
+    //
+    // 56 % of draws force a fresh command buffer, and each of those is a
+    // `vkQueueSubmit` and a fence — ~2 100 a second against a ring eight deep,
+    // which is what `Phase::Slot` measures the worker blocking on. A bare join
+    // rate cannot say which of these terms to attack, and the rule has enough
+    // terms that guessing picks the wrong one: `!samples_own_target` is the
+    // obvious suspect since the GVA resident sampled rung made self-alias
+    // common, but `batch_eligible` alone folds seven conditions before any of
+    // these are reached.
+    //
+    // The seven terms of `batch_eligible` are spelled out here rather than
+    // folded, because "ineligible" is the answer for most of the population and
+    // would be the least useful thing this census could say. `joins` still reads
+    // `batch_eligible` through the first seven arms, so the two cannot diverge:
+    // an arm added to one without the other changes what `joins` means and the
+    // debug assertion below fails.
+    //
+    // One expression, evaluated once, so the decision and the census cannot
+    // disagree about what the rule is. Ordered as the predicate was, except that
+    // `batch_slot` stays last because it is the only term that looks anything
+    // up.
+    let no_join = if force_loss {
+        Some("nojoin_force_loss")
+    } else if ctx.caps.quirks.no_deferred_draw_batching {
+        Some("nojoin_quirk")
+    } else if is_mrt {
+        Some("nojoin_mrt")
+    } else if req.depth.is_some() {
+        Some("nojoin_depth")
+    } else if !req.skip_readback {
+        Some("nojoin_reads_back")
+    } else if req.occlusion_query.is_some() {
+        Some("nojoin_query")
+    } else if req.target_identity.is_none() {
+        Some("nojoin_no_identity")
+    } else if !req.load_from_target {
+        Some("nojoin_not_load_from_target")
+    } else if req.target_rgba8.is_some() {
+        Some("nojoin_cpu_seed")
+    } else if req.seed_from_target.is_some() {
+        Some("nojoin_gpu_seed")
+    } else if samples_own_target {
+        Some("nojoin_samples_own_target")
+    } else if batch_target
+        .as_ref()
+        .and_then(|t| pools.batch_slot(t))
+        .is_none()
+    {
+        Some("nojoin_no_open_batch")
+    } else {
+        None
+    };
+    crate::runtime::drain::note_store_route(no_join.unwrap_or("join_appended"));
+    let joins = no_join.is_none();
+    // The ladder above restates `batch_eligible`'s terms, and `batch_eligible`
+    // is still read on its own further down. A term corrected in one spelling
+    // and not the other is the divergence this catches, at no release cost.
+    debug_assert!(
+        batch_eligible || no_join.is_some(),
+        "the no-join ladder must refuse everything batch_eligible refuses"
+    );
     // Claim the next ring slot — BEFORE any pool acquire, so a recycled slot
     // can never alias a still-in-flight CB. Blocks (retire) only when every
     // slot is still in flight; the wait lands in retire_wait_us. A batch
