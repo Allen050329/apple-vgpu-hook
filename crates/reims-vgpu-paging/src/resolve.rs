@@ -12,6 +12,30 @@ use reims_vgpu_wire::page_table as wire_page_table;
 
 pub use reims_vgpu_wire::page_table::{Geometry, ARM64E, X86_64};
 
+/// The page-table geometry for a guest page shift, or `None`.
+///
+/// Only 12 (x86_64) and 14 (arm64e) are geometries this device walks, and the
+/// answer is `None` for anything else — there is no arm default, because a walk
+/// at the wrong stride reads a tree that is there and returns PFNs that are
+/// wrong rather than failing.
+///
+/// This sits next to the two constants rather than in the device because the
+/// device is not its only caller: [`crate::span`] takes a `Geometry` and every
+/// device rail above it starts from a `page_shift`, so the selector would
+/// otherwise be a device-side function that the crate holding both geometries
+/// cannot use. It reads neither a fixture nor a host, which is what leaves it
+/// here rather than a rung either side.
+#[inline]
+pub fn geometry_for_page_shift(page_shift: u32) -> Option<Geometry> {
+    if page_shift == X86_64.page_shift {
+        Some(X86_64)
+    } else if page_shift == ARM64E.page_shift {
+        Some(ARM64E)
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Task {
     pub active: bool,
@@ -44,7 +68,13 @@ pub enum ResolveStatus {
     ErrZeroRootPfn = 5,
     ErrZeroDepth = 6,
     ErrDepthTooDeep = 7,
-    ErrAddressOutOfRange = 8,
+    // 8 was `ErrAddressOutOfRange`, removed rather than left as vocabulary no
+    // boot could ever print. Nothing in this crate or the device constructed
+    // it, and the format says nothing could: the walk masks each level's index
+    // to `index_bits` and discards the bits of the GVA above the tree's reach —
+    // which is what the guest's own descent does, so an address "past the end"
+    // is not a condition either side recognises. The discriminant is left as a
+    // hole rather than reused, because these numbers are compared across logs.
     ErrPageTableRead = 9,
     ErrZeroPfn = 10,
     ErrMalformedPte = 11,
@@ -97,7 +127,6 @@ pub fn resolve_status_name(status: ResolveStatus) -> &'static str {
         ResolveStatus::ErrZeroRootPfn => "zero-root-pfn",
         ResolveStatus::ErrZeroDepth => "zero-depth",
         ResolveStatus::ErrDepthTooDeep => "depth-too-deep",
-        ResolveStatus::ErrAddressOutOfRange => "address-out-of-range",
         ResolveStatus::ErrPageTableRead => "page-table-read",
         ResolveStatus::ErrZeroPfn => "zero-pfn",
         ResolveStatus::ErrMalformedPte => "malformed-pte",
@@ -231,6 +260,23 @@ mod tests {
     };
 
     const PAGE_SHIFT_ARM64E: u32 = ARM64E.page_shift;
+
+    /// The two supported page shifts select their own geometry and every other
+    /// shift selects none.
+    ///
+    /// The `None` half is the load-bearing one. A shift with no geometry that
+    /// fell back to an arm default would walk a real tree at the wrong stride:
+    /// the reads succeed, the indices come out of the wrong bits, and the PFNs
+    /// returned are wrong rather than absent.
+    #[test]
+    fn a_page_shift_selects_its_own_geometry_and_nothing_else_selects_one() {
+        assert_eq!(geometry_for_page_shift(X86_64.page_shift), Some(X86_64));
+        assert_eq!(geometry_for_page_shift(ARM64E.page_shift), Some(ARM64E));
+        // Between the two, below both, and past the width of an address.
+        for shift in [0, 11, 13, 15, 16, 21, 64, u32::MAX] {
+            assert_eq!(geometry_for_page_shift(shift), None, "shift {shift}");
+        }
+    }
 
     struct MapReader {
         map: BTreeMap<u64, u8>,
@@ -395,13 +441,10 @@ mod tests {
             assert!(max_base.checked_add(max_page_off).is_some());
         }
 
-        // And nothing wider is accepted. The shift alone decides this, so the
-        // depth bound is left at the shared maximum on purpose.
+        // And nothing wider is accepted. The shift is the only thing a
+        // geometry carries, so it is the only thing that can decide this.
         for shift in 0..64u32 {
-            let g = Geometry {
-                page_shift: shift,
-                max_depth: ARM64E.max_depth,
-            };
+            let g = Geometry { page_shift: shift };
             if g.validate().is_ok() {
                 assert!(
                     shift == ARM64E.page_shift || shift == X86_64.page_shift,

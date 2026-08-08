@@ -1,6 +1,7 @@
 //! Resolving a byte span to the guest pages under it.
 
 use crate::resolve::{read_task_root, translate_root_run, Geometry, ResolveStatus, Task};
+use alloc::vec::Vec;
 use reims_vgpu_wire::mem::GuestMemory;
 
 /// How many guest pages `[gva, gva+span)` touches, given `page_size`.
@@ -79,6 +80,177 @@ pub fn walk_span(
         &mut |index, r| visit(index, r.map(|gpa| gpa & !mask)),
     );
     Ok(())
+}
+
+/// Why a span did not resolve in full, keeping **where** it refused.
+///
+/// [`walk_span`] already separates the two — a setup refusal is its `Err` and a
+/// per-page refusal reaches its visitor — and every fail-closed caller then
+/// flattens them back into one value. They must not flatten to the *same* one:
+/// a setup refusal means the walk never reached a page table, so most of its
+/// statuses are "the directory did not read" rather than "this address does not
+/// translate", and a caller that reports them as an unresolved address names a
+/// check that never ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpanRefusal {
+    /// The walk could not start: an unusable geometry, an inactive task, an
+    /// unreadable directory, a zero root PFN or a zero depth. No page of the
+    /// span can resolve.
+    Setup(ResolveStatus),
+    /// The walk ran and a page of the span did not translate.
+    Page(ResolveStatus),
+}
+
+/// One page's worth of a byte span: the guest-physical bytes it lands on, and
+/// which bytes of the caller's buffer they are.
+///
+/// `gpa` is the page base **plus** the span's offset within that page, so it is
+/// the address to read or write directly — unlike [`walk_span`], which reports
+/// page bases because its callers index pages rather than bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpanChunk {
+    /// First guest-physical byte of this chunk.
+    pub gpa: u64,
+    /// Offset of this chunk in the caller's buffer.
+    pub offset: usize,
+    /// Length of the chunk. Never crosses the end of its page.
+    pub len: usize,
+}
+
+impl SpanChunk {
+    /// The chunk's bytes within a caller's buffer, as a range to index with.
+    #[inline]
+    pub fn range(self) -> core::ops::Range<usize> {
+        self.offset..self.offset + self.len
+    }
+}
+
+/// Cut `[gva, gva+len)` into one [`SpanChunk`] per guest page it touches, in
+/// order, stopping at the first page that does not resolve.
+///
+/// # Why the cutting is here and the transfer is not
+///
+/// This is the arithmetic every byte-level guest access owes and none of them
+/// can see whole: a span starts mid-page, so the first chunk is short, and the
+/// bytes left in the current page — not the bytes left in the buffer — bound
+/// every chunk after it. It was written twice in the device, once for reads and
+/// once for writes, in the same four lines each time, and a mistake in it does
+/// not fail: it reads or writes the right number of bytes at an address that
+/// belongs to the neighbouring page.
+///
+/// What stays with the caller is the transfer, because the seam here
+/// ([`GuestMemory`]) only reads and only answers `bool`, while the device's own
+/// host access reads *and* writes and names **which** transaction failed. A
+/// copy loop moved in here would have to flatten that to "a byte did not move".
+/// So the caller keeps its typed error and its `&mut` host, and takes the
+/// arithmetic from here.
+///
+/// The visitor answering `false` stops the walk, and a stopped walk is `Ok`:
+/// stopping is the caller's decision, not a refusal.
+pub fn visit_span_chunks(
+    mem: &dyn GuestMemory,
+    geometry: Geometry,
+    task: &Task,
+    gva: u64,
+    len: usize,
+    visit: &mut dyn FnMut(SpanChunk) -> bool,
+) -> Result<(), SpanRefusal> {
+    if len == 0 {
+        return Ok(());
+    }
+    let page = geometry.page_size();
+    let mask = geometry.page_offset_mask();
+    let mut done = 0usize;
+    let mut refused = None;
+    walk_span(mem, geometry, task, gva, len as u64, &mut |_, r| {
+        let page_base = match r {
+            Ok(base) => base,
+            Err(status) => {
+                refused = Some(status);
+                return false;
+            }
+        };
+        // `done` advances by whole chunks, so the offset within the page is the
+        // span's own start offset on the first page and zero on every page
+        // after it. Deriving it from the running position rather than tracking
+        // it separately is what keeps the two consistent.
+        let cur = gva.saturating_add(done as u64);
+        let in_page = cur & mask;
+        let n = (len - done).min((page - in_page) as usize);
+        let chunk = SpanChunk {
+            gpa: page_base + in_page,
+            offset: done,
+            len: n,
+        };
+        done += n;
+        visit(chunk)
+    })
+    .map_err(SpanRefusal::Setup)?;
+    match refused {
+        Some(status) => Err(SpanRefusal::Page(status)),
+        None => Ok(()),
+    }
+}
+
+/// [`visit_span_chunks`] collected, for a caller that cannot transfer while it
+/// walks.
+///
+/// A guest **write** is exactly that caller: the walk reads page tables through
+/// a shared borrow of the host and the write needs an exclusive one, so the two
+/// cannot interleave and the whole span has to be resolved before the first
+/// byte moves. That is not a limitation to work around — it is the same
+/// resolve-then-write order a write owes anyway, since a span that refuses on
+/// its last page must not have had its first page written.
+pub fn span_chunks(
+    mem: &dyn GuestMemory,
+    geometry: Geometry,
+    task: &Task,
+    gva: u64,
+    len: usize,
+) -> Result<Vec<SpanChunk>, SpanRefusal> {
+    let mut out = Vec::new();
+    visit_span_chunks(mem, geometry, task, gva, len, &mut |chunk| {
+        out.push(chunk);
+        true
+    })?;
+    Ok(out)
+}
+
+/// The page-aligned GPA of every guest page under `[gva, gva+span)`, in order,
+/// refusing the whole span if any page does not resolve.
+///
+/// The fail-closed counterpart to [`walk_span`]'s visitor, which reports an
+/// unresolved page and walks on. Both contracts are needed and they are not
+/// interchangeable: a caller checking a cached page list against the live table
+/// wants the holes reported in place, and a caller about to hand the list to a
+/// host mapping wants no list at all rather than a short one. Handing a short
+/// list to a mapper maps the pages that did resolve and silently drops the
+/// rest, so the guest reads its own bytes for part of a span and someone else's
+/// for the remainder.
+pub fn span_page_bases(
+    mem: &dyn GuestMemory,
+    geometry: Geometry,
+    task: &Task,
+    gva: u64,
+    span: u64,
+) -> Result<Vec<u64>, SpanRefusal> {
+    let mut out = Vec::with_capacity(pages_spanned(gva, span, geometry.page_size()) as usize);
+    let mut refused = None;
+    walk_span(mem, geometry, task, gva, span, &mut |_, r| match r {
+        Ok(page_base) => {
+            out.push(page_base);
+            true
+        }
+        Err(status) => {
+            refused = Some(status);
+            false
+        }
+    })
+    .map_err(SpanRefusal::Setup)?;
+    match refused {
+        Some(status) => Err(SpanRefusal::Page(status)),
+        None => Ok(out),
+    }
 }
 
 #[cfg(test)]
@@ -190,10 +362,7 @@ mod tests {
 
         // And a geometry off both pathways is refused before the task is read
         // at all, so a bad page shift cannot walk a tree at the wrong stride.
-        let bad = Geometry {
-            page_shift: 13,
-            max_depth: g.max_depth,
-        };
+        let bad = Geometry { page_shift: 13 };
         assert_eq!(
             walk_span(&mem, bad, &live, 0, 4096, &mut |_, _| true),
             Err(ResolveStatus::ErrUnsupportedGeometry)
@@ -250,6 +419,130 @@ mod tests {
         })
         .unwrap();
         assert_eq!(visited, 0);
+    }
+
+    /// The chunk run covers every byte of the span exactly once, in order, and
+    /// no chunk crosses the end of its page.
+    ///
+    /// The three properties are asserted together because the arithmetic fails
+    /// by trading one for another: bounding a chunk by the bytes left in the
+    /// buffer instead of the bytes left in the page still covers the span
+    /// exactly once, and runs off the end of the first page while doing it.
+    #[test]
+    fn a_chunk_run_covers_every_byte_once_and_stays_inside_its_page() {
+        let g = X86_64;
+        let page = g.page_size();
+        let mut buf = [0u8; IMAGE];
+        let mut b = Builder::new(g, &mut buf);
+        let root = b.map(1, 0, 0x40);
+        b.map_into(root, 1, 1, 0x41);
+        b.map_into(root, 1, 2, 0x42);
+        b.map_into(root, 1, 3, 0x43);
+        let task = directory(&mut b, root, 1);
+        let mem = SliceMemory::new(b.bytes());
+
+        // Starts 100 bytes into the first page and runs two pages past it, so
+        // the first chunk is short, the middle is whole and the last is a
+        // remainder — the three shapes a chunk can have.
+        let start = page + 100;
+        let len = (2 * page + 7) as usize;
+        let chunks = span_chunks(&mem, g, &task, start, len).unwrap();
+
+        assert_eq!(
+            chunks[0],
+            SpanChunk {
+                gpa: 0x41 * page + 100,
+                offset: 0,
+                len: (page - 100) as usize,
+            },
+            "the first chunk starts at the span's offset within its page"
+        );
+        assert_eq!(chunks.len(), 3);
+
+        let mut want_offset = 0usize;
+        for c in &chunks {
+            assert_eq!(c.offset, want_offset, "chunks tile the buffer in order");
+            let in_page = c.gpa & g.page_offset_mask();
+            assert!(
+                in_page + c.len as u64 <= page,
+                "chunk at {:#x} for {} bytes runs past the end of its page",
+                c.gpa,
+                c.len
+            );
+            want_offset += c.len;
+        }
+        assert_eq!(want_offset, len, "every byte of the span is covered");
+
+        // And the GPAs are the pages the table names, not a run from the first.
+        let got: Vec<u64> = chunks.iter().map(|c| c.gpa).collect();
+        assert_eq!(got, [0x41 * page + 100, 0x42 * page, 0x43 * page]);
+    }
+
+    /// A span with an unresolved page yields no chunks at all, and the refusal
+    /// says the walk ran — as distinct from never having started.
+    ///
+    /// The distinction is the point of [`SpanRefusal`]: a caller that reports a
+    /// setup status as an unresolved address names a check that never ran.
+    #[test]
+    fn a_chunk_run_refuses_the_whole_span_and_says_where_it_refused() {
+        let g = X86_64;
+        let page = g.page_size();
+        let mut buf = [0u8; IMAGE];
+        let mut b = Builder::new(g, &mut buf);
+        // Page 1 of the span is left unmapped between two that resolve.
+        let root = b.map(1, 0, 0x40);
+        b.map_into(root, 1, 2, 0x42);
+        let live = directory(&mut b, root, 1);
+        let zero_root = directory(&mut b, 0, 1);
+        let mem = SliceMemory::new(b.bytes());
+
+        assert_eq!(
+            span_chunks(&mem, g, &live, 0, (3 * page) as usize),
+            Err(SpanRefusal::Page(ResolveStatus::ErrZeroPfn)),
+            "a hole mid-span refuses the span rather than returning its head"
+        );
+        assert_eq!(
+            span_chunks(&mem, g, &zero_root, 0, (3 * page) as usize),
+            Err(SpanRefusal::Setup(ResolveStatus::ErrZeroRootPfn)),
+            "a walk that never started is a setup refusal, not an address that \
+             does not translate"
+        );
+
+        // A zero-length span is not a refusal — it is nothing to do.
+        assert_eq!(span_chunks(&mem, g, &live, 0, 0), Ok(Vec::new()));
+    }
+
+    /// The fail-closed page list refuses a span with a hole rather than
+    /// returning the pages before it.
+    ///
+    /// A short list is the dangerous answer: its caller maps what it was given
+    /// and the guest then reads its own bytes for the head of the span and
+    /// whatever owns those host pages for the rest.
+    #[test]
+    fn span_page_bases_refuses_a_hole_rather_than_returning_a_short_list() {
+        let g = X86_64;
+        let page = g.page_size();
+        let mut buf = [0u8; IMAGE];
+        let mut b = Builder::new(g, &mut buf);
+        let root = b.map(1, 0, 0x40);
+        b.map_into(root, 1, 2, 0x42);
+        let task = directory(&mut b, root, 1);
+        let mem = SliceMemory::new(b.bytes());
+
+        assert_eq!(
+            span_page_bases(&mem, g, &task, 0, 3 * page),
+            Err(SpanRefusal::Page(ResolveStatus::ErrZeroPfn))
+        );
+        // A span that does resolve reports each page's own base, page-aligned:
+        // starting mid-page does not carry the offset onto the answer.
+        assert_eq!(
+            span_page_bases(&mem, g, &task, page / 2, page / 2).unwrap(),
+            [0x40 * page]
+        );
+        assert_eq!(
+            span_page_bases(&mem, g, &task, 2 * page + 8, page - 8).unwrap(),
+            [0x42 * page]
+        );
     }
 
     /// A span's page count is decided by where it *starts*, not only by how

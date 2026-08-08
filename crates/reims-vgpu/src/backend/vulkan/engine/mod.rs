@@ -2009,8 +2009,8 @@ impl GuestPageTarget {
     }
 
     /// The window's byte layout, for planning copy rectangles.
-    fn geometry(&self) -> crate::runtime::guest_window_regions::WindowGeometry {
-        crate::runtime::guest_window_regions::WindowGeometry {
+    fn geometry(&self) -> reims_vgpu_paging::regions::WindowGeometry {
+        reims_vgpu_paging::regions::WindowGeometry {
             pitch_bytes: self.pitch_bytes(),
             width_texels: self.width,
             height_texels: self.height,
@@ -2026,7 +2026,7 @@ impl GuestPageTarget {
     /// buffer detiled at that packing can be scattered by byte range with no
     /// row or format arithmetic left to do. When it does not hold, a run's
     /// bytes include padding that must not be written
-    /// ([`crate::runtime::guest_window_regions`] states why), and a
+    /// (`reims_vgpu_paging::regions` states why), and a
     /// `VkBufferCopy` has no way to skip it — so that window takes the
     /// rectangle path, which does.
     fn rows_are_dense(&self) -> bool {
@@ -2314,7 +2314,7 @@ unsafe fn plan_guest_copies(
         let base = bound.offset + bound.head;
         let start = run.window_offset;
         let end = start.saturating_add(run.guest.requested());
-        for r in crate::runtime::guest_window_regions::plan_regions(&geom, start, end) {
+        for r in reims_vgpu_paging::regions::plan_regions(&geom, start, end) {
             let region = ash::vk::BufferImageCopy::default()
                 // The rectangle's own offset is in window bytes; `- start`
                 // re-bases it onto this run, which is what `base` names.

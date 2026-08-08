@@ -1,58 +1,61 @@
 //! Read task GPU-virtual addresses via the task page directory.
 //!
-//! Thin wrapper over [`crate::contract::gva_resolve`] +
-//! [`crate::runtime::host::HostMemory`].
+//! The device's adapter over `reims_vgpu_paging`: the walk, the span cutting
+//! and the geometry table live there, and what this module adds is the three
+//! things that crate structurally cannot see — the device's [`TaskTable`], its
+//! [`HostMemory`] (as the [`HostPhys`] seam), and the mapping of the walk's
+//! typed refusals onto [`MemError`] and the failure channel.
+//!
 //! Geometry always requires an explicit create-time page_shift (12 = x86_64,
 //! 14 = arm64e). There is no arm-default overload — callers must choose.
 
-use crate::contract::gva_resolve::{
-    read_task_root, resolve_status_name, translate_root, Geometry, ResolveStatus, Task,
-    ARM64E_GEOMETRY, X86_64_GEOMETRY,
-};
 use crate::model::{TaskEntry, TaskTable};
 use crate::runtime::host::{HostMemory, MemError};
+use reims_vgpu_paging::resolve::{
+    geometry_for_page_shift, read_task_root, resolve_status_name, translate_root, ResolveStatus,
+    Task,
+};
+use reims_vgpu_paging::span::{visit_span_chunks, walk_span, SpanRefusal};
 use reims_vgpu_wire::mem::GuestMemory;
 
-pub use reims_vgpu_paging::span::{pages_spanned, walk_span};
-
-/// A span walk's setup refusal as this device's memory error.
+/// A span refusal as this device's memory error.
 ///
-/// One spelling, because three rails read bytes through [`walk_span`] and each
-/// would otherwise decide for itself which refusals mean "the directory did not
-/// read" and which mean "the walk refused". `ErrZeroRootPfn` and `ErrZeroDepth`
-/// are the walk's own answer about a table it could read; everything else here
-/// is a failure to get as far as the table.
-pub(crate) fn span_setup_error(status: ResolveStatus) -> MemError {
-    match status {
-        ResolveStatus::ErrZeroRootPfn | ResolveStatus::ErrZeroDepth => {
-            MemError::Unresolved(status)
-        }
-        _ => MemError::TaskRootRead,
+/// One spelling, because every rail that reads or writes bytes across a span
+/// ends here and each would otherwise decide for itself which refusals mean
+/// "the directory did not read", which mean "the walk refused", and which mean
+/// "that address does not translate".
+///
+/// A [`SpanRefusal::Page`] is the last of those: the walk ran and the guest's
+/// own table had no mapping, so the status is about the address. A
+/// [`SpanRefusal::Setup`] is one of the first two, and which one is the whole
+/// content of that arm — `ErrZeroRootPfn` and `ErrZeroDepth` are the walk's
+/// answer about a directory it *could* read, and everything else there is a
+/// failure to get as far as the directory at all.
+pub(crate) fn span_refusal_error(refusal: SpanRefusal) -> MemError {
+    match refusal {
+        SpanRefusal::Setup(
+            status @ (ResolveStatus::ErrZeroRootPfn | ResolveStatus::ErrZeroDepth),
+        ) => MemError::Unresolved(status),
+        SpanRefusal::Setup(_) => MemError::TaskRootRead,
+        SpanRefusal::Page(status) => MemError::Unresolved(status),
     }
 }
 
 /// [`HostMemory`]'s guest-physical reads as the wire crate's guest-memory
 /// seam. One address space — guest-physical — per that trait's hard rule.
-struct HostPhys<'a, M: HostMemory>(&'a M);
+///
+/// The one spelling in the crate. There were two, and the second was declared
+/// inside a function body in `gva_view`, which is how it stayed invisible: a
+/// reader of either site saw a complete four-line adapter and no reason to look
+/// for another. They agreed, but nothing made them — and the seam they
+/// implement is the one place where "which address space is this" is decided,
+/// so a copy that grew a second method or read a different accessor would put
+/// two answers in the crate with no diff to catch it.
+pub(crate) struct HostPhys<'a, M: HostMemory>(pub &'a M);
 
 impl<M: HostMemory> GuestMemory for HostPhys<'_, M> {
     fn read_at(&self, gpa: u64, dst: &mut [u8]) -> bool {
         self.0.read_gpa(gpa, dst).is_ok()
-    }
-}
-
-/// Select page-table geometry for a known guest page size.
-///
-/// Only 12 (x86_64) and 14 (arm64e) are valid. Unknown shifts return `None`
-/// (no silent arm fallback).
-#[inline]
-pub fn geometry_for_page_shift(page_shift: u32) -> Option<Geometry> {
-    if page_shift == X86_64_GEOMETRY.page_shift {
-        Some(X86_64_GEOMETRY)
-    } else if page_shift == ARM64E_GEOMETRY.page_shift {
-        Some(ARM64E_GEOMETRY)
-    } else {
-        None
     }
 }
 
@@ -78,35 +81,25 @@ pub fn read_task_gva<M: HostMemory>(
         active: true,
         directory_pfn: task.directory_pfn,
     };
-    let (page, mask) = (geom.page_size(), geom.page_offset_mask());
-    let mut filled = 0usize;
+    // Streams rather than collecting the chunks first: this sits one level
+    // below per-row blit loops, and a read that resolves to a single page —
+    // which most of them do — would otherwise allocate a one-element Vec per
+    // row. The write path cannot do the same, because the walk holds the host
+    // shared and the write needs it exclusively.
     let mut result: Result<(), MemError> = Ok(());
-    walk_span(
-        &reader,
-        geom,
-        &gr_task,
-        gva,
-        buf.len() as u64,
-        &mut |_, r| {
-            let page_base = match r {
-                Ok(gpa) => gpa,
-                Err(status) => {
-                    result = Err(MemError::Unresolved(status));
-                    return false;
-                }
-            };
-            let cur = gva.saturating_add(filled as u64);
-            let page_left = page - (cur & mask);
-            let n = (buf.len() - filled).min(page_left as usize);
-            if let Err(e) = host.read_gpa(page_base + (cur & mask), &mut buf[filled..filled + n]) {
+    visit_span_chunks(&reader, geom, &gr_task, gva, buf.len(), &mut |chunk| {
+        match host.read_gpa(chunk.gpa, &mut buf[chunk.range()]) {
+            Ok(()) => true,
+            Err(e) => {
+                // The host's own error, not a walk status: the address resolved
+                // and the transaction is what failed, and which transaction it
+                // was is the finding.
                 result = Err(e);
-                return false;
+                false
             }
-            filled += n;
-            true
-        },
-    )
-    .map_err(span_setup_error)?;
+        }
+    })
+    .map_err(span_refusal_error)?;
     result
 }
 
@@ -296,44 +289,18 @@ pub fn write_task_gva<M: HostMemory>(
         active: true,
         directory_pfn: task.directory_pfn,
     };
-    let (page, mask) = (geom.page_size(), geom.page_offset_mask());
     // Resolve first, then write: the walk borrows the host to read page tables
-    // and the writes need it mutably, so the two cannot interleave.
-    let mut page_gpas = Vec::new();
-    let mut refused = None;
-    {
+    // and the writes need it mutably, so the two cannot interleave. The
+    // collecting form of the cutter has this one caller, so its import is here
+    // rather than at the module head where it would be dead on a product build.
+    use reims_vgpu_paging::span::span_chunks;
+    let chunks = {
         let reader = HostPhys(&*host);
-        walk_span(
-            &reader,
-            geom,
-            &gr_task,
-            gva,
-            buf.len() as u64,
-            &mut |_, r| match r {
-                Ok(page_base) => {
-                    page_gpas.push(page_base);
-                    true
-                }
-                Err(status) => {
-                    refused = Some(status);
-                    false
-                }
-            },
-        )
-        .map_err(span_setup_error)?;
+        span_chunks(&reader, geom, &gr_task, gva, buf.len()).map_err(span_refusal_error)?
+    };
+    for chunk in chunks {
+        host.write_gpa(chunk.gpa, &buf[chunk.range()])?;
     }
-    if let Some(status) = refused {
-        return Err(MemError::Unresolved(status));
-    }
-    let mut written = 0usize;
-    for page_gpa in page_gpas {
-        let cur = gva.saturating_add(written as u64);
-        let page_left = page - (cur & mask);
-        let n = (buf.len() - written).min(page_left as usize);
-        host.write_gpa(page_gpa + (cur & mask), &buf[written..written + n])?;
-        written += n;
-    }
-    debug_assert_eq!(written, buf.len());
     Ok(())
 }
 
@@ -569,7 +536,8 @@ pub fn visit_task_gva_page_gpas<M: HostMemory>(
 ///
 /// The ordered form, for callers that walk the result as a window —
 /// neighbouring entries differing by exactly one page is what lets a gather
-/// coalesce them. Compare `len()` against [`pages_spanned`] to learn whether
+/// coalesce them. Compare `len()` against
+/// [`reims_vgpu_paging::span::pages_spanned`] to learn whether
 /// anything was dropped.
 pub fn task_gva_page_gpas<M: HostMemory>(
     host: &M,
@@ -592,7 +560,8 @@ pub fn task_gva_page_gpas<M: HostMemory>(
 /// The set form, for callers that only ask "is this page one of mine?" — the
 /// deferred-window page indexes and the blit/Store destination bounds. Order
 /// is not preserved and repeats collapse, so `len()` is a lower bound on the
-/// pages walked; that is what every caller compares against [`pages_spanned`].
+/// pages walked; that is what every caller compares against
+/// [`reims_vgpu_paging::span::pages_spanned`].
 pub fn task_gva_page_gpa_set<M: HostMemory>(
     host: &M,
     tasks: &TaskTable,
@@ -691,12 +660,20 @@ pub fn translate_task_gva<M: HostMemory>(
         active: true,
         directory_pfn: task.directory_pfn,
     };
-    let root = read_task_root(&reader, &gr_task, geom).ok()?;
-    let t = translate_root(&reader, geom, root.root_pfn, root.depth, gva);
-    if t.status != ResolveStatus::Ok {
-        return None;
-    }
-    Some(t.gpa)
+    // A one-byte span, so the single chunk's `gpa` is this GVA's own address —
+    // page base plus its offset within the page. Going through the span cutter
+    // rather than `read_task_root` + `translate_root` by hand is what keeps the
+    // zero-root and zero-depth refusals here identical to the ones every other
+    // rail gets: written out at this call site they were a fifth copy, and this
+    // copy was the one that did not have them, reaching the same answer only
+    // because the descent refuses a zero root a second time further down.
+    let mut gpa = None;
+    visit_span_chunks(&reader, geom, &gr_task, gva, 1, &mut |chunk| {
+        gpa = Some(chunk.gpa);
+        false
+    })
+    .ok()?;
+    gpa
 }
 
 /// One-line walk diagnosis for a single task slot (measure-only; no product gates).
@@ -826,8 +803,8 @@ mod tests {
     use crate::contract::endian::st32;
     use crate::observe::Decline;
 
-    /// The collapse this migration ended: nineteen distinct checks — the walk's
-    /// fifteen plus four of its own — all answered `MemError::Unmapped`, and
+    /// The collapse this migration ended: every distinct check — the walk's own
+    /// and four more here — answered `MemError::Unmapped`, and
     /// `MemError` reached the always-on log at no site in the crate. So a
     /// malformed PTE, a zero root PFN, an inactive task and a genuinely unmapped
     /// GPA were one value, invisibly, on the guest-memory hot path.
@@ -836,7 +813,7 @@ mod tests {
     /// one, because the property that matters is the absence of aliasing.
     #[test]
     fn no_two_guest_memory_checks_answer_with_the_same_reason() {
-        use crate::contract::gva_resolve::ResolveStatus as R;
+        use reims_vgpu_paging::resolve::ResolveStatus as R;
         const WALK: &[R] = &[
             R::ErrArgs,
             R::ErrInactiveTask,
@@ -845,7 +822,6 @@ mod tests {
             R::ErrZeroRootPfn,
             R::ErrZeroDepth,
             R::ErrDepthTooDeep,
-            R::ErrAddressOutOfRange,
             R::ErrPageTableRead,
             R::ErrZeroPfn,
             R::ErrMalformedPte,
@@ -882,7 +858,7 @@ mod tests {
             )
             .collect();
         let total = slugs.len();
-        assert_eq!(total, 32, "12 walk reasons + 20 memory reasons");
+        assert_eq!(total, 31, "11 walk reasons + 20 memory reasons");
         slugs.sort_unstable();
         slugs.dedup();
         assert_eq!(

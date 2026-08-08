@@ -361,7 +361,7 @@ pub fn references_for_runs<H: HostOps + ?Sized>(
             return Err(report_once(refusal));
         }
         let mut out = Vec::new();
-        for run in crate::runtime::gva_view::contig_page_runs(gpas, page_size) {
+        for run in reims_vgpu_paging::runs::contig_page_runs(gpas, page_size) {
             let run_start = (run.start as u64) * page_size;
             let run_end = (run.end as u64) * page_size;
             // Clip to the window: the first run usually starts before it (the
@@ -420,7 +420,7 @@ pub fn reference_for_pages<H: HostOps + ?Sized>(
     if !contiguous {
         return Err(report_once(MapRefusal::Scattered {
             pages: gpas.len(),
-            runs: crate::runtime::gva_view::contig_run_count(gpas, page_size),
+            runs: reims_vgpu_paging::runs::contig_run_count(gpas, page_size),
             first,
         }));
     }
@@ -808,7 +808,7 @@ mod tests {
     /// This number decides whether widening the bind to N ranges is worth
     /// building, and how expensive it would be — a window in two stretches and
     /// a window in five hundred both refuse identically without it. So it is
-    /// asserted against `gva_view::contig_run_count` on the same input rather
+    /// asserted against `reims_vgpu_paging::runs::contig_run_count` on the same input rather
     /// than against a literal: a hand-written expectation here would be a
     /// second implementation of the coalescing rule, and the one that drifts is
     /// always the copy nothing else reads.
@@ -822,7 +822,7 @@ mod tests {
             0x20000, 0x21000, // run 3
             0x50000, 0x51000, 0x52000, // run 4
         ];
-        let expected = crate::runtime::gva_view::contig_run_count(&gpas, PAGE);
+        let expected = reims_vgpu_paging::runs::contig_run_count(&gpas, PAGE);
         assert_eq!(expected, 4, "fixture must actually be four stretches");
 
         with_granularity(Some(PAGE), || {
@@ -851,7 +851,7 @@ mod tests {
         // case the widening is supposed to leave alone.
         let contiguous: Vec<u64> = (0..4).map(|i| 0x1000 + i * PAGE).collect();
         assert_eq!(
-            crate::runtime::gva_view::contig_run_count(&contiguous, PAGE),
+            reims_vgpu_paging::runs::contig_run_count(&contiguous, PAGE),
             1
         );
         with_granularity(Some(PAGE), || {

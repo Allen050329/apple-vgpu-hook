@@ -42,7 +42,7 @@ pub enum MemError {
     /// genuinely-unmapped GPA cases that also answer `Unmapped`. That is the
     /// "one status for N checks" shape the ground rules name by example, and it
     /// sat on the guest-memory hot path.
-    Unresolved(crate::contract::gva_resolve::ResolveStatus),
+    Unresolved(reims_vgpu_paging::resolve::ResolveStatus),
     /// The task is not active, or its directory PFN is zero, so there is no page
     /// table to walk. Distinct from [`Self::Unresolved`]: the walk never began.
     NoTaskDirectory,
@@ -98,7 +98,7 @@ impl MemError {
     pub fn is_guest_teardown(&self) -> bool {
         matches!(
             self,
-            Self::Unresolved(crate::contract::gva_resolve::ResolveStatus::ErrZeroPfn)
+            Self::Unresolved(reims_vgpu_paging::resolve::ResolveStatus::ErrZeroPfn)
         )
     }
 }
@@ -2008,7 +2008,7 @@ mod tests {
     /// happens to put it.
     #[test]
     fn only_a_zero_pfn_means_the_guest_tore_the_range_down() {
-        use crate::contract::gva_resolve::ResolveStatus as R;
+        use reims_vgpu_paging::resolve::ResolveStatus as R;
         const WALK: &[R] = &[
             R::Ok,
             R::ErrArgs,
@@ -2018,7 +2018,6 @@ mod tests {
             R::ErrZeroRootPfn,
             R::ErrZeroDepth,
             R::ErrDepthTooDeep,
-            R::ErrAddressOutOfRange,
             R::ErrPageTableRead,
             R::ErrZeroPfn,
             R::ErrMalformedPte,

@@ -2124,7 +2124,7 @@ pub(super) fn task_gva_guest_run_window<M: HostMemory + HostOps>(
     let page = state.page_size();
     let gpas =
         gva_mem::task_gva_page_gpas(host, &state.tasks, task_id, gva, span, state.page_shift);
-    let wanted = gva_mem::pages_spanned(gva, span, page);
+    let wanted = reims_vgpu_paging::span::pages_spanned(gva, span, page);
     if gpas.len() as u64 != wanted {
         return Err(WindowRefusal::SpanUnmapped);
     }
@@ -6612,7 +6612,7 @@ fn gva_span_alloc_generation<M: HostMemory + HostOps>(
     }
     let pages =
         gva_mem::task_gva_page_gpa_set(host, &state.tasks, task_id, gva, span, state.page_shift);
-    if (pages.len() as u64) < gva_mem::pages_spanned(gva, span, state.page_size()) {
+    if (pages.len() as u64) < reims_vgpu_paging::span::pages_spanned(gva, span, state.page_size()) {
         return 0;
     }
     gva_page_set_hash(&pages)

@@ -1931,7 +1931,7 @@ pub fn ensure_contig_view<H: HostMemory + HostOps>(
     // anyway turns documented control flow ("use write_mapping_bytes /
     // read_mapping_bytes / multi-run import-present") into a logged
     // `qemu_map_pages_callback_failed`.
-    let runs = crate::runtime::gva_view::contig_run_count(&gpas, page_sz as u64);
+    let runs = reims_vgpu_paging::runs::contig_run_count(&gpas, page_sz as u64);
     if runs != 1 {
         let served = CONTIG_FRAGMENTED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let m = state.mappings.get_mut(&mapping_id)?;
@@ -2167,7 +2167,7 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
         return false;
     }
     flush_retired_views(state, host);
-    let runs = crate::runtime::gva_view::contig_page_runs(&gpas, page_size);
+    let runs = reims_vgpu_paging::runs::contig_page_runs(&gpas, page_size);
     let import_started = std::time::Instant::now();
     for run in &runs {
         let run_gpas = &gpas[run.clone()];

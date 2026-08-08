@@ -14,9 +14,11 @@
 //!
 //! See [[map-memory2]] GPU-import model and HostOps `map_pages` / `unmap_pages`.
 
-use crate::contract::gva_resolve::Task;
 use crate::model::{DeviceState, GvaHostView, TaskEntry, TaskTable};
-use crate::runtime::gva_mem::geometry_for_page_shift;
+use crate::runtime::gva_mem::HostPhys;
+use reims_vgpu_paging::resolve::{geometry_for_page_shift, Task};
+use reims_vgpu_paging::runs::{contig_page_runs, contig_run_count};
+use reims_vgpu_paging::span::span_page_bases;
 use crate::runtime::host::{HostMemory, HostOps, MemError};
 use crate::runtime::mapper::RunCopy;
 
@@ -205,44 +207,21 @@ fn collect_span_gpas<M: HostMemory>(
         return Err(MemError::NoTaskDirectory);
     }
     let geom = geometry_for_page_shift(page_shift).ok_or(MemError::UnsupportedPageShift)?;
-    let page_size = geom.page_size();
-    struct HostPhys<'a, M: HostMemory>(&'a M);
-    impl<M: HostMemory> reims_vgpu_wire::mem::GuestMemory for HostPhys<'_, M> {
-        fn read_at(&self, gpa: u64, dst: &mut [u8]) -> bool {
-            self.0.read_gpa(gpa, dst).is_ok()
-        }
-    }
     let reader = HostPhys(host);
     let gr_task = Task {
         active: true,
         directory_pfn: task.directory_pfn,
     };
-    let mut gpas =
-        Vec::with_capacity(crate::runtime::gva_mem::pages_spanned(gva, length, page_size) as usize);
-    let mut refused = None;
-    // `walk_span` reports each page's own base, which is what HostOps
-    // `map_pages` takes.
-    crate::runtime::gva_mem::walk_span(&reader, geom, &gr_task, gva, length, &mut |_, r| match r {
-        Ok(page_base) => {
-            gpas.push(page_base);
-            true
-        }
-        Err(status) => {
-            refused = Some(status);
-            false
-        }
-    })
-    .map_err(crate::runtime::gva_mem::span_setup_error)?;
-    if let Some(status) = refused {
-        return Err(MemError::Unresolved(status));
-    }
+    // Page bases, which is what HostOps `map_pages` takes, and fail-closed,
+    // which is what makes them safe to hand it.
+    let gpas = span_page_bases(&reader, geom, &gr_task, gva, length)
+        .map_err(crate::runtime::gva_mem::span_refusal_error)?;
     if gpas.is_empty() {
         return Err(MemError::BadArgs);
     }
     Ok(gpas)
 }
 
-pub use reims_vgpu_paging::runs::{contig_page_runs, contig_run_count};
 
 /// Build or reuse a contiguous host-VA view of guest pages for `[gva, gva+length)`.
 ///
@@ -757,7 +736,7 @@ mod tests {
     use super::*;
     use crate::contract::endian::st32;
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::gva_resolve::ResolveStatus;
+    use reims_vgpu_paging::resolve::ResolveStatus;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
 

@@ -50,7 +50,6 @@ pub mod guest_ram;
 pub mod guest_ram_map;
 /// Scattered guest windows → image-copy rectangles. Pure arithmetic, ungated so
 /// both backends and every test arm reach it.
-pub mod guest_window_regions;
 /// Task GVA → guest RAM reads.
 pub mod gva_mem;
 /// Task-GVA HostOps views (MapMemory2 / UnmapMemory lifecycle).

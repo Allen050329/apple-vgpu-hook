@@ -1436,7 +1436,7 @@ pub fn resolve_type11_ref<M: HostMemory>(
 ///
 /// # Why the walk status is on it
 ///
-/// [`crate::contract::gva_resolve::ResolveStatus`] distinguishes fifteen checks
+/// `reims_vgpu_paging::resolve::ResolveStatus` distinguishes every check
 /// in the guest page-table walk and has done since it was written; this site
 /// collapsed all of them into the single word `translate`. Two refusals with
 /// opposite remedies were therefore indistinguishable in the log: a leaf PTE the

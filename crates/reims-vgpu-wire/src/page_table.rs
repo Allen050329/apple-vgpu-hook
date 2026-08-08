@@ -16,14 +16,21 @@
 //!   [`PTE_PFN_MASK`], used raw with no further shift.
 //! - **Zero is the sole not-present encoding**: an absent entry reads zero, and
 //!   a removed one is cleared back to zero.
-//! - A frame number never has bit 31 set, and physical page zero is never
-//!   mapped.
+//! - A frame number never has bit 31 set, and the flag is only ever written
+//!   together with a frame number — the guest builds an entry by OR-ing the two,
+//!   never the flag alone.
 //!
 //! Those last two points are why [`WalkError::MalformedPte`] is a distinct error
-//! rather than a pedantic split of [`WalkError::NotPresent`]. A working guest
-//! cannot produce a nonzero entry whose frame-number field is zero. Reading one
-//! means the page holding the table was corrupted, and collapsing the two arms
-//! would discard that signal to save a branch.
+//! rather than a pedantic split of [`WalkError::NotPresent`]. Together they say
+//! the only entry with a zero frame-number field and a nonzero word is
+//! [`PTE_FLAG_MASK`] exactly, which is a value the guest has no way to write.
+//! Reading one means the page holding the table was corrupted, and collapsing
+//! the two arms would discard that signal to save a branch.
+//!
+//! The argument deliberately does not rest on "physical page zero is never
+//! mapped". That is true of the platform rather than of this format, nothing in
+//! the guest's own construction enforces it, and it is not needed: the flag
+//! never travelling alone is what closes the case.
 //!
 //! The fan-out is 1024 entries per node and byte lengths convert to pages with a
 //! 12-bit shift. Both are the x86 pathway's values and both agree with
@@ -110,30 +117,30 @@ const _: () = {
 
 /// Page-table shape for one guest pathway.
 ///
-/// Only two numbers are stored. Everything else about the shape — entries per
+/// **One number is stored.** Everything else about the shape — entries per
 /// table, index mask, page size — is derived, because they are not independent:
 /// a node is exactly one page of four-byte entries, so the fan-out is fixed by
-/// the page size. Storing them separately invites a struct whose fields
+/// the page size. Storing any of them separately invites a struct whose fields
 /// disagree, which is what [`Geometry::validate`] would then have to catch.
+///
+/// [`MAX_DEPTH`] used to be a field here, and it is the worked example of that
+/// hazard: both pathway constants set it to `MAX_DEPTH`, nothing ever
+/// constructed a `Geometry` with anything else, and half of `validate` existed
+/// to catch a disagreement only a hand-built struct could create. The depth
+/// bound is a property of the address space, not of a page size — its
+/// derivation is the `const` assertion at its own declaration — so it is read
+/// from there directly and there is no second copy to keep honest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Geometry {
     /// Guest page shift: 12 on x86_64, 14 on arm64e. Never defaulted.
     pub page_shift: u32,
-    /// Bound on the depth read from the task directory.
-    pub max_depth: u32,
 }
 
 /// x86_64 macOS guest: 4 KiB pages, 1024 entries per node, ten index bits.
-pub const X86_64: Geometry = Geometry {
-    page_shift: 12,
-    max_depth: MAX_DEPTH,
-};
+pub const X86_64: Geometry = Geometry { page_shift: 12 };
 
 /// arm64e macOS guest: 16 KiB pages, 4096 entries per node, twelve index bits.
-pub const ARM64E: Geometry = Geometry {
-    page_shift: 14,
-    max_depth: MAX_DEPTH,
-};
+pub const ARM64E: Geometry = Geometry { page_shift: 14 };
 
 impl Geometry {
     /// Bytes per guest page.
@@ -188,9 +195,6 @@ impl Geometry {
         if self.page_shift != 12 && self.page_shift != 14 {
             return Err(WalkError::UnsupportedGeometry);
         }
-        if self.max_depth == 0 || self.max_depth > MAX_DEPTH {
-            return Err(WalkError::UnsupportedGeometry);
-        }
         Ok(())
     }
 }
@@ -204,7 +208,7 @@ pub enum WalkError {
     ZeroRootPfn,
     /// The task's directory reported depth zero.
     ZeroDepth,
-    /// The task's directory reported a depth past [`Geometry::max_depth`].
+    /// The task's directory reported a depth past [`MAX_DEPTH`].
     DepthTooDeep,
     /// A page holding part of the tree could not be read.
     TableRead,
@@ -302,7 +306,7 @@ pub fn walk<M: GuestMemory>(
     if depth == 0 {
         return Err(fail(WalkError::ZeroDepth));
     }
-    if depth > geometry.max_depth {
+    if depth > MAX_DEPTH {
         return Err(fail(WalkError::DepthTooDeep));
     }
 
@@ -423,7 +427,7 @@ pub fn walk_run<M: GuestMemory>(
         visit(0, Err(fail(WalkError::ZeroDepth)));
         return;
     }
-    if depth > geometry.max_depth {
+    if depth > MAX_DEPTH {
         visit(0, Err(fail(WalkError::DepthTooDeep)));
         return;
     }
@@ -719,10 +723,7 @@ mod tests {
     #[test]
     fn a_geometry_off_either_pathway_is_refused_rather_than_walked() {
         for shift in [0, 11, 13, 15, 16] {
-            let g = Geometry {
-                page_shift: shift,
-                max_depth: MAX_DEPTH,
-            };
+            let g = Geometry { page_shift: shift };
             assert_eq!(g.validate(), Err(WalkError::UnsupportedGeometry));
         }
         assert_eq!(X86_64.validate(), Ok(()));
