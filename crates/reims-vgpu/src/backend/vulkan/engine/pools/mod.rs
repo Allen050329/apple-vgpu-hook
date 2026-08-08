@@ -1923,6 +1923,25 @@ const STAGING_MISS_EMIT_EVERY: u64 = 512;
 /// the readback past more draws, and the completion-stamp contract forbids that:
 /// a Store's pixels must be in guest RAM before the stamp that claims them.
 ///
+/// # The readback share is now nearly all of it
+///
+/// Same probe after the self-alias join term was dropped from
+/// `engine::exec`'s `JoinTerms` ladder:
+///
+/// ```text
+/// batch_flushes            33538   (was 55334)
+/// batch_readback_joins     30471   90.9 % of them (was 58.8 %)
+/// batch_flush_draws        91495   2.73 draws per batch (was 1.77)
+/// ```
+///
+/// So the paragraph above has become the whole answer rather than most of it:
+/// **91 % of batches now end at a readback**, and the remaining 9 % is every
+/// other cause put together. Batch length is set by how often the guest issues
+/// a Store, the completion-stamp contract forbids deferring one, and 30 471
+/// readbacks is one per command stream. That is the floor this rail can reach
+/// without changing what a stamp promises — not a number to tune this constant
+/// against.
+///
 /// Before changing this constant, read `batch_flush_draws / batch_flushes`
 /// against it — while the ratio sits far below, the ceiling is not the bound.
 const BATCH_MAX_DRAWS: u64 = 8;

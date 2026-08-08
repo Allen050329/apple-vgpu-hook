@@ -304,13 +304,25 @@ pub(crate) enum Phase {
     /// it. Doubling the ring doubles that budget once; halving the submissions
     /// would do the same and keep the latency.
     ///
-    /// The submission count is the more promising end, and the next thing to
-    /// measure is why: `batch_joins` 41 453 of `batch_flush_draws` 94 904 means
-    /// **56 % of draws force a fresh command buffer**. `joins` is a six-term
-    /// rule, one term of which is `!samples_own_target` — and a draw sampling
-    /// the target it renders into is exactly what
-    /// `draw::vulkan::try_gva_resident_sample` now makes common. Split that
-    /// predicate by refusing term before assuming which one binds.
+    /// The submission count was the more promising end, and splitting the join
+    /// rule by refusing term found it: `!samples_own_target` alone forced
+    /// 29.7 % of all draws into their own command buffer, and it was standing
+    /// in for a barrier rather than for a real ordering constraint. Dropping it
+    /// took `batch_flushes` 55 334 -> 33 538 on the same probe.
+    ///
+    /// # What that bought, and what it did not
+    ///
+    /// `slot_us` 6 870 ms -> 5 640 ms and `ring_retire_blocks` 17 533 ->
+    /// 14 565 across the boot, so the ring does block less. The frame rate did
+    /// not move: 63/s before and after, 24 of 24 seconds below 100 Hz.
+    ///
+    /// A 39 % cut in submissions buying an 18 % cut in the blocking and no
+    /// frames says the ring was not queued behind submission *overhead*. In
+    /// the same second the device moves 4.46 GB of guest buffer runs into
+    /// device-local memory and writes 4.33 GB of rendered surface back to
+    /// guest pages — 8.8 GB/s across the bus on a discrete host, against a
+    /// worker that holds the engine lock 671 ms of every second. Look there
+    /// before shortening this span again.
     Slot = 1,
     Pipeline = 2,
     Stage = 3,

@@ -1510,6 +1510,28 @@ pub(crate) unsafe fn execute_draw_inner(
     // readback, an occlusion query or a missing identity — they are real
     // conditions this workload does not present, and a firing one is news.
     //
+    // # What it reads now
+    //
+    // Same probe after the self-alias term was dropped, 91 495 draws:
+    //
+    //   join_appended                38 272   41.8 %
+    //   nojoin_no_open_batch         19 836   21.7 %
+    //   join_appended_self_alias     19 685   21.5 %
+    //   nojoin_not_load_from_target  13 702   15.0 %
+    //
+    // Joins 43.5 % -> 63.3 % and `batch_flushes` 55 334 -> 33 538, a 39 %
+    // cut in submissions. `nojoin_no_open_batch` nearly doubled, which is the
+    // expected shape and not a regression: a self-alias draw that used to
+    // stop at its own term now walks to the end of the ladder and is counted
+    // there when the open batch is on another target.
+    //
+    // What that leaves is `nojoin_no_open_batch` as the largest refusal, and
+    // it is a statement about `BatchTarget` rather than about the draw — the
+    // batch is keyed by target identity and geometry, so a run alternating
+    // between two surfaces cannot batch at all even though each draw opens
+    // and ends its own render pass inside the command buffer. Nothing read so
+    // far says that key is load-bearing.
+    //
     // So the batching ceiling was one term: a draw sampling the target it
     // renders into, which the GVA resident sampled rung made common. That term
     // is gone, and the reason it was ever there does not survive reading the
