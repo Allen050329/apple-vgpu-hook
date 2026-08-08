@@ -37,16 +37,32 @@
 //! the wrong denominator for a per-surface-rail ratio by about 2.4x. Use the
 //! route counter for the rail being reasoned about.
 //!
-//! So there is no burst of redundant Stores to collapse on this workload, and
+//! So there is no burst of redundant Stores to collapse *inside* this rail, and
 //! the deferred window would still have nothing to coalesce. What is left is the
 //! rail's own cost at the rate the guest asks for it, and that cost is this
 //! device's largest single item: removing only its copy commands, with every
 //! barrier, flush and stamp left in place, took a driven drag from 76 Hz to
-//! 104 Hz and collapsed `slot_us` by a factor of 62. The route to it is
-//! therefore not fewer copies but copies that do not sit in the graphics queue
-//! ahead of the draws — see `backend::vulkan::engine::context`'s
-//! `dedicated_transfer_family`, where the host's idle copy engine and the five
-//! steps of using it are recorded.
+//! 104 Hz.
+//!
+//! # It is the bytes, not the queue they are submitted to
+//!
+//! The obvious reading of that ablation — that the copies are expensive because
+//! they sit in the graphics queue ahead of the draws — was tested by building
+//! the alternative and measuring it. It is wrong, and
+//! `backend::vulkan::engine::context`'s `dedicated_transfer_family` carries the
+//! four boots that say so: putting the bus-crossing half of this copy on a host
+//! that has an idle copy engine moves the block between three different counters
+//! and leaves the frame rate where it was. A narrower ablation isolates why —
+//! skipping the image read alone, with the bytes still crossing, is worth 4 Hz of
+//! the 30.
+//!
+//! What is expensive is the traffic: this rail and the GVA Store together put
+//! **~5.0 GB/s into guest RAM**, about 21 full-surface writebacks for every frame
+//! the user sees. Six surfaces at ~70 Hz would be a third of that even at one
+//! write each, so the redundancy is real — it is simply not *within* one rail,
+//! which is what the two censuses above were each measuring. Whatever removes it
+//! has to look across the rails and across frames, not at the spacing of Stores
+//! inside one.
 //!
 //! One caveat for whoever reads the witness this rail feeds:
 //! `MappingEntry::render_flush`'s doc quotes `render_flush_age_sub_ms` /

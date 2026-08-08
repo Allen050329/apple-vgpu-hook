@@ -1051,68 +1051,70 @@ impl DeviceContext {
 /// `slot_us` moved a number that was downstream of this one, which is why
 /// halving the submissions once bought no frames at all.
 ///
-/// So the prize for running these copies beside the rendering rather than
-/// through it is bounded below by the gap between 76 Hz and 104 Hz, and the
-/// remaining 16 Hz to a 120 Hz target is somewhere else entirely.
+/// # The prize is not here, and a built rail measured that
+///
+/// It reads from the table above as if moving the copies off this queue were
+/// worth the gap between 76 Hz and 104 Hz. It is not, and the way to find that
+/// out was to build it: a second queue, a ring of transfer command buffers, two
+/// timeline semaphores, and the writeback's scatter submitted to the copy
+/// engine instead of appended to the draw batch. It ran, on the x86/Vulkan
+/// pathway against the same host, with `vk_queues transfer_family=1`.
+///
+/// The split was at the **scratch buffer**, not at the image, and that part of
+/// the design was right and stays recorded because it is the cheap answer to the
+/// ownership problem below. The detile (`vkCmdCopyImageToBuffer` into the
+/// device-local scratch) stayed on `gq`, so the render target never left its
+/// family and never gave up its lossless framebuffer compression. Only the
+/// scatter — `vkCmdCopyBuffer` out of the scratch into imported guest pages —
+/// crossed, and the only resources both queues saw were buffers, which are free
+/// to share `CONCURRENT`.
+///
+/// What four driven Safari-drag boots measured, against a 67.8 Hz baseline taken
+/// on the same tree and machine that hour:
+///
+/// | arrangement | `present_hz` med | `slot_us` | CPU wait on the copy engine |
+/// |---|---|---|---|
+/// | shipping — every copy on `gq` | 67.8 | 265 000 us/s | — |
+/// | scatter on the copy engine, 4-deep ring | 67.4 | **8 000 us/s** | 240 000 us/s |
+/// | same, 16-deep | 69.8 | 290 000 us/s | ~0 |
+/// | same, 64-deep | 69.0 | 230 000 us/s | ~0 |
+///
+/// `slot_us` really does collapse — by 33x, close to what the ablation
+/// predicted. And it buys nothing, because **the block is conserved**. At depth
+/// 4 the drain worker stops waiting for a ring slot and starts waiting for a
+/// transfer command buffer instead, for the same 240 ms a second. Deepening the
+/// ring removes that wait and the block reappears a third time, as the graphics
+/// submission's own write-after-read wait for the scratch buffer it is about to
+/// overwrite. Three arrangements, three different counters, one number.
+///
+/// # Because the wall is the bus, and every queue shares it
+///
+/// A narrower ablation says so directly. Skipping only the image read, with the
+/// scatter still running and still moving its bytes, gives **72.9 Hz** — four
+/// Hertz, not thirty. The earlier ablation reached 104 Hz because it removed the
+/// scatter too, and with it the bus traffic. A copy engine moves those same
+/// bytes over that same link.
+///
+/// The traffic is the finding: ~1 500 guest-page writebacks a second at ~3.34 MB
+/// each is **~5.0 GB/s into guest RAM**, sustained, at ~70 displayed frames a
+/// second. That is about **21 full-surface writebacks per frame the user sees**,
+/// spread over roughly six surfaces — and it is split across two rails, the
+/// render Store at ~613/s (`readback_split`'s `vouch`) and the GVA Store making
+/// up the rest of `guest_write_linear`.
+///
+/// So the route to 120 Hz is fewer bytes crossing, and nothing about which
+/// engine carries them. Do not rebuild this rail to chase frames. It is worth
+/// rebuilding only *after* the byte volume comes down, when a decoupled
+/// `slot_us` would have something left to convert into frames — and the shape it
+/// should take is the one above.
 ///
 /// A copy engine is still not free, and anything built here has to answer three
 /// costs the shared queue does not pay: a cross-queue dependency needs a
 /// semaphore rather than a pipeline barrier, an image written by one family and
 /// read by another needs an ownership transfer or `CONCURRENT` sharing, and
 /// splitting a copy out of the batch it is currently appended to restores the
-/// second submission that appending it removed. The writeback is the better
-/// candidate of the two rails despite being the larger: nothing waits on it but
-/// the completion stamp, whereas a draw waits on its own gather.
-///
-/// # What moving the writeback actually requires
-///
-/// Written down because the shape is not obvious from the size of the prize, and
-/// the naive version — create a queue, submit the copy to it — is undefined
-/// behaviour rather than a slow rail. Resident images are `EXCLUSIVE`, so an
-/// image the graphics family wrote has undefined contents when read by the
-/// transfer family with no ownership transfer between them. The round trip per
-/// writeback is:
-///
-/// 1. In the graphics batch, after the draws: the existing layout transition to
-///    `TRANSFER_SRC_OPTIMAL`, plus a **release** barrier carrying
-///    `srcQueueFamilyIndex = gq`, `dstQueueFamilyIndex = tq`.
-/// 2. Flush that batch signalling a semaphore.
-/// 3. In a transfer command buffer: the matching **acquire** barrier, the copy
-///    commands, the `TRANSFER_WRITE -> HOST_READ` barrier, then a **release**
-///    back to `gq`.
-/// 4. Submit it waiting the first semaphore and signalling a second, plus its
-///    own fence — which `quiesce_guest_writes` must then wait, and today that
-///    walks the graphics ring alone.
-/// 5. The **next draw into that image** records the matching acquire, and its
-///    submission must wait the second semaphore.
-///
-/// Step 5 reads as the invasive one, because a per-image wait would make a
-/// graphics submission's wait list depend on which images the draws inside it
-/// touch, and nothing in the submission ring models that.
-///
-/// **A timeline semaphore removes that objection.** `timelineSemaphore` is core
-/// in Vulkan 1.2, which is this device's baseline, so it needs no capability
-/// gate. Keep one timeline for the transfer queue, incremented once per
-/// writeback submission. Capture its current value when a graphics command
-/// buffer *begins recording*, and have that submission wait the timeline at the
-/// captured value. Any image the draws touch that was released to `tq` was
-/// released by a transfer whose value is at or below what was captured, so the
-/// wait is sufficient for every one of them at once — one wait per submission,
-/// no per-image bookkeeping, and no stall in the ordinary case because those
-/// transfers were submitted before this command buffer was even recorded.
-///
-/// That turns step 5 from a redesign of the submission ring into a single extra
-/// wait value carried on the submit, and leaves the acquire itself as an extra
-/// pair of family indices on a barrier the draw path already emits — the
-/// registry tracks last access per image (`ResidentAccess`), so "released to the
-/// transfer family" is one more state there rather than a new mechanism.
-///
-/// `CONCURRENT` sharing across the two families removes steps 1, 3 and 5 and is
-/// the tempting shortcut. It is a real trade rather than a free one — a
-/// concurrently-shared image gives up lossless framebuffer compression on
-/// several vendors, taxing every draw to speed up the copy — so it has to be
-/// measured against the exclusive form on this workload rather than assumed
-/// cheaper. Gate whichever wins on the capability, never on a device name.
+/// second submission that appending it removed. Splitting at the scratch buffer
+/// answers the middle one for nothing, which is why that is where it belongs.
 fn dedicated_transfer_family(families: &[vk::QueueFamilyProperties]) -> Option<u32> {
     families
         .iter()
