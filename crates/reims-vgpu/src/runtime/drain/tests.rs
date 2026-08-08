@@ -5061,3 +5061,52 @@ fn an_opcode_past_the_dispatch_ceiling_is_reported_apart_from_an_unassigned_slot
          unassigned slot is still raised"
     );
 }
+
+/// A declined command says its piece once and is counted every time.
+///
+/// `CmdDeleteObject` arrives from the guest's shared-object allocator while the
+/// window server is compositing, so a line per packet would be a per-frame
+/// flood in the always-on log — and a flood is how the refusals around it stop
+/// being read. The latch is what makes the record survivable; the route counter
+/// is what keeps the rate knowable, because emitters dedupe and counters do
+/// not, and quoting one as the other is the mistake this pair exists to
+/// prevent.
+#[test]
+fn a_declined_command_is_latched_in_the_log_and_counted_in_the_census() {
+    use crate::runtime::drain::store_route_count;
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let pkt = Packet {
+        opcode: CHILD_OP_DELETE_OBJECT,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN + 8,
+        completion_stamp: 0,
+        payload: vec![0u8; 8],
+        next_head: 0,
+    };
+
+    let route = UnimplementedCommand::DeleteObject.slug();
+    let before = store_route_count(route);
+    let cap = crate::observe::FailCapture::start();
+    for _ in 0..3 {
+        process_child_packet(&mut state, &mut host, 2, &pkt);
+    }
+    let lines: Vec<String> = cap
+        .lines()
+        .into_iter()
+        .filter(|l| l.contains(&format!("reason={route}")))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "three identical declines are one line, or the guest's frame rate sets \
+         the log's line rate; got {lines:?}"
+    );
+    drop(cap);
+    assert_eq!(
+        store_route_count(route) - before,
+        3,
+        "the census counts every packet, which is the rate the latched line \
+         cannot carry"
+    );
+}

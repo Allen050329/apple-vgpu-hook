@@ -3556,20 +3556,35 @@ fn process_child_packet<H: HostMemory + HostOps>(
 /// One call site per command, and one place the record is built: the fields are
 /// the packet's, so a second spelling would be a second chance to report the
 /// wrong opcode beside the right command name.
+///
+/// **A line once per opcode, and a count every window.** These are not rare
+/// events — `CmdDeleteObject` arrives from the guest's shared-object allocator
+/// mid-composite, so an unlatched line per packet would be a per-frame flood in
+/// the always-on log, and a flood is how a real refusal stops being read. The
+/// latch costs the rate, which is why the route counter goes up first: the
+/// emitter dedupes and the counter does not, and the two answer different
+/// questions.
 fn note_unimplemented(
     state: &mut DeviceState,
     channel_id: u32,
     command: UnimplementedCommand,
     packet: &Packet,
 ) {
-    state.record_fail(FailEvent::UnimplementedChildCommand {
+    // Keyed by the command's own slug, so the counter and the `reason=` a reader
+    // greps for are one string rather than two that can drift apart.
+    note_store_route(command.slug());
+    let ev = FailEvent::UnimplementedChildCommand {
         channel: channel_id,
         command,
         opcode: packet.opcode,
         total_size: packet.total_size,
         stamp_count: packet.stamp_count(),
         payload: packet.payload.clone(),
-    });
+    };
+    // Per opcode and not per command: the deprecated set is fifteen numbers
+    // behind one command name, and which of them a guest is still emitting is
+    // the whole content of the record.
+    state.record_fail_once(ev, u64::from(packet.opcode));
 }
 
 /// Drain one child channel.

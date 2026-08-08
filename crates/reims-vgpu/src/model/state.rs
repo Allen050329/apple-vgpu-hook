@@ -3095,6 +3095,28 @@ impl DeviceState {
         #[cfg(test)]
         self.fails.push(ev);
     }
+
+    /// [`Self::record_fail`], but the line is emitted only the first time this
+    /// `(reason, discriminant)` pair is seen this boot.
+    ///
+    /// For an event that repeats at the guest's own rate. A refusal the guest
+    /// re-triggers every frame does not become more true for being printed
+    /// thirty times a second; it becomes unreadable, and takes the rest of the
+    /// log with it. The caller pairs this with a route counter, because the
+    /// latch is what costs the rate.
+    ///
+    /// The in-memory vec is still appended on every call. It is the tests'
+    /// view, and a test asserting that a second packet was declined would
+    /// otherwise be asserting the latch instead.
+    pub fn record_fail_once(&mut self, ev: FailEvent, discriminant: u64) {
+        if crate::observe::first_sight(crate::observe::Decline::slug(&ev), discriminant) {
+            crate::observe::Emit::decline("fail_event", &ev).fail();
+        }
+        #[cfg(test)]
+        self.fails.push(ev);
+        #[cfg(not(test))]
+        let _ = ev;
+    }
 }
 
 #[cfg(test)]
