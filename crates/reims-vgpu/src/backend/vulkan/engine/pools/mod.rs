@@ -186,6 +186,37 @@ pub(crate) struct ResourcePools {
     /// `gather_guest_buffer_window` exists to avoid.
     gather_free: HashMap<u64, Vec<BufferSlot>>,
     gather_live: Vec<BufferSlot>,
+    /// Buffer binds the command buffer now recording has already staged or
+    /// gathered, keyed by the content that produced them.
+    ///
+    /// The key is `(Arc` address`, length)` of the bind's content — the runtime
+    /// holds one `Arc` per resolved `(task, reference, offset)`, so two binds of
+    /// the same guest window are the same pointer and two different windows
+    /// cannot collide however their bytes compare.
+    ///
+    /// # Why the command buffer and not the draw
+    ///
+    /// This was a local in `execute_draw_inner`, so it deduplicated the ~5 binds
+    /// of one draw and nothing across the batch that draw joins. A window bound
+    /// by four consecutive draws was copied into device-local memory four times,
+    /// and a driven Safari drag moved **4.46 GB per second** that way.
+    ///
+    /// One copy per command buffer is what the guest's own model gives it. The
+    /// bytes are read when the command buffer executes, so a guest that rewrote
+    /// the window between two draws of one command buffer would already be
+    /// racing itself: nothing tells it when either draw runs. Copying twice does
+    /// not make that guest correct, it only makes this device slower.
+    ///
+    /// # What ends an entry's life
+    ///
+    /// The slots named here live in `staging_live` / `gather_live`, so the map
+    /// is cleared wherever those are handed away or recycled —
+    /// [`ResourcePools::seal_entry`] and [`ResourcePools::recycle_staging`] —
+    /// and additionally whenever this device records a write **into guest
+    /// pages** ([`ResourcePools::note_guest_write_recorded`]). That last one is
+    /// the correctness edge: a bind after a Store into the same pages must see
+    /// what the Store wrote, and reusing a copy taken before it would not.
+    cb_bound_buffers: HashMap<(usize, u64), super::exec::BoundBuffer>,
     /// Staging free-list hits / misses and the miss bucket histogram; see
     /// `note_staging_miss`. Measure-only.
     staging_hits: u64,

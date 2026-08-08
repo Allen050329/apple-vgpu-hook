@@ -37,9 +37,9 @@ use super::vk_call::{VkCall, VkOp};
 /// be handed to the staging free list — where it would be reissued as scratch
 /// over the guest's live pages.
 #[derive(Clone, Copy)]
-struct BoundBuffer {
-    buffer: vk::Buffer,
-    offset: vk::DeviceSize,
+pub(super) struct BoundBuffer {
+    pub(super) buffer: vk::Buffer,
+    pub(super) offset: vk::DeviceSize,
 }
 
 impl From<BufferSlot> for BoundBuffer {
@@ -138,7 +138,6 @@ unsafe fn stage_buffer_content(
     content: &BufferContent,
     usage: vk::BufferUsageFlags,
     snapshot_volatile: bool,
-    slots_by_content: &mut std::collections::HashMap<(usize, u64), BoundBuffer>,
     gathers: &mut Vec<PendingGuestGather>,
 ) -> Result<BoundBuffer, DrawError> {
     let key = match content {
@@ -148,8 +147,9 @@ unsafe fn stage_buffer_content(
             src.total_len,
         ),
     };
-    if let Some(bound) = slots_by_content.get(&key) {
-        return Ok(*bound);
+    if let Some(bound) = pools.cb_bound_buffer(key) {
+        counters.note_buffer_bind_reused();
+        return Ok(bound);
     }
     let bound = match content {
         BufferContent::Bytes(b) => {
@@ -205,7 +205,7 @@ unsafe fn stage_buffer_content(
             }
         }
     };
-    slots_by_content.insert(key, bound);
+    pools.note_cb_bound_buffer(key, bound);
     Ok(bound)
 }
 
@@ -1833,12 +1833,11 @@ pub(crate) unsafe fn execute_draw_inner(
     // Vertex buffers (with Constant step shift), deduplicated by content:
     // several attributes on one interleaved stream share one staging slot.
     let no_vertex_fetch = draw_has_no_invocations(req);
-    let mut slots_by_content: std::collections::HashMap<(usize, u64), BoundBuffer> =
-        std::collections::HashMap::new();
     // Filled by whichever binds below are scattered guest windows, and drained
-    // in the record phase ahead of the render pass. Deduplicated for free:
-    // `slots_by_content` returns an already-planned window's buffer without
-    // reaching the gather again, so a stream bound twice is copied once.
+    // in the record phase ahead of the render pass. Deduplicated for free: the
+    // pool's `cb_bound_buffers` returns an already-planned window's buffer
+    // without reaching the gather again, so a window bound twice anywhere in
+    // this command buffer is copied once.
     let mut guest_gathers: Vec<PendingGuestGather> = Vec::new();
     let mut vertex_bufs = Vec::new();
     for resource in &req.vertex_attributes {
@@ -1898,7 +1897,6 @@ pub(crate) unsafe fn execute_draw_inner(
                 &resource.content,
                 vk::BufferUsageFlags::VERTEX_BUFFER,
                 batch_eligible,
-                &mut slots_by_content,
                 &mut guest_gathers,
             )?
         };
@@ -1935,7 +1933,6 @@ pub(crate) unsafe fn execute_draw_inner(
             &resource.content,
             vk::BufferUsageFlags::STORAGE_BUFFER,
             batch_eligible,
-            &mut slots_by_content,
             &mut guest_gathers,
         )?;
         storage_slots.push((resource.binding, slot));

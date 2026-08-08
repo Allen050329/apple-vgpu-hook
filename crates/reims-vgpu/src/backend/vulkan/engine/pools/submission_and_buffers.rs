@@ -81,6 +81,7 @@ impl ResourcePools {
             staging_live: Vec::new(),
             gather_free: HashMap::new(),
             gather_live: Vec::new(),
+            cb_bound_buffers: std::collections::HashMap::new(),
             staging_hits: 0,
             staging_misses: 0,
             staging_miss_bins: [0; STAGING_BUCKET_BINS],
@@ -1060,6 +1061,9 @@ impl ResourcePools {
         dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
         sampled_retains: Vec<SampledRetain>,
     ) -> PendingGpuCleanup {
+        // The slots the map names are about to be handed to the cleanup, so
+        // nothing recorded after this may bind one.
+        self.forget_cb_bound_buffers();
         let mut readback: Vec<BufferSlot> = self.readback_live.take().into_iter().collect();
         readback.append(&mut self.readback_multi_live);
         PendingGpuCleanup {
@@ -1266,6 +1270,28 @@ impl ResourcePools {
         self.guest_reads_in_flight = true;
     }
 
+    /// The buffer this command buffer already staged or gathered for `key`, if
+    /// it still holds one. See `ResourcePools::cb_bound_buffers`.
+    pub(crate) fn cb_bound_buffer(&self, key: (usize, u64)) -> Option<super::super::exec::BoundBuffer> {
+        self.cb_bound_buffers.get(&key).copied()
+    }
+
+    /// Remember that `key`'s bytes are in `bound` for the rest of this command
+    /// buffer.
+    pub(crate) fn note_cb_bound_buffer(
+        &mut self,
+        key: (usize, u64),
+        bound: super::super::exec::BoundBuffer,
+    ) {
+        self.cb_bound_buffers.insert(key, bound);
+    }
+
+    /// Drop every remembered bind. Called from the three places that end a
+    /// slot's life — the seal, the recycle, and a recorded guest-page write.
+    fn forget_cb_bound_buffers(&mut self) {
+        self.cb_bound_buffers.clear();
+    }
+
     /// Clear the guest-read debt and answer whether there was one.
     ///
     /// Split from the wait so the ledger half is testable without a device: it
@@ -1308,6 +1334,9 @@ impl ResourcePools {
     /// — records the debt and nothing else, because there is then no image for
     /// the reclaim to take.
     pub(crate) fn note_guest_write_recorded(&mut self, identity: &TargetIdentity) {
+        // A bind recorded after this must not reuse a copy taken before it: the
+        // Store lands in guest pages a later bind may name.
+        self.forget_cb_bound_buffers();
         self.guest_writes_in_flight = true;
         if self.pin_resident_target(identity, true) {
             self.unpin_on_settle.push(identity.clone());
@@ -1900,6 +1929,7 @@ impl ResourcePools {
     }
 
     pub(crate) fn recycle_staging(&mut self) {
+        self.forget_cb_bound_buffers();
         for slot in self.staging_live.drain(..) {
             let bucket = Self::bucket(slot.size);
             self.staging_free.entry(bucket).or_default().push(slot);
@@ -3795,6 +3825,56 @@ mod recycle_tests {
         pools.note_guest_read_recorded();
         assert!(pools.take_guest_read_debt());
         assert!(!pools.take_guest_read_debt());
+    }
+
+    /// A remembered bind names a pool slot, and it must not outlive the three
+    /// events that end that slot's usefulness.
+    ///
+    /// The seal and the recycle are lifetime: both hand the slot away, and a
+    /// later bind of the same content would be given a buffer the ring is free
+    /// to reissue to somebody else. The guest-page write is correctness and is
+    /// the one worth the most — a Store lands in guest pages a later bind may
+    /// name, so a bind after it must not be served a copy taken before it. Each
+    /// is asserted on its own, so a clear deleted from one site cannot be
+    /// covered by another still having one.
+    #[test]
+    fn a_remembered_bind_does_not_survive_the_three_things_that_end_it() {
+        let key = (0xabc_usize, 4096u64);
+        let bound = crate::backend::vulkan::engine::exec::BoundBuffer {
+            buffer: vk::Buffer::null(),
+            offset: 0,
+        };
+        let identity = TargetIdentity::Surface {
+            id: 1,
+            width: 16,
+            height: 16,
+            generation: 0,
+        };
+        /// One thing that ends a remembered bind's life, named for the failure
+        /// message.
+        type EndOfLife<'a> = (&'a str, &'a dyn Fn(&mut ResourcePools));
+        let ends: [EndOfLife<'_>; 3] = [
+            ("a seal", &|p| {
+                p.seal_entry(Vec::new(), Vec::new());
+            }),
+            ("a staging recycle", &|p| p.recycle_staging()),
+            ("a recorded guest-page write", &|p| {
+                p.note_guest_write_recorded(&identity)
+            }),
+        ];
+        for (what, end) in ends {
+            let mut pools = ResourcePools::new();
+            pools.note_cb_bound_buffer(key, bound);
+            assert!(
+                pools.cb_bound_buffer(key).is_some(),
+                "a bind must be reusable before {what}"
+            );
+            end(&mut pools);
+            assert!(
+                pools.cb_bound_buffer(key).is_none(),
+                "a bind remembered across {what} names a slot no longer this command buffer's"
+            );
+        }
     }
 
     /// The write ledger's own half, and the reason it is a ledger rather than a
