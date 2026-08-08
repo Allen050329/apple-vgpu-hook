@@ -18,38 +18,42 @@
 //! ever fully covered a live window. A ratio pinned at 1.0 by the workload is
 //! not coalescing; it is the statement that none was available.
 //!
-//! # There is repetition, and the 1.0 above does not rule it out
+//! # A second census agrees: this rail is close to one Store per surface
 //!
 //! A later census counted how many *distinct* surfaces a run of Stores names.
 //! Sampling the surface rail in fixed batches of 1 024 Stores over a driven
-//! Safari drag, each batch touched about **six** distinct mapping ids. Against
-//! ~1 560 Stores a second and 78 displayed frames, that is roughly **three
-//! full-target Stores into each surface per frame the user sees**.
+//! Safari drag, each batch touched about **six** distinct mapping ids, and the
+//! rail ran at 640 Stores a second (`surface_resident` on a 1 001 ms
+//! `store_routes` window) against a 75.8 Hz median present. That is
+//! 640 / 6.2 / 75.8 ≈ **1.3 full-target Stores into each surface per frame the
+//! user sees** — near the floor of one, and consistent with the paragraph above
+//! rather than against it.
 //!
-//! Set beside the arms-equals-lands reading, those two do not conflict, and the
-//! difference between them is what a future attempt has to be careful about.
-//! "No later Store fully covered a **live window**" is a statement about
-//! windows, and a window that is landed promptly is rarely alive when the next
-//! Store arrives — so a ratio of 1.0 can mean the windows were short rather
-//! than that the Stores were unique. It is not evidence that the third Store
-//! into a surface was carrying different pixels from the second.
+//! The arithmetic is worth stating because getting it wrong is easy and it was
+//! got wrong once here: dividing the same six surfaces into `target_reads`
+//! (~1 560/s) instead gives ~3 Stores per surface per frame and reads as a 2:1
+//! redundancy waiting to be collapsed. `target_reads` counts **every** rail's
+//! full-frame copy — this one, the GVA Store, and the present capture — so it is
+//! the wrong denominator for a per-surface-rail ratio by about 2.4x. Use the
+//! route counter for the rail being reasoned about.
 //!
-//! What it is *not* is a licence to elide. A repeated Store is redundant only if
-//! nothing read those guest pages in between, and that is the part neither
-//! census measured: the guest CPU may read them with no device operation, and
-//! `pass_scissor_union_full` at 99.92 % says only that each pass covered its own
-//! target, not that no one looked at the previous one. Anything built here needs
-//! the reader question answered first, and the hazards this module's own list
-//! below records — resident drift, pin leaks, page recycling, write ordering
-//! against the guest's own claim — all return with any window that outlives its
-//! Store.
+//! So there is no burst of redundant Stores to collapse on this workload, and
+//! the deferred window would still have nothing to coalesce. What is left is the
+//! rail's own cost at the rate the guest asks for it, and that cost is this
+//! device's largest single item: removing only its copy commands, with every
+//! barrier, flush and stamp left in place, took a driven drag from 76 Hz to
+//! 104 Hz and collapsed `slot_us` by a factor of 62. The route to it is
+//! therefore not fewer copies but copies that do not sit in the graphics queue
+//! ahead of the draws — see `backend::vulkan::engine::context`'s
+//! `dedicated_transfer_family`, where the host's idle copy engine and the five
+//! steps of using it are recorded.
 //!
-//! It matters because this rail is the device's largest single cost. Removing
-//! only its copy commands, with every barrier, flush and stamp left in place,
-//! took a driven drag from 76 Hz to 104 Hz and collapsed `slot_us` by a factor
-//! of 62 — see `backend::vulkan::engine::context`'s `dedicated_transfer_family`,
-//! which also records the other way to spend that finding: the host has a copy
-//! engine and this device submits every byte to the graphics queue instead.
+//! One caveat for whoever reads the witness this rail feeds:
+//! `MappingEntry::render_flush`'s doc quotes `render_flush_age_sub_ms` /
+//! `_sub_frame` / `_frame_plus` figures, and **those counters exist nowhere in
+//! the tree but that comment** — they were retired without it. Its conclusion may
+//! still be right; it is simply no longer reproducible from a boot, so do not
+//! read those three numbers as something a fresh log can confirm.
 //!
 //! What the rail did buy is real and is kept: the Store does not read the frame
 //! back off the GPU. [`crate::runtime::mapping_write::write_bgra8_from_resident_gpu`]
