@@ -2786,9 +2786,127 @@ impl BindReachUnbounded {
 /// whether narrowing is worth its correctness risk. `unbounded_kb` is the half
 /// that cannot be narrowed at all, so a small `bounded` share caps the win no
 /// matter how favourable the ratio is.
+/// What the vertex stage's own reflection says a buffer bound at Metal index
+/// `index` is: the declared AIR argument byte size, and the AIR type name that
+/// says whether that size bounds the read or merely describes one element of it.
+///
+/// A `constant Uniforms& u [[buffer(2)]]` declares a size that *is* the bound.
+/// A `device float* p [[buffer(2)]]` may declare one too, and there it is the
+/// pointee's size while the shader indexes arbitrarily far past it — so the size
+/// alone is not the answer and the type name is carried beside it.
+fn vertex_stage_buffer_declaration(
+    reflection: &metal2vulkan::reflect::ShaderReflection,
+    index: u32,
+) -> Option<&metal2vulkan::reflect::ResourceBinding> {
+    reflection.bindings.iter().find(|b| {
+        b.kind == metal2vulkan::reflect::ResourceKind::Buffer && b.metal_index == index
+    })
+}
+
+/// Band the `NoAttribute` population against what the vertex shader's reflection
+/// declares for the same bind.
+///
+/// This is the bucket the split found: 67.5 % of every gathered byte, 232 147
+/// binds a boot at ~221 KB each, none of them a vertex stream. A stride cannot
+/// bound them because the vertex descriptor never mentions them — they are
+/// constant/storage buffers Metal binds through the same
+/// `setVertexBuffer:offset:atIndex:` call. What can bound them is the shader's
+/// own declared argument size, and this counts whether that size exists and how
+/// it compares to the span, without acting on either:
+///
+/// ```text
+/// zcreach_noattr_declared / _kb     the reflection carries a usable size
+/// zcreach_noattr_ptr / _kb          it does, but the argument is a pointer
+/// zcreach_noattr_unnamed / _kb      it does, but carries no type name
+/// zcreach_noattr_undeclared / _kb   it carries no size
+/// zcreach_noattr_unreflected / _kb  the binding is not in the reflection
+/// zcreach_noattr_d_le5 .. _full     declared size against the gathered span
+/// ```
+///
+/// The pointer split is the correctness line and it is why the size alone is not
+/// the finding. For a `constant T&` the declared size *is* the bound. For a
+/// `device T*` it is one element's size and the shader may index arbitrarily far
+/// past it, so narrowing on it would hand the GPU a short buffer and lose guest
+/// work silently. Only the first is a candidate.
+///
+/// # What a driven boot answers, and why this rail cannot be narrowed yet
+///
+/// `zcreach_noattr_declared` is **zero**. Not one bind in a Safari-drag boot
+/// reached the candidate arm:
+///
+/// ```text
+/// zcreach_noattr_unnamed       211 180 binds   46 542 590 KB
+/// zcreach_noattr_unreflected    19 726 binds    4 576 928 KB
+/// zcreach_noattr_undeclared         51 binds       10 869 KB
+/// zcreach_noattr_ptr                 0 binds            0 KB
+/// ```
+///
+/// So the blocker is not that these are pointers — none was *known* to be one.
+/// It is that the reflection carries `declared_size` without `type_name` for
+/// 211 180 of them, and with no name there is nothing to tell a `constant T&`
+/// from a `device T*`. Both spellings produce a size; only one of them is a
+/// bound. Narrowing on the size alone would be correct for the first and would
+/// silently hand the GPU a short buffer for the second.
+///
+/// That makes this a **translator metadata gap, not a guest-contract fact**, and
+/// it is the one lever here with a known shape: carrying the AIR argument type
+/// name through reflection for these bindings would put 46.5 GB of a boot's
+/// gather traffic — about two thirds of it — behind a decidable test. Until it
+/// is carried, the conservative arm is the only correct one, and this function
+/// counts rather than narrows.
+fn note_noattr_declaration(
+    reflection: &metal2vulkan::reflect::ShaderReflection,
+    index: u32,
+    span: u64,
+) {
+    use crate::runtime::drain::{note_store_route, note_store_route_n};
+    let Some(binding) = vertex_stage_buffer_declaration(reflection, index) else {
+        note_store_route("zcreach_noattr_unreflected");
+        note_store_route_n("zcreach_noattr_unreflected_kb", span / 1024);
+        return;
+    };
+    let Some(declared) = binding.declared_size.map(u64::from).filter(|&n| n > 0) else {
+        note_store_route("zcreach_noattr_undeclared");
+        note_store_route_n("zcreach_noattr_undeclared_kb", span / 1024);
+        return;
+    };
+    // A trailing `*` is AIR's own spelling of "this argument is a pointer", so
+    // the declared size describes the pointee and not the reach. Absent a type
+    // name there is nothing to rule the pointer case out, which is the same
+    // *answer* as knowing it is one — but not the same finding, so the two are
+    // counted apart. "The translator does not carry the name" is a gap that
+    // could be closed upstream; "the guest really passed a pointer" cannot.
+    match binding.type_name.as_deref().map(|n| n.trim_end()) {
+        Some(name) if name.ends_with('*') => {
+            note_store_route("zcreach_noattr_ptr");
+            note_store_route_n("zcreach_noattr_ptr_kb", span / 1024);
+            return;
+        }
+        None => {
+            note_store_route("zcreach_noattr_unnamed");
+            note_store_route_n("zcreach_noattr_unnamed_kb", span / 1024);
+            return;
+        }
+        Some(_) => {}
+    }
+    note_store_route("zcreach_noattr_declared");
+    note_store_route_n("zcreach_noattr_declared_kb", declared.min(span) / 1024);
+    note_store_route_n("zcreach_noattr_declared_span_kb", span / 1024);
+    note_store_route(match declared.min(span).saturating_mul(100) / span {
+        0 => "zcreach_noattr_d_lt1",
+        1..=4 => "zcreach_noattr_d_le5",
+        5..=9 => "zcreach_noattr_d_le10",
+        10..=24 => "zcreach_noattr_d_le25",
+        25..=49 => "zcreach_noattr_d_le50",
+        50..=98 => "zcreach_noattr_d_le99",
+        _ => "zcreach_noattr_d_full",
+    });
+}
+
 fn note_vertex_bind_reach(
     req: &DrawEncodeRequest,
     attributes: &[crate::runtime::decode::resource::VertexAttribute],
+    reflection: &metal2vulkan::reflect::ShaderReflection,
     index: u32,
     span: u64,
 ) {
@@ -2808,6 +2926,9 @@ fn note_vertex_bind_reach(
             note_store_route_n("zcreach_unbounded_kb", span / 1024);
             note_store_route(count);
             note_store_route_n(kb, span / 1024);
+            if why == BindReachUnbounded::NoAttribute {
+                note_noattr_declaration(reflection, index, span);
+            }
             return;
         }
     };
@@ -5185,7 +5306,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // the staging read chose, and banding it here would mix two
             // populations under one ratio.
             if let crate::backend::vulkan::engine::BufferContent::GuestRuns(ref src) = content {
-                note_vertex_bind_reach(req, &pd.vertex_attributes, b.index, src.total_len);
+                note_vertex_bind_reach(
+                    req,
+                    &pd.vertex_attributes,
+                    &v_shader.reflection,
+                    b.index,
+                    src.total_len,
+                );
             }
             vtx_storage.push((b.index, content));
         }

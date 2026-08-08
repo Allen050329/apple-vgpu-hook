@@ -1063,7 +1063,7 @@ impl ResourcePools {
     ) -> PendingGpuCleanup {
         // The slots the map names are about to be handed to the cleanup, so
         // nothing recorded after this may bind one.
-        self.forget_cb_bound_buffers();
+        self.forget_cb_bound_buffers("bindmap_clear_seal", "bindmap_clear_seal_entries");
         let mut readback: Vec<BufferSlot> = self.readback_live.take().into_iter().collect();
         readback.append(&mut self.readback_multi_live);
         PendingGpuCleanup {
@@ -1288,7 +1288,49 @@ impl ResourcePools {
 
     /// Drop every remembered bind. Called from the three places that end a
     /// slot's life — the seal, the recycle, and a recorded guest-page write.
-    fn forget_cb_bound_buffers(&mut self) {
+    /// Drop every cached buffer bind, and say how many were dropped and by whom.
+    ///
+    /// The three callers discard the map for three different reasons, and only
+    /// one of them is about the *slots*: `seal_entry` and `recycle_staging` are
+    /// handing the staging slots the map names to a cleanup or a free list, so
+    /// nothing recorded after them may name one. `note_guest_write_recorded` is
+    /// not — its slots are untouched, and it clears the map because a Store
+    /// lands in guest pages a later bind may name.
+    ///
+    /// That last one clears unconditionally, and a driven boot puts it at
+    /// ~1 560 Stores a second, so it reads like over-invalidation: a Store into
+    /// surface pages discarding vertex-buffer copies that cannot overlap them.
+    ///
+    /// **It is not, and the entries column here is what settled it.** A driven
+    /// Safari-drag boot:
+    ///
+    /// ```text
+    /// bindmap_clear_seal            83 293 calls   290 747 entries
+    /// bindmap_clear_guestwrite      37 625 calls         0 entries
+    /// bindmap_clear_recycle              0 calls         0 entries
+    /// ```
+    ///
+    /// The guest-write arm never discards anything: `seal_entry` has always
+    /// already emptied the map by the time a Store records, because the Store's
+    /// copy is appended to a batch that is then flushed, and the flush seals.
+    /// Scoping that clear to overlapping pages would therefore buy exactly
+    /// nothing — and the entries column is the only thing that says so, because
+    /// the call column alone reads as 37 625 invalidations a boot.
+    ///
+    /// `bindmap_clear_seal`'s 3.5 entries a call is where the invalidation
+    /// actually is, and it is not obviously wrong either: those slots really are
+    /// being handed away. A bind surviving its submission would mean holding the
+    /// device-local gather buffer out of the recycle pool, which is a different
+    /// design carrying a VRAM cost, not a scoping fix.
+    ///
+    /// So this is a healthy zero, and a **non-zero**
+    /// `bindmap_clear_guestwrite_entries` is the reading that matters: it would
+    /// mean Stores had started landing while binds are live, and the
+    /// unconditional clear would have become a real cost.
+    fn forget_cb_bound_buffers(&mut self, why: &'static str, entries_slug: &'static str) {
+        let n = self.cb_bound_buffers.len() as u64;
+        crate::runtime::drain::note_store_route(why);
+        crate::runtime::drain::note_store_route_n(entries_slug, n);
         self.cb_bound_buffers.clear();
     }
 
@@ -1336,7 +1378,7 @@ impl ResourcePools {
     pub(crate) fn note_guest_write_recorded(&mut self, identity: &TargetIdentity) {
         // A bind recorded after this must not reuse a copy taken before it: the
         // Store lands in guest pages a later bind may name.
-        self.forget_cb_bound_buffers();
+        self.forget_cb_bound_buffers("bindmap_clear_guestwrite", "bindmap_clear_guestwrite_entries");
         self.guest_writes_in_flight = true;
         if self.pin_resident_target(identity, true) {
             self.unpin_on_settle.push(identity.clone());
@@ -1929,7 +1971,7 @@ impl ResourcePools {
     }
 
     pub(crate) fn recycle_staging(&mut self) {
-        self.forget_cb_bound_buffers();
+        self.forget_cb_bound_buffers("bindmap_clear_recycle", "bindmap_clear_recycle_entries");
         for slot in self.staging_live.drain(..) {
             let bucket = Self::bucket(slot.size);
             self.staging_free.entry(bucket).or_default().push(slot);
