@@ -2888,10 +2888,30 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
 /// guest did.
 ///
 /// So the question has never actually been asked, and it is asked here — at the
-/// production site, before `seed_color_load` reads anything. Nothing is elided
-/// yet: eliding means threading a "load from the resident" decision back into
-/// the encode path, and this class renders a *plausible* frame when it is wrong,
-/// so the population is worth knowing before the plumbing is built.
+/// production site, before `seed_color_load` reads anything.
+///
+/// # The answer
+///
+/// One driven Safari drag, against `load_seed_ok_color` 4 862 — every colour
+/// LOAD seed the device produced in that boot:
+///
+/// ```text
+/// gvaseed_could_elide      4 849   99.7 %
+/// gvaseed_not_quiet           11
+/// gvaseed_no_resident          2
+/// gvaseed_no_generation        0
+/// ```
+///
+/// So the deleted rung's zero was entirely its sampling point. The real
+/// population is very nearly all of them, and it lines up with the wait it would
+/// remove: `settle_linear_texture_seed` was 4 792 waits, 4 758 of them overlaps,
+/// in the same boot.
+///
+/// Nothing is elided here. Eliding means threading a "load from the resident"
+/// decision back into the encode path, and this class renders a *plausible*
+/// frame when it is wrong — this file records a reverted attempt that gave a
+/// black screen with orange fragments — so the population was worth knowing
+/// before the plumbing.
 pub(super) fn note_gva_load_seed_probe<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
