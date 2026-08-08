@@ -1302,7 +1302,7 @@ unsafe fn upload_buffer_to_sampled_image(
     );
 }
 
-/// The eleven conditions that decide how a draw reaches the submission ring.
+/// The ten conditions that decide how a draw reaches the submission ring.
 ///
 /// Two questions, one set of fields. `batch_eligible` asks whether this draw
 /// may leave its command buffer in recording state for a successor to append
@@ -1324,6 +1324,30 @@ unsafe fn upload_buffer_to_sampled_image(
 /// stream, which is exactly what the draw asked for. What the refusal was
 /// standing in for was the missing dependency in front of that copy; see
 /// [`barrier_resident_for_transfer_read`].
+///
+/// # Not a term: not loading from the target
+///
+/// The same shape, found the same way, and it refused a further 15 % of draws
+/// (16 576 on the boot that retired it). A draw that CLEARs rather than LOADs
+/// discards the attachment through `initialLayout = UNDEFINED`, so joining an
+/// open batch means recording a CLEAR pass after a pass that wrote the same
+/// image — legal, and something the batch already did in the other order.
+///
+/// What made it unsafe was that the clear path's own barrier derived its source
+/// scope from the target's tracked layout, and a resident a render pass just
+/// filled sits in `TRANSFER_SRC_OPTIMAL`. So the clear named a transfer read as
+/// what it was waiting for, while the thing it actually had to wait for was the
+/// previous draw's colour writes — nothing ordered them, and inside one command
+/// buffer with the producing draw a few commands back, that is the short-fuse
+/// version of the same undefined behaviour. `super::pools::ResidentAccess` now
+/// carries what last touched a resident separately from where it sits, so the
+/// clear waits on `COLOR_ATTACHMENT_OUTPUT`/`COLOR_ATTACHMENT_WRITE` and the
+/// term has nothing left to stand in for.
+///
+/// Nothing else consulted it: `BatchTarget` keys on identity and geometry and
+/// not on the load action, an open batch accumulates only per-draw descriptor
+/// sets and sampled admissions, and no completion stamp, epoch publish, pin or
+/// writeback branches on it.
 struct JoinTerms {
     force_loss: bool,
     quirk: bool,
@@ -1332,7 +1356,6 @@ struct JoinTerms {
     reads_back: bool,
     has_query: bool,
     no_identity: bool,
-    not_load_from_target: bool,
     cpu_seed: bool,
     gpu_seed: bool,
     no_open_batch: bool,
@@ -1362,7 +1385,7 @@ impl JoinTerms {
     /// one question and miss the other, and cannot be mis-scoped by landing at
     /// the wrong index — its scope is written beside it, not inferred from
     /// where it sits.
-    const LADDER: [JoinRefusal; 11] = [
+    const LADDER: [JoinRefusal; 10] = [
         (|t| t.force_loss, JoinScope::Draw, "nojoin_force_loss"),
         (|t| t.quirk, JoinScope::Draw, "nojoin_quirk"),
         (|t| t.is_mrt, JoinScope::Draw, "nojoin_mrt"),
@@ -1370,11 +1393,6 @@ impl JoinTerms {
         (|t| t.reads_back, JoinScope::Draw, "nojoin_reads_back"),
         (|t| t.has_query, JoinScope::Draw, "nojoin_query"),
         (|t| t.no_identity, JoinScope::Draw, "nojoin_no_identity"),
-        (
-            |t| t.not_load_from_target,
-            JoinScope::Fit,
-            "nojoin_not_load_from_target",
-        ),
         (|t| t.cpu_seed, JoinScope::Fit, "nojoin_cpu_seed"),
         (|t| t.gpu_seed, JoinScope::Fit, "nojoin_gpu_seed"),
         (|t| t.no_open_batch, JoinScope::Fit, "nojoin_no_open_batch"),
@@ -1565,7 +1583,6 @@ pub(crate) unsafe fn execute_draw_inner(
         reads_back: !req.skip_readback,
         has_query: req.occlusion_query.is_some(),
         no_identity: req.target_identity.is_none(),
-        not_load_from_target: !req.load_from_target,
         cpu_seed: req.target_rgba8.is_some(),
         gpu_seed: req.seed_from_target.is_some(),
         // Last because it is the only term that looks anything up. Evaluated
@@ -3616,10 +3633,9 @@ mod tests {
             reads_back: b(4),
             has_query: b(5),
             no_identity: b(6),
-            not_load_from_target: b(7),
-            cpu_seed: b(8),
-            gpu_seed: b(9),
-            no_open_batch: b(10),
+            cpu_seed: b(7),
+            gpu_seed: b(8),
+            no_open_batch: b(9),
         }
     }
 
