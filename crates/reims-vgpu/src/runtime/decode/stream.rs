@@ -89,14 +89,41 @@ impl crate::observe::Refusal for DecodeStatus {
 /// that has never been made to move, and `pad` for one the serializer does not
 /// write at all. See [`reims_vgpu_wire::ops::segment::SegmentHeader`], which
 /// records what each was perturbed with.
+///
+/// # The two the reader's contract does act on
+///
+/// A conforming consumer of this stream treats `begin_flag` and
+/// `unidentified_u8` as **encoder-lifetime control**, and it is the only thing
+/// it treats them as. `begin_flag` set means this segment's records continue
+/// the encoder the previous segment left open, and are a protocol error if that
+/// encoder is absent or of a different type — the reader is required to refuse
+/// rather than quietly open a fresh one. `unidentified_u8` set means the
+/// encoder survives this segment and the next one may continue it; clear means
+/// the encoder ends here. A render segment that does *not* continue a previous
+/// one begins by decoding a render-pass descriptor out of its own records.
+///
+/// So one Metal render command encoder — one Vulkan render pass — may span an
+/// unbounded number of records across an unbounded number of segments, and this
+/// device instead opens and ends a render pass per draw.
+///
+/// **Whether that costs anything here is a question about this guest**, and it
+/// is what [`SEGMENT_CHAIN_ROUTES`] is for: both bytes read `0` in every
+/// fixture, but every fixture is a single segment captured between
+/// `-beginSegment:` and `-endEncoding`, which is exactly the population that
+/// cannot chain. A live stream is a different population and had never been
+/// counted. Read the routes on a driven boot before building anything over
+/// this: if `seg_chain_none` is the whole census, this guest never asks for a
+/// pass to outlive a segment and there is nothing here to honour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Segment {
     pub offset: u32,
     pub length: u32,
     pub type_: u8,
-    /// `-beginSegment:`'s unnamed `BOOL` first argument, verbatim.
+    /// `-beginSegment:`'s unnamed `BOOL` first argument, verbatim. The reader's
+    /// contract makes this "continue the open encoder"; see the type doc.
     pub begin_flag: u8,
-    /// Written, always `0` in every fixture, and not identified.
+    /// Written, always `0` in every fixture. The reader's contract makes this
+    /// "the encoder outlives this segment"; see the type doc.
     pub unidentified_u8: u8,
     /// The eighth header byte, which neither `-beginSegment:` call writes. On a
     /// real wire it is whatever the ring last contained, so it is not padding
@@ -253,6 +280,10 @@ pub fn decode_next_segment(bytes: &[u8], cursor: &mut usize) -> Result<Segment, 
         return Err(DecodeStatus::ErrBadLength("stream_seg_cursor_overflow"));
     }
     let segment_index = segment_index_for_offset(bytes, *cursor as u32)?;
+    crate::runtime::drain::note_store_route(segment_chain_route(
+        header[SEGMENT_BEGIN_FLAG_OFFSET],
+        header[SEGMENT_UNIDENTIFIED_OFFSET],
+    ));
     let out = Segment {
         offset: *cursor as u32,
         length: segment_len as u32,
@@ -266,6 +297,30 @@ pub fn decode_next_segment(bytes: &[u8], cursor: &mut usize) -> Result<Segment, 
     };
     *cursor += segment_len;
     Ok(out)
+}
+
+/// Every census route [`segment_chain_route`] can answer, in the order
+/// `(continues_previous, continues_into_next)` counts up.
+///
+/// Exported so a reading is over a named set rather than over whichever names a
+/// grep of the log happened to find, and so the four cannot be spelled twice.
+pub const SEGMENT_CHAIN_ROUTES: [&str; 4] = [
+    "seg_chain_none",
+    "seg_chain_next",
+    "seg_chain_prev",
+    "seg_chain_both",
+];
+
+/// Which of [`SEGMENT_CHAIN_ROUTES`] a segment header's two encoder-lifetime
+/// bytes select.
+///
+/// Any non-zero is a set flag: the bytes carry a `BOOL` and the stream is
+/// guest-controlled, so `!= 0` is the test rather than `== 1`. A guest that
+/// wrote `2` would otherwise be counted as "not chaining" and the whole reading
+/// would be wrong in the direction that reads as a settled question.
+pub fn segment_chain_route(continues_previous: u8, continues_into_next: u8) -> &'static str {
+    let index = usize::from(continues_previous != 0) << 1 | usize::from(continues_into_next != 0);
+    SEGMENT_CHAIN_ROUTES[index]
 }
 
 fn validate_segment(bytes: &[u8], segment: &Segment) -> Result<usize, DecodeStatus> {
@@ -390,6 +445,37 @@ pub fn iter_segments(bytes: &[u8]) -> Result<Vec<Segment>, DecodeStatus> {
 mod tests {
     use super::*;
     use crate::contract::endian::st32;
+
+    /// The four chain routes are distinct, and each pair of flags selects its
+    /// own. A collision would fold two populations into one bucket, which is
+    /// the failure that reads as an answer: `seg_chain_none` carrying the whole
+    /// census is the reading that says this guest never chains encoders, and it
+    /// must not also be what a mis-indexed table says.
+    #[test]
+    fn each_pair_of_chain_flags_selects_its_own_route() {
+        let mut seen = std::collections::HashSet::new();
+        for route in SEGMENT_CHAIN_ROUTES {
+            assert!(seen.insert(route), "two chain routes share the name {route}");
+        }
+        assert_eq!(segment_chain_route(0, 0), "seg_chain_none");
+        assert_eq!(segment_chain_route(0, 1), "seg_chain_next");
+        assert_eq!(segment_chain_route(1, 0), "seg_chain_prev");
+        assert_eq!(segment_chain_route(1, 1), "seg_chain_both");
+    }
+
+    /// The bytes are guest-controlled, so the flag test is `!= 0` and not
+    /// `== 1`. A guest writing any other truthy value must not be counted as
+    /// "did not chain" — that would put a segment the reader's contract says
+    /// continues an open encoder into the bucket whose emptiness is the whole
+    /// question.
+    #[test]
+    fn any_non_zero_chain_byte_is_a_set_flag() {
+        for v in [1u8, 2, 0x7f, 0x80, 0xff] {
+            assert_eq!(segment_chain_route(v, 0), "seg_chain_prev", "prev={v:#x}");
+            assert_eq!(segment_chain_route(0, v), "seg_chain_next", "next={v:#x}");
+            assert_eq!(segment_chain_route(v, v), "seg_chain_both", "both={v:#x}");
+        }
+    }
 
     fn push_segment(buf: &mut Vec<u8>, type_: u8, payload: &[u8]) {
         let len = (SEGMENT_HEADER_LEN + payload.len()) as u32;
