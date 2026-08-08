@@ -1027,11 +1027,38 @@ impl DeviceContext {
 /// the CPU's wait for the GPU is about the size of the GPU's copy work, and that
 /// work is serialised against the rendering only because it shares a queue.
 ///
-/// It is a correspondence, not a proof — neither number is a measurement of the
-/// other, and a copy engine is not free. Anything built on it has to answer
-/// three costs the shared queue does not pay: a cross-queue dependency needs a
-/// semaphore rather than a pipeline barrier, an image read by one family and
-/// written by another needs an ownership transfer or `CONCURRENT` sharing, and
+/// # An ablation says the whole ceiling is this
+///
+/// The correspondence above is not a proof, so it was tested directly: a probe
+/// boot recorded the writeback's barriers, batch flush, stamp and every CPU-side
+/// bookkeeping step exactly as normal, and skipped only the
+/// `cmd_copy_image_to_buffer`/scatter commands themselves — the GPU work, and
+/// nothing else. The guest loses its frames that way, so it is an ablation and
+/// never a shipping arm; it is recorded here because of what it measured.
+///
+/// | | shipping | writeback GPU work removed |
+/// |---|---|---|
+/// | `present_hz` median | 72.7-76.4 | **104.0** |
+/// | seconds below 100 Hz | 24/24 | **4/25** |
+/// | `slot_us` | 245 750 us/s | **3 986 us/s** |
+/// | `drain_duty` `duty` | 0.81 | 0.59 |
+/// | `draw_us/draw` | 132-139 us | 78 us |
+/// | draws | 4 383-4 800/s | 5 916-6 407/s |
+///
+/// `slot_us` falls by a factor of 62. It was not ring depth, not submission
+/// overhead and not jitter: it was this device's own copies sitting in the queue
+/// ahead of the draws whose slots it was waiting for. Every earlier attempt on
+/// `slot_us` moved a number that was downstream of this one, which is why
+/// halving the submissions once bought no frames at all.
+///
+/// So the prize for running these copies beside the rendering rather than
+/// through it is bounded below by the gap between 76 Hz and 104 Hz, and the
+/// remaining 16 Hz to a 120 Hz target is somewhere else entirely.
+///
+/// A copy engine is still not free, and anything built here has to answer three
+/// costs the shared queue does not pay: a cross-queue dependency needs a
+/// semaphore rather than a pipeline barrier, an image written by one family and
+/// read by another needs an ownership transfer or `CONCURRENT` sharing, and
 /// splitting a copy out of the batch it is currently appended to restores the
 /// second submission that appending it removed. The writeback is the better
 /// candidate of the two rails despite being the larger: nothing waits on it but
