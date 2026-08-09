@@ -209,6 +209,23 @@ out to prove a test really fails without it is the right habit; undoing it with 
 Copy the file aside and copy it back, or edit the stub out the way you edited it in. Never reach for
 git to undo a probe.
 
+### An Isolated Worktree Comes From The Session's Repository
+
+Give a delegated agent its own worktree and it is cut from whatever repository the session is running
+in, never from a path the prompt names. Machines carrying this project often carry a second checkout
+beside it with unrelated history and differently-named modules, and handing an agent the wrong one
+fails quietly: it finds a tree, reports that the files you cited are absent, builds against the
+closest analogues it can find, and comes back green.
+
+Confirm which repository a worktree belongs to before reading anything produced in it:
+
+```sh
+git -C <worktree path> remote -v
+```
+
+Where the target is not the repository the session started in, run the agent in that checkout
+directly rather than asking for isolation, and brief it read-only per the rule above.
+
 ## Before A Broad Sweep
 
 Deletion and audit sweeps over this crate have been run many times. What each concluded lives next
