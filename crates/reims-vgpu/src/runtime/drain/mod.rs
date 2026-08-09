@@ -3954,12 +3954,15 @@ pub fn signal_display_vbl<H: HostMemory + HostOps>(
 ///   own. Per-draw submission is a full CPU-GPU round trip.
 /// - `readbacks` / `readback_bytes` — whether every draw drags its target back
 ///   to host memory, which is a fence wait plus a copy.
-/// - `render_post_wait_skips` / `target_reads` — the two halves of the deferred
-///   composite Store. The first counts draws that returned without a fence wait
-///   because they kept their pixels on the GPU; the second counts the reads a
-///   consumer later asked for. A rail that only *moves* the copy raises the
-///   second by as much as it raises the first, and `readbacks` alone — which
+/// - `render_post_wait_skips` / `guest_writeback_reads` — the two halves of the
+///   deferred composite Store. The first counts draws that returned without a
+///   fence wait because they kept their pixels on the GPU; the second counts the
+///   reads a consumer later asked for. A rail that only *moves* the copy raises
+///   the second by as much as it raises the first, and `readbacks` alone — which
 ///   pooled both until it was split — reported no change at all in that case.
+/// - `present_capture_reads` / `present_capture_read_bytes` — full-frame
+///   resident reads whose bytes go to the host window rather than into guest
+///   pages.
 /// - `creates` / `*_misses` — pipeline, shader and descriptor churn, where a
 ///   miss is a driver compile rather than a lookup.
 /// - `sampled_reuploads` — re-staging texture content a cache hit should have

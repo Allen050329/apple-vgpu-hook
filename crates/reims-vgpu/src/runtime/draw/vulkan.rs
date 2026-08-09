@@ -7330,10 +7330,9 @@ fn gva_resident_bgra(format: u16) -> bool {
 /// of every render Store in the boot** against 9 870 on the GPU-direct surface
 /// rail.
 ///
-/// Each one submits and then blocks on a fence. `readback_split`'s `fence`
-/// count matches `target_reads` exactly, and at ~750 us apiece these are most
-/// of the 18 s a boot spends waiting — more than twice the entire sampled
-/// resolve. Do not read a change here as touching a cold path.
+/// Each one submits and then blocks on a fence. At ~750 us apiece those blocks
+/// are most of the 18 s a boot spends waiting — more than twice the entire
+/// sampled resolve. Do not read a change here as touching a cold path.
 ///
 /// The reason it cannot simply become `copy_target_to_guest_pages` like the
 /// surface rail is format, not plumbing: a buffer→image copy converts nothing,

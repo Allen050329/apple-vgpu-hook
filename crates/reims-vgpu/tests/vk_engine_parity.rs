@@ -1649,8 +1649,8 @@ fn a_bgra_resident_draw_reads_back_identically_twice() {
 ///
 /// The split is the measurement: a `skip_readback` draw must land in
 /// `render_post_wait_skips` and leave `readbacks` alone, and the `read_target`
-/// a consumer later asks for must land in `target_reads` and *still* leave
-/// `readbacks` alone.
+/// a consumer later asks for must land in `guest_writeback_reads` and *still*
+/// leave `readbacks` alone.
 #[test]
 fn a_skipped_draw_readback_and_a_resident_read_are_counted_apart() {
     let _g = engine_test_session();
@@ -1686,7 +1686,7 @@ fn a_skipped_draw_readback_and_a_resident_read_are_counted_apart() {
         "a skip_readback draw did not record its skipped fence wait"
     );
     assert_eq!(
-        draw.target_reads, 0,
+        draw.guest_writeback_reads, 0,
         "a draw that reads nothing back recorded a resident read"
     );
 
@@ -1696,17 +1696,79 @@ fn a_skipped_draw_readback_and_a_resident_read_are_counted_apart() {
         .pixels;
     let read = engine::counter_snapshot().delta_since(&before_read);
     assert_eq!(
-        read.target_reads, 1,
+        read.guest_writeback_reads, 1,
         "read_target did not record a resident read"
     );
     assert_eq!(
-        read.target_read_bytes,
+        read.guest_writeback_read_bytes,
         px.len() as u64,
         "resident read bytes disagree with the frame it returned"
     );
     assert_eq!(
         read.readbacks, 0,
         "read_target was pooled into the draw rail's readback count"
+    );
+}
+
+/// Both entry points read the same resident by the same rail, so nothing but the
+/// arm each asks for separates the two counts.
+#[test]
+fn the_present_capture_and_the_writeback_read_count_against_different_pairs() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let w = 16u32;
+    let h = 16u32;
+    let identity = TargetIdentity::Surface {
+        id: 94,
+        width: w,
+        height: h,
+        generation: 1,
+    };
+    let mut req = engine_req(&v, &f, w, h);
+    req.target_identity = Some(identity.clone());
+    req.skip_readback = true;
+    match engine::execute_draw_request(&req) {
+        Ok(_) => {}
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("SKIP resident read populations: {e}");
+            return;
+        }
+        Err(e) => panic!("resident draw: {e}"),
+    }
+
+    let need = (w * h * 4) as usize;
+    let before_capture = engine::counter_snapshot();
+    let captured = engine::read_resident_bgra(&identity, need).expect("present capture read");
+    let capture = engine::counter_snapshot().delta_since(&before_capture);
+    assert_eq!(
+        (
+            capture.present_capture_reads,
+            capture.present_capture_read_bytes
+        ),
+        (1, captured.len() as u64),
+        "the present capture did not record its own read: {capture:?}"
+    );
+    assert_eq!(
+        capture.guest_writeback_reads, 0,
+        "the present capture was counted as a guest writeback: {capture:?}"
+    );
+
+    let before_writeback = engine::counter_snapshot();
+    let px = engine::read_target(&identity)
+        .expect("writeback read")
+        .pixels;
+    let writeback = engine::counter_snapshot().delta_since(&before_writeback);
+    assert_eq!(
+        (
+            writeback.guest_writeback_reads,
+            writeback.guest_writeback_read_bytes
+        ),
+        (1, px.len() as u64),
+        "read_target did not record its own read: {writeback:?}"
+    );
+    assert_eq!(
+        writeback.present_capture_reads, 0,
+        "read_target was counted as a present capture: {writeback:?}"
     );
 }
 
@@ -2778,7 +2840,7 @@ fn gva_deferred_store_flush_read_matches_sync_store() {
     // like removing it. Both halves are asserted: one read happened, and the
     // draw rail stayed out of it.
     assert_eq!(
-        df.target_reads, 1,
+        df.guest_writeback_reads, 1,
         "flush is the single resident read: {df:?}"
     );
     assert_eq!(

@@ -81,6 +81,21 @@ pub enum DrawCoverage {
     LoadedPartialScissor,
 }
 
+/// Which consumer a full-frame read of a pinned resident was taken for.
+///
+/// The arms divide by where the bytes end up, which is what decides whether the
+/// read is owed to the guest at all.
+///
+/// See [`EngineCounters::note_target_read`] for the pair each arm feeds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TargetReadConsumer {
+    /// The host window's present capture. This device paints that window, and
+    /// the guest never observes these bytes.
+    PresentCapture,
+    /// Guest memory, by whichever writeback rail the caller took.
+    GuestWriteback,
+}
+
 /// Declare the engine counter vocabulary once; see the module docs for why.
 ///
 /// Doc comments written on a name here land on *both* the atomic field and its
@@ -182,28 +197,34 @@ engine_counters! {
         /// elided too).
         compute_deferred_writebacks,
         compute_deferred_writeback_bytes,
-        /// Deferred-flush reads (read_resident_storage): the on-access GPU→host
-        /// copy that lands deferred content in guest pages.
 
         // --- residency / oracle I/O ---
         /// Device→host copies taken as the tail of a draw or a compute dispatch,
         /// i.e. work a submission did for itself.
         ///
-        /// Deliberately *not* pooled with `target_reads`. A composite Store that
-        /// takes `skip_readback` moves its copy from here to there rather than
-        /// deleting it, so one number over both populations cannot say whether the
-        /// deferral worked — it reads the same either way. On a desktop workload
-        /// `computes` is 0, so this is the draw rail alone.
+        /// Deliberately *not* pooled with `guest_writeback_reads`. A composite
+        /// Store that takes `skip_readback` moves its copy from here to there
+        /// rather than deleting it, so one number over both populations cannot say
+        /// whether the deferral worked — it reads the same either way. On a desktop
+        /// workload `computes` is 0, so this is the draw rail alone.
         readbacks,
         readback_bytes,
-        /// Full-frame reads of a pinned resident through `read_target`: the present
-        /// capture and the deferred render window's on-access flush.
+        /// Full-frame reads of a pinned resident taken for the host window's
+        /// present capture. See [`TargetReadConsumer`].
+        present_capture_reads,
+        present_capture_read_bytes,
+        /// Full-frame reads of a pinned resident that leave the frame in guest
+        /// memory. See [`TargetReadConsumer`].
+        ///
+        /// The GPU-direct rail is counted here beside the copying ones, and it
+        /// makes no host copy at all. So the byte total is what the frame cost to
+        /// move, not what the CPU touched.
         ///
         /// These are the copies a deferred rail *keeps*, paid once when a consumer
-        /// asks instead of once per Store. `target_reads / readbacks` is what
-        /// separates "the readback moved" from "the readback went away".
-        target_reads,
-        target_read_bytes,
+        /// asks instead of once per Store. `guest_writeback_reads / readbacks` is
+        /// what separates "the readback moved" from "the readback went away".
+        guest_writeback_reads,
+        guest_writeback_read_bytes,
         /// Completion stamps whose word was recorded into the GPU queue behind
         /// the writebacks they follow, rather than stored by this thread after
         /// blocking on them.
@@ -604,9 +625,20 @@ impl EngineCounters {
         self.readback_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn note_target_read(&self, bytes: u64) {
-        self.target_reads.fetch_add(1, Ordering::Relaxed);
-        self.target_read_bytes.fetch_add(bytes, Ordering::Relaxed);
+    /// Record one full-frame read of a pinned resident against the population
+    /// `consumer` names, and nothing against the other.
+    pub fn note_target_read(&self, consumer: TargetReadConsumer, bytes: u64) {
+        let (reads, read_bytes) = match consumer {
+            TargetReadConsumer::PresentCapture => {
+                (&self.present_capture_reads, &self.present_capture_read_bytes)
+            }
+            TargetReadConsumer::GuestWriteback => (
+                &self.guest_writeback_reads,
+                &self.guest_writeback_read_bytes,
+            ),
+        };
+        reads.fetch_add(1, Ordering::Relaxed);
+        read_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub fn note_seed_upload(&self, bytes: u64) {
@@ -805,6 +837,26 @@ mod tests {
         // And neither is the skip, which counts the population these two divide
         // the complement of. Nothing above took the skip path.
         assert_eq!(s.sampled_gather_skips, 0);
+    }
+
+    #[test]
+    fn a_resident_read_counts_against_one_consumer_and_leaves_the_other_alone() {
+        let counters = EngineCounters::default();
+        counters.note_target_read(TargetReadConsumer::PresentCapture, 4096);
+        counters.note_target_read(TargetReadConsumer::GuestWriteback, 1024);
+        counters.note_target_read(TargetReadConsumer::GuestWriteback, 2048);
+
+        let s = counters.snapshot();
+        assert_eq!(
+            (s.present_capture_reads, s.present_capture_read_bytes),
+            (1, 4096),
+            "the present capture's read did not land in its own pair: {s:?}"
+        );
+        assert_eq!(
+            (s.guest_writeback_reads, s.guest_writeback_read_bytes),
+            (2, 3072),
+            "a writeback read landed somewhere other than its own pair: {s:?}"
+        );
     }
 
     #[test]
