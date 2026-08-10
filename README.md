@@ -147,14 +147,16 @@ full list, with the parse, is `crates/reims-vgpu/src/env.rs`. Each accepts `1`/`
 
 | Variable | Effect |
 |---|---|
-| `REIMS_VGPU_DMABUF=off` | Stop reaching guest pages through a dma-buf, even where the host can. Every guest-memory rail takes the copying path instead — which is what runs on any host without `VK_EXT_external_memory_dma_buf`, so this is how that half is exercised on a machine that has it. |
+| `REIMS_VGPU_GUEST_IMPORT=off` | Stop reaching guest pages by importing a host pointer, even where the host can. Every guest-memory rail takes the copying path instead — which is what runs on any host without `VK_EXT_external_memory_host`, so this is how that half is exercised on a machine that has it. |
 | `REIMS_VGPU_DRAW_LOG=on` | Verbose per-draw detail on top of the always-on failure log. |
+| `REIMS_VGPU_GPU_STAMP=off` | Make a completion stamp that follows a guest-page writeback block the drain worker on that writeback and write the stamp word itself, instead of queueing the word behind the copy and letting the completion thread raise the interrupt. This is the rail a host without a host-pointer import or without `timelineSemaphore` takes regardless, so a hang or a torn frame can be attributed to one mechanism or the other without a rebuild. |
 
 An override can only **narrow** what the device does. There is no way to switch a rail *on* that the
 host reported it cannot run: capability is measured from the device at startup, and asking a driver
-for an extension it does not advertise fails device creation rather than degrading. `REIMS_VGPU_DMABUF`
-has no on direction for that reason — on a host without the extension it is already off, and the
-`vk_caps` line in `/tmp/reims-vgpu-fail.log` names which check said so.
+for an extension it does not advertise fails device creation rather than degrading.
+`REIMS_VGPU_GUEST_IMPORT` has no on direction for that reason — on a host without the extension it is
+already off, and the `vk_caps` line in `/tmp/reims-vgpu-fail.log` names which check said so, reporting
+`host_pointer_import=disabled_by_env` when this switch is what turned it off.
 
 ## Repo layout
 
