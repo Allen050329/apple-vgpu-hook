@@ -30,6 +30,40 @@
 //! [`super::pools::ResourcePools::host_ram_import_census`] is where a boot says
 //! how close it came.
 //!
+//! # Every submission is charged for the whole live set
+//!
+//! RADV's amdgpu winsys treats a host-pointer import as unconditionally
+//! resident: every live one is appended to every command submission's BO list,
+//! whether or not that submission binds it. An ioctl trace shows a submission
+//! that binds no guest memory at all still carrying the full set, and the charge
+//! tracks bytes rather than windows. Measured on a Radeon RX 9070 XT (RADV
+//! GFX1201), submit plus fence wait, min of five runs:
+//!
+//! ```text
+//! live imported    per submit
+//!         0 MiB      27.7 us
+//!        16 MiB      47.2 us
+//!       256 MiB     307.4 us
+//!      1024 MiB     869.7 us
+//! ```
+//!
+//! About 27.7 us plus 1 us per MiB live, or 4 ns per 4 KiB page. The control is
+//! the same allocation count and the same dirty anonymous footprint with no
+//! import, which stays at 27.7 us — so this is the import, not the memory.
+//! Splitting one gibibyte across four times as many windows moved it by 1.7 %:
+//! [`WINDOW_COUNT_CAP`] is not the knob, [`WINDOW_TOTAL_BYTE_CAP`] is.
+//!
+//! So the byte cap is a standing per-submission tax on the whole device, paid by
+//! draws that never touch guest memory. A boot that reaches the cap and holds it
+//! — which is what the `guest_import_levels` census has shown, at
+//! `windows=16 mib=1024` within 30 s — is paying roughly 850 us on every
+//! submission it makes. Weigh a raise against that, and read
+//! `buffer_guest_imports` first: while it is zero the rail is removing no copies
+//! at all, and the tax is the only thing it is doing.
+//!
+//! Whether another driver charges the same way is unmeasured; nothing here has
+//! run the experiment off amdgpu.
+//!
 //! # What the import does not promise
 //!
 //! Freeing the memory ends the GPU's access, but nothing in the extension's
