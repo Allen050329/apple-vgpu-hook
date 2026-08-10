@@ -83,6 +83,7 @@ impl ResourcePools {
             staging_live: Vec::new(),
             gather_free: HashMap::new(),
             gather_live: Vec::new(),
+            cb_bound_buffers: std::collections::HashMap::new(),
             staging_hits: 0,
             staging_misses: 0,
             staging_miss_bins: [0; STAGING_BUCKET_BINS],
@@ -725,7 +726,7 @@ impl ResourcePools {
     /// [`ResourcePools::reclaim_pools_for_allocation_retry`] is the half of the
     /// recovery that is safe there — a free-list entry is by construction one no
     /// command buffer holds. Retiring live residents is not safe here, and is
-    /// done only by `registry_ensure_color`, which calls the fuller
+    /// done only by `registry_ensure_attachment`, which calls the fuller
     /// [`ResourcePools::reclaim_for_allocation_retry`] itself; that function
     /// records the segfault which established the difference.
     pub(super) unsafe fn bind_image_slab(
@@ -812,7 +813,7 @@ impl ResourcePools {
     }
 
     /// Return a displaced resident-target image to `target_free` for reuse by a
-    /// later same-(geometry, format) `registry_ensure`/`registry_ensure_color`
+    /// later same-(geometry, format) `registry_ensure`/`registry_ensure_attachment`
     /// create. `None` means it was recycled; `Some(img)` means a cap was full and
     /// the caller must destroy it.
     fn try_recycle_target(&mut self, img: FreeTargetImage) -> Option<FreeTargetImage> {
@@ -1062,6 +1063,9 @@ impl ResourcePools {
         dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
         sampled_retains: Vec<SampledRetain>,
     ) -> PendingGpuCleanup {
+        // The slots the map names are about to be handed to the cleanup, so
+        // nothing recorded after this may bind one.
+        self.forget_cb_bound_buffers("bindmap_clear_seal", "bindmap_clear_seal_entries");
         let mut readback: Vec<BufferSlot> = self.readback_live.take().into_iter().collect();
         readback.append(&mut self.readback_multi_live);
         PendingGpuCleanup {
@@ -1268,6 +1272,70 @@ impl ResourcePools {
         self.guest_reads_in_flight = true;
     }
 
+    /// The buffer this command buffer already staged or gathered for `key`, if
+    /// it still holds one. See `ResourcePools::cb_bound_buffers`.
+    pub(crate) fn cb_bound_buffer(&self, key: (usize, u64)) -> Option<super::super::exec::BoundBuffer> {
+        self.cb_bound_buffers.get(&key).copied()
+    }
+
+    /// Remember that `key`'s bytes are in `bound` for the rest of this command
+    /// buffer.
+    pub(crate) fn note_cb_bound_buffer(
+        &mut self,
+        key: (usize, u64),
+        bound: super::super::exec::BoundBuffer,
+    ) {
+        self.cb_bound_buffers.insert(key, bound);
+    }
+
+    /// Drop every remembered bind. Called from the three places that end a
+    /// slot's life — the seal, the recycle, and a recorded guest-page write.
+    /// Drop every cached buffer bind, and say how many were dropped and by whom.
+    ///
+    /// The three callers discard the map for three different reasons, and only
+    /// one of them is about the *slots*: `seal_entry` and `recycle_staging` are
+    /// handing the staging slots the map names to a cleanup or a free list, so
+    /// nothing recorded after them may name one. `note_guest_write_recorded` is
+    /// not — its slots are untouched, and it clears the map because a Store
+    /// lands in guest pages a later bind may name.
+    ///
+    /// That last one clears unconditionally, and a driven boot puts it at
+    /// ~1 560 Stores a second, so it reads like over-invalidation: a Store into
+    /// surface pages discarding vertex-buffer copies that cannot overlap them.
+    ///
+    /// **It is not, and the entries column here is what settled it.** A driven
+    /// Safari-drag boot:
+    ///
+    /// ```text
+    /// bindmap_clear_seal            83 293 calls   290 747 entries
+    /// bindmap_clear_guestwrite      37 625 calls         0 entries
+    /// bindmap_clear_recycle              0 calls         0 entries
+    /// ```
+    ///
+    /// The guest-write arm never discards anything: `seal_entry` has always
+    /// already emptied the map by the time a Store records, because the Store's
+    /// copy is appended to a batch that is then flushed, and the flush seals.
+    /// Scoping that clear to overlapping pages would therefore buy exactly
+    /// nothing — and the entries column is the only thing that says so, because
+    /// the call column alone reads as 37 625 invalidations a boot.
+    ///
+    /// `bindmap_clear_seal`'s 3.5 entries a call is where the invalidation
+    /// actually is, and it is not obviously wrong either: those slots really are
+    /// being handed away. A bind surviving its submission would mean holding the
+    /// device-local gather buffer out of the recycle pool, which is a different
+    /// design carrying a VRAM cost, not a scoping fix.
+    ///
+    /// So this is a healthy zero, and a **non-zero**
+    /// `bindmap_clear_guestwrite_entries` is the reading that matters: it would
+    /// mean Stores had started landing while binds are live, and the
+    /// unconditional clear would have become a real cost.
+    fn forget_cb_bound_buffers(&mut self, why: &'static str, entries_slug: &'static str) {
+        let n = self.cb_bound_buffers.len() as u64;
+        crate::runtime::drain::note_store_route(why);
+        crate::runtime::drain::note_store_route_n(entries_slug, n);
+        self.cb_bound_buffers.clear();
+    }
+
     /// Clear the guest-read debt and answer whether there was one.
     ///
     /// Split from the wait so the ledger half is testable without a device: it
@@ -1310,6 +1378,9 @@ impl ResourcePools {
     /// — records the debt and nothing else, because there is then no image for
     /// the reclaim to take.
     pub(crate) fn note_guest_write_recorded(&mut self, identity: &TargetIdentity) {
+        // A bind recorded after this must not reuse a copy taken before it: the
+        // Store lands in guest pages a later bind may name.
+        self.forget_cb_bound_buffers("bindmap_clear_guestwrite", "bindmap_clear_guestwrite_entries");
         self.guest_writes_in_flight = true;
         if self.pin_resident_target(identity, true) {
             self.unpin_on_settle.push(identity.clone());
@@ -1902,6 +1973,7 @@ impl ResourcePools {
     }
 
     pub(crate) fn recycle_staging(&mut self) {
+        self.forget_cb_bound_buffers("bindmap_clear_recycle", "bindmap_clear_recycle_entries");
         for slot in self.staging_live.drain(..) {
             let bucket = Self::bucket(slot.size);
             self.staging_free.entry(bucket).or_default().push(slot);
@@ -3254,7 +3326,7 @@ mod recycle_tests {
                 ResidentStorageImageSlot {
                     slot: null_storage_slot(8, 8),
                     generation: 0,
-                    layout: vk::ImageLayout::UNDEFINED,
+                    access: ResidentAccess::Untouched,
                     pinned,
                     gpu_only_content: false,
                     last_touch_ms: touch,
@@ -3318,7 +3390,7 @@ mod recycle_tests {
         let mut pools = ResourcePools::new();
         let id = admit_compute_resident(&mut pools, 1, 1_000, false);
         // The dispatch wrote it. Nothing else holds the result.
-        pools.mark_resident_storage_image(&id, 7, vk::ImageLayout::GENERAL);
+        pools.mark_resident_storage_image(&id, 7);
 
         let cutoff = 10_000u64.saturating_sub(IDLE_TARGET_AGE_MS);
         assert!(
@@ -3359,14 +3431,14 @@ mod recycle_tests {
             "both are re-servable, so both could be given back"
         );
 
-        pools.mark_resident_storage_image(&a, 1, vk::ImageLayout::GENERAL);
+        pools.mark_resident_storage_image(&a, 1);
         assert_eq!(
             pools.recoverable_compute_storage_residents(),
             vec![b],
             "the sole copy drops out; its peer is still offered"
         );
 
-        pools.mark_resident_storage_image(&b, 1, vk::ImageLayout::GENERAL);
+        pools.mark_resident_storage_image(&b, 1);
         assert!(
             pools.recoverable_compute_storage_residents().is_empty(),
             "nothing left that can be destroyed without refusing a later dispatch"
@@ -3407,15 +3479,15 @@ mod recycle_tests {
             "a resident no dispatch has written holds no guest work"
         );
 
-        pools.mark_resident_storage_image(&a, 1, vk::ImageLayout::GENERAL);
+        pools.mark_resident_storage_image(&a, 1);
         check(&pools, "a dispatch wrote the first");
         assert_eq!(pools.compute_storage_sole_copy.count, 1);
         // A second dispatch into the same resident is still one resident.
-        pools.mark_resident_storage_image(&a, 2, vk::ImageLayout::GENERAL);
+        pools.mark_resident_storage_image(&a, 2);
         check(&pools, "a second dispatch into the same resident");
         assert_eq!(pools.compute_storage_sole_copy.count, 1);
 
-        pools.mark_resident_storage_image(&b, 1, vk::ImageLayout::GENERAL);
+        pools.mark_resident_storage_image(&b, 1);
         check(&pools, "a dispatch wrote the second");
         assert_eq!(pools.compute_storage_sole_copy.count, 2);
 
@@ -3433,7 +3505,7 @@ mod recycle_tests {
         assert_eq!(pools.compute_storage_sole_copy.count, 0);
 
         // Removal folds a still-sole-copy resident out — the re-key path.
-        pools.mark_resident_storage_image(&b, 3, vk::ImageLayout::GENERAL);
+        pools.mark_resident_storage_image(&b, 3);
         check(&pools, "the second written again");
         assert_eq!(pools.compute_storage_sole_copy.count, 1);
         assert!(pools.remove_compute_storage_resident(&b).is_some());
@@ -3459,7 +3531,7 @@ mod recycle_tests {
             ResidentStorageImageSlot {
                 slot: null_storage_slot(8, 8),
                 generation: 0,
-                layout: vk::ImageLayout::UNDEFINED,
+                access: ResidentAccess::Untouched,
                 pinned,
                 gpu_only_content: false,
                 last_touch_ms: touch,
@@ -3797,6 +3869,56 @@ mod recycle_tests {
         pools.note_guest_read_recorded();
         assert!(pools.take_guest_read_debt());
         assert!(!pools.take_guest_read_debt());
+    }
+
+    /// A remembered bind names a pool slot, and it must not outlive the three
+    /// events that end that slot's usefulness.
+    ///
+    /// The seal and the recycle are lifetime: both hand the slot away, and a
+    /// later bind of the same content would be given a buffer the ring is free
+    /// to reissue to somebody else. The guest-page write is correctness and is
+    /// the one worth the most — a Store lands in guest pages a later bind may
+    /// name, so a bind after it must not be served a copy taken before it. Each
+    /// is asserted on its own, so a clear deleted from one site cannot be
+    /// covered by another still having one.
+    #[test]
+    fn a_remembered_bind_does_not_survive_the_three_things_that_end_it() {
+        let key = (0xabc_usize, 4096u64);
+        let bound = crate::backend::vulkan::engine::exec::BoundBuffer {
+            buffer: vk::Buffer::null(),
+            offset: 0,
+        };
+        let identity = TargetIdentity::Surface {
+            id: 1,
+            width: 16,
+            height: 16,
+            generation: 0,
+        };
+        /// One thing that ends a remembered bind's life, named for the failure
+        /// message.
+        type EndOfLife<'a> = (&'a str, &'a dyn Fn(&mut ResourcePools));
+        let ends: [EndOfLife<'_>; 3] = [
+            ("a seal", &|p| {
+                p.seal_entry(Vec::new(), Vec::new());
+            }),
+            ("a staging recycle", &|p| p.recycle_staging()),
+            ("a recorded guest-page write", &|p| {
+                p.note_guest_write_recorded(&identity)
+            }),
+        ];
+        for (what, end) in ends {
+            let mut pools = ResourcePools::new();
+            pools.note_cb_bound_buffer(key, bound);
+            assert!(
+                pools.cb_bound_buffer(key).is_some(),
+                "a bind must be reusable before {what}"
+            );
+            end(&mut pools);
+            assert!(
+                pools.cb_bound_buffer(key).is_none(),
+                "a bind remembered across {what} names a slot no longer this command buffer's"
+            );
+        }
     }
 
     /// The write ledger's own half, and the reason it is a ledger rather than a

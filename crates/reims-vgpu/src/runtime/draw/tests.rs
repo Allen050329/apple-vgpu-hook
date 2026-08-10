@@ -5534,3 +5534,99 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
     assert_eq!(store_route_count("gvarung_resident_absent"), absent);
     assert_eq!(store_route_count("gvarung_resident"), served);
 }
+
+/// The depth attachment's identity is the guest texture the pass bound, so two
+/// draws into one depth texture name one resident and the second allocates
+/// nothing.
+///
+/// This is the whole of what makes the depth rail cost amortise. The engine's
+/// reuse test is `ResidentTargetSlot::reusable_for` and it is keyed on this
+/// value, so an identity that varied per draw — or that collided between two
+/// guest textures — would put the rail straight back to one image per draw, or
+/// fuse two guests' depth buffers into one. Neither is visible in a frame until
+/// a workload is large enough to notice, which is why it is pinned here rather
+/// than left to a boot.
+///
+/// Not a GPU test: nothing in this crate can drive `registry_ensure_depth`
+/// without a device, so the gate sits at the key that rail is keyed on.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
+    use crate::backend::vulkan::engine::TargetIdentity;
+    use crate::runtime::decode::render::DepthAttachment;
+    use crate::runtime::draw::vulkan::depth_chain_identity;
+
+    let id = |r: &DrawEncodeRequest, st: bool| depth_chain_identity(r, st);
+    let req = |depth_ref: u32, w: u32, h: u32| DrawEncodeRequest {
+        colors: vec![ColorRtRequest {
+            width: w,
+            height: h,
+            ..Default::default()
+        }],
+        depth_attach: Some(DepthAttachment {
+            texture_ref: depth_ref,
+            ..Default::default()
+        }),
+        ..DrawEncodeRequest::default()
+    };
+
+    let first = id(&req(42, 1024, 768), false).expect("a bound depth texture has one");
+    assert_eq!(
+        first,
+        TargetIdentity::Texture {
+            ref_: 42,
+            width: 1024,
+            height: 768,
+            generation: 0,
+            stencil: false,
+        },
+        "the guest's own texture ref is the key"
+    );
+    assert_eq!(
+        id(&req(42, 1024, 768), false).as_ref(),
+        Some(&first),
+        "a second draw into the same depth texture resolves the same resident"
+    );
+    assert_ne!(
+        id(&req(43, 1024, 768), false),
+        Some(first.clone()),
+        "two guest depth textures must not fuse into one resident"
+    );
+    assert_ne!(
+        id(&req(42, 800, 600), false),
+        Some(first.clone()),
+        "geometry is part of the key, so a resized attachment recreates"
+    );
+
+    // The stencil aspect selects the image format, so it partitions the key. Two
+    // residents, each stable, rather than one retired and recreated on every
+    // alternation between a stencil draw and a depth-only one.
+    assert_ne!(
+        id(&req(42, 1024, 768), true),
+        Some(first),
+        "a stencil-carrying depth attachment is its own resident"
+    );
+
+    // No depth texture in the pass descriptor: nothing to key a resident on, and
+    // the engine's transient fallback is what runs.
+    assert_eq!(
+        id(&req(0, 1024, 768), false),
+        None,
+        "an unbound depth attachment names no resident"
+    );
+    assert_eq!(
+        depth_chain_identity(
+            &DrawEncodeRequest {
+                colors: vec![ColorRtRequest {
+                    width: 1024,
+                    height: 768,
+                    ..Default::default()
+                }],
+                ..DrawEncodeRequest::default()
+            },
+            false
+        ),
+        None,
+        "and neither does a pass with no depth attachment at all"
+    );
+}

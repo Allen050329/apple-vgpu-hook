@@ -186,6 +186,51 @@ pub(crate) struct ResourcePools {
     /// `gather_guest_buffer_window` exists to avoid.
     gather_free: HashMap<u64, Vec<BufferSlot>>,
     gather_live: Vec<BufferSlot>,
+    /// Buffer binds the command buffer now recording has already staged or
+    /// gathered, keyed by the content that produced them.
+    ///
+    /// The key is `(Arc` address`, length)` of the bind's content — the runtime
+    /// holds one `Arc` per resolved `(task, reference, offset)`, so two binds of
+    /// the same guest window are the same pointer and two different windows
+    /// cannot collide however their bytes compare.
+    ///
+    /// # Why the command buffer and not the draw
+    ///
+    /// This was a local in `execute_draw_inner`, so it deduplicated the ~5 binds
+    /// of one draw and nothing across the batch that draw joins. A window bound
+    /// by four consecutive draws was copied into device-local memory four times,
+    /// and a driven Safari drag moved **4.46 GB per second** that way.
+    ///
+    /// One copy per command buffer is what the guest's own model gives it. The
+    /// bytes are read when the command buffer executes, so a guest that rewrote
+    /// the window between two draws of one command buffer would already be
+    /// racing itself: nothing tells it when either draw runs. Copying twice does
+    /// not make that guest correct, it only makes this device slower.
+    ///
+    /// Same probe after the move, busiest census second:
+    ///
+    /// ```text
+    /// buffer_guest_gathers       19 372 ->  11 894
+    /// buffer_guest_gather_bytes    4.46 GB ->   2.71 GB
+    /// buffer_bind_reuses                -    23 947
+    /// batch_flush_draws           3 913 ->   4 635
+    /// ```
+    ///
+    /// Two binds in three are served from a copy this command buffer already
+    /// holds. Bus traffic per draw — this, plus the surface writeback going the
+    /// other way — went 2.25 MB to 1.69 MB while the drag ran 18 % more draws a
+    /// second, and its peak present rate went 68 Hz to 76 Hz.
+    ///
+    /// # What ends an entry's life
+    ///
+    /// The slots named here live in `staging_live` / `gather_live`, so the map
+    /// is cleared wherever those are handed away or recycled —
+    /// [`ResourcePools::seal_entry`] and [`ResourcePools::recycle_staging`] —
+    /// and additionally whenever this device records a write **into guest
+    /// pages** ([`ResourcePools::note_guest_write_recorded`]). That last one is
+    /// the correctness edge: a bind after a Store into the same pages must see
+    /// what the Store wrote, and reusing a copy taken before it would not.
+    cb_bound_buffers: HashMap<(usize, u64), super::exec::BoundBuffer>,
     /// Staging free-list hits / misses and the miss bucket histogram; see
     /// `note_staging_miss`. Measure-only.
     staging_hits: u64,
@@ -835,14 +880,16 @@ pub(crate) struct StorageImageSlot {
 
 pub(crate) struct ResidentStorageImageUse {
     pub slot: StorageImageSlot,
-    pub layout: vk::ImageLayout,
+    pub access: ResidentAccess,
     pub generation_match: bool,
 }
 
 struct ResidentStorageImageSlot {
     slot: StorageImageSlot,
     generation: u32,
-    layout: vk::ImageLayout,
+    /// What last touched this image, and where that left it — see
+    /// [`ResidentAccess`], which the target registry shares.
+    access: ResidentAccess,
     /// Deferred-writeback pin: the resident is the only copy of this content
     /// (guest pages are stale) — LRU eviction must skip it until the caller
     /// flushes and unpins.
@@ -960,6 +1007,99 @@ pub(crate) struct NonPinnedTotals {
     pub bytes: u64,
 }
 
+/// Where a registry-resident image sits, and what put it there, as one value.
+///
+/// The two halves are inseparable because reading either one alone is the bug
+/// this type exists to make unrepresentable. A tracked **layout** names where
+/// the image is; a barrier's source scope has to name what last **touched** it,
+/// and on this registry the two disagree by construction. A render pass moves
+/// its primary attachment to `TRANSFER_SRC_OPTIMAL` through `final_layout`
+/// without any transfer having run, so a resident sitting in that layout was in
+/// fact last written by a colour attachment write. Deriving a barrier's source
+/// scope from the layout reads that write as a transfer read and leaves the
+/// colour writes free to race whatever comes next — the same stale-frame
+/// failure as omitting the barrier outright, only harder to see.
+///
+/// A resident is the only image class where this matters. Pool-owned transients
+/// re-enter their free lists only through `drain_cleanup`, which `retire_slot`
+/// reaches only after `wait_for_fences` on the submission that last used them,
+/// so a pooled image cannot be handed out while GPU work still reads it and
+/// there is nothing for a source scope to name. A resident is keyed by
+/// [`TargetIdentity`] and deliberately outlives the draw so its pixels survive
+/// to the next one, which is exactly what makes it useful — and exactly why it
+/// alone has to state what it is waiting for.
+///
+/// The enum is closed because the rails that touch a resident are: a draw's
+/// render pass, an MRT secondary's render pass, a resident sample, and the
+/// three transfer reads (present blit, guest-page readback, GPU seed source).
+/// Every one of them ends in one of these variants, which is what lets
+/// [`Self::source_scope`] be exact rather than a blunt `ALL_COMMANDS` union
+/// over every write a resident could conceivably carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResidentAccess {
+    /// Created or recycled; nothing has touched the image.
+    Untouched,
+    /// A render pass wrote it as a colour attachment and left it in that pass's
+    /// `final_layout` — `TRANSFER_SRC_OPTIMAL` for a primary target,
+    /// `COLOR_ATTACHMENT_OPTIMAL` for an MRT secondary.
+    ColorWrite(vk::ImageLayout),
+    /// A draw sampled it.
+    ShaderRead,
+    /// A transfer read it: a present blit, a guest-page readback, a GPU seed
+    /// copy, or this draw's own copy-on-sample snapshot.
+    TransferRead,
+}
+
+impl ResidentAccess {
+    /// Where the image is — the `old_layout` a barrier over it must name.
+    pub(crate) fn layout(self) -> vk::ImageLayout {
+        match self {
+            Self::Untouched => vk::ImageLayout::UNDEFINED,
+            Self::ColorWrite(layout) => layout,
+            Self::ShaderRead => vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            Self::TransferRead => vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        }
+    }
+
+    /// What last touched it — the `srcStageMask`/`srcAccessMask` a barrier over
+    /// it must name, whichever direction that barrier goes.
+    ///
+    /// One answer serves reads and writes both. A read-after-write needs the
+    /// write made available, which the write's own access flag supplies; a
+    /// write-after-read needs an execution dependency on the read, which the
+    /// read's own stage supplies. Naming the single access that actually
+    /// happened covers each hazard in its own direction.
+    ///
+    /// Naming only the *last* access is sufficient because consecutive barriers
+    /// over one resident form a dependency chain: the barrier that let access
+    /// N+1 happen already named access N as its source, so a write two accesses
+    /// back stays ordered through the barrier that stood between them. That
+    /// holds only while every touch updates the registry, which is why this
+    /// enum and the field carrying it are the same value — a rail that touches
+    /// a resident without recording it is the one way to break the chain, and
+    /// it cannot compile without choosing a variant.
+    pub(crate) fn source_scope(self) -> (vk::PipelineStageFlags, vk::AccessFlags) {
+        match self {
+            Self::Untouched => (
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::AccessFlags::empty(),
+            ),
+            Self::ColorWrite(_) => (
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            ),
+            Self::ShaderRead => (
+                vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::AccessFlags::SHADER_READ,
+            ),
+            Self::TransferRead => (
+                vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::TRANSFER_READ,
+            ),
+        }
+    }
+}
+
 pub(crate) struct ResidentTargetSlot {
     pub image: vk::Image,
     pub memory: vk::DeviceMemory,
@@ -981,8 +1121,9 @@ pub(crate) struct ResidentTargetSlot {
     /// epoch 0 ("nothing published since attach") is a legal *mapping* value
     /// and a bare `0 == 0` would match an image that was never stamped at all.
     pub content_epoch: Option<u32>,
-    /// Last known layout (tracked for correct barriers).
-    pub layout: vk::ImageLayout,
+    /// What last touched this image, and where that left it. See
+    /// [`ResidentAccess`] for why these are one field and not two.
+    pub access: ResidentAccess,
     /// Concrete Vulkan attachment format the image was created with. Every
     /// question about this resident's channel order is asked of this field,
     /// through [`ResidentTargetSlot::scanout_order`] — a format change forces an
@@ -1155,7 +1296,7 @@ impl ResidentTargetSlot {
     /// The desktop workload creates no framebuffer-less resident at all: on a
     /// driven x86/Vulkan boot (Safari window drag, 2 892 posted events, ~37.5 Hz
     /// median present) the `vk_alloc_sites` census reads `mrt_secondary=0:0:0`,
-    /// and only [`ResourcePools::registry_ensure_color`] allocates under that
+    /// and only [`ResourcePools::registry_ensure_attachment`] allocates under that
     /// site. So every slot the drain and the recreate arms retired that boot had
     /// a real framebuffer, and all three disposal sites would have behaved
     /// identically with the check and without it.
@@ -1923,6 +2064,25 @@ const STAGING_MISS_EMIT_EVERY: u64 = 512;
 /// the readback past more draws, and the completion-stamp contract forbids that:
 /// a Store's pixels must be in guest RAM before the stamp that claims them.
 ///
+/// # The readback share is now nearly all of it
+///
+/// Same probe after the self-alias join term was dropped from
+/// `engine::exec`'s `JoinTerms` ladder:
+///
+/// ```text
+/// batch_flushes            33538   (was 55334)
+/// batch_readback_joins     30471   90.9 % of them (was 58.8 %)
+/// batch_flush_draws        91495   2.73 draws per batch (was 1.77)
+/// ```
+///
+/// So the paragraph above has become the whole answer rather than most of it:
+/// **91 % of batches now end at a readback**, and the remaining 9 % is every
+/// other cause put together. Batch length is set by how often the guest issues
+/// a Store, the completion-stamp contract forbids deferring one, and 30 471
+/// readbacks is one per command stream. That is the floor this rail can reach
+/// without changing what a stamp promises — not a number to tune this constant
+/// against.
+///
 /// Before changing this constant, read `batch_flush_draws / batch_flushes`
 /// against it — while the ratio sits far below, the ceiling is not the bound.
 const BATCH_MAX_DRAWS: u64 = 8;
@@ -1973,7 +2133,21 @@ pub(crate) enum AllocSite {
     /// boot: `mrt_draw_single=24579` with no `secondary_mrt_drop` at all — the
     /// guest never asked for MRT, rather than asking and being degraded.
     MrtSecondary,
+    /// A depth buffer allocated for one draw and destroyed after it, because
+    /// the pass named no guest depth texture to key a resident on. See
+    /// [`AllocSite::DepthResident`] for the rail that owns the identified case;
+    /// this one should read near zero, and a rising count means guests are
+    /// binding depth state without a depth attachment.
     TransientDepth,
+    /// A depth buffer held in the registry under the guest texture the pass
+    /// bound, for as long as the guest keeps that texture.
+    ///
+    /// Split from [`AllocSite::TransientDepth`] rather than replacing it because
+    /// the two answer different questions and a boot series spanning the change
+    /// has to stay readable: this counts allocations that amortise over a
+    /// texture's life, that one counts allocations that do not amortise at all.
+    /// Summing them would hide exactly the ratio the split exists to show.
+    DepthResident,
     /// A HOST_VISIBLE upload block, not one staging buffer.
     ///
     /// Every staging bind is a sub-allocation out of one of these
@@ -1998,7 +2172,7 @@ pub(crate) enum AllocSite {
     GuestGatherBlock,
 }
 
-const ALLOC_SITE_N: usize = 9;
+const ALLOC_SITE_N: usize = 10;
 
 impl AllocSite {
     const fn idx(self) -> usize {
@@ -2006,12 +2180,13 @@ impl AllocSite {
             AllocSite::StorageImage => 0,
             AllocSite::MrtSecondary => 1,
             AllocSite::TransientDepth => 2,
-            AllocSite::StagingBlock => 3,
-            AllocSite::Readback => 4,
-            AllocSite::ReadbackMulti => 5,
-            AllocSite::SlabBlock => 6,
-            AllocSite::GuestScratch => 7,
-            AllocSite::GuestGatherBlock => 8,
+            AllocSite::DepthResident => 3,
+            AllocSite::StagingBlock => 4,
+            AllocSite::Readback => 5,
+            AllocSite::ReadbackMulti => 6,
+            AllocSite::SlabBlock => 7,
+            AllocSite::GuestScratch => 8,
+            AllocSite::GuestGatherBlock => 9,
         }
     }
 }
@@ -2020,6 +2195,7 @@ const ALLOC_SITE_NAMES: [&str; ALLOC_SITE_N] = [
     "storage_image",
     "mrt_secondary",
     "transient_depth",
+    "depth_resident",
     "staging_block",
     "readback",
     "readback_multi",
@@ -2885,7 +3061,7 @@ mod staging_mapping_tests {
 
 #[cfg(test)]
 mod resident_reuse_tests {
-    use super::ResidentTargetSlot;
+    use super::{ResidentAccess, ResidentTargetSlot};
     use crate::backend::vulkan::translate;
     use ash::vk;
 
@@ -2902,7 +3078,7 @@ mod resident_reuse_tests {
             generation,
             content_ready: false,
             content_epoch: None,
-            layout: vk::ImageLayout::UNDEFINED,
+            access: ResidentAccess::Untouched,
             color_format: format,
             pin_count: 0,
             gpu_only_content: false,

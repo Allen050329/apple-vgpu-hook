@@ -690,6 +690,15 @@ pub struct RenderPipelineDescriptor {
     /// descriptor**, not an unknown position; the mesh shape never states one
     /// and falls back to inferring the block.
     pub has_vertex_descriptor_offset: bool,
+    /// The guest's `rasterSampleCount`. See
+    /// [`PIPELINE_TAG_RASTER_SAMPLE_COUNT`].
+    ///
+    /// **Zero means the descriptor did not state the property**, which is the
+    /// Metal default of [`DEFAULT_RASTER_SAMPLE_COUNT`]. Readers ask `> 1` rather
+    /// than `!= 1` so that an absent property and a stated single-sample count
+    /// are one answer, and so a defaulted `RenderPipelineDescriptor` does not
+    /// read as a count no device can rasterize at.
+    pub raster_sample_count: u32,
     pub vertex_attributes: Vec<VertexAttribute>,
     /// First color attachment (compat / color0).
     pub color0: PipelineColorAttachment,
@@ -1204,8 +1213,41 @@ pub const PIPELINE_TAG_MESH_FRAGMENT_FUNC: u8 = 0x03;
 /// [`note_vertex_block_inferred`], which is what still measures the mesh arm's
 /// reliance on it.
 pub const PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET: u8 = PIPELINE_TAG_MESH_FRAGMENT_FUNC;
+/// `MTLRenderPipelineDescriptor.rasterSampleCount` — how many samples each
+/// fragment is rasterized at.
+///
+/// Present on both shapes: it is a property of the descriptor rather than of
+/// either role map, so it is in both `*_TAGS_CONSUMED` lists.
+///
+/// **A property equal to a freshly-initialised descriptor's is omitted from the
+/// block entirely**, which is the grammar rule behind every ragged shape this
+/// decoder sees, and it makes this tag's presence meaningful on its own: the
+/// Metal default is one sample, so a descriptor that states this property is
+/// asking for something other than single-sampling. The value is still what is
+/// read — [`DEFAULT_RASTER_SAMPLE_COUNT`] and absence are treated alike — because
+/// acting on presence would make the decode depend on the encoder's omission
+/// rule rather than on the number the guest sent.
+pub const PIPELINE_TAG_RASTER_SAMPLE_COUNT: u8 = 0x04;
 /// Offset (from header end) to color-attachment section; vertex block lives before it.
 pub const PIPELINE_TAG_COLOR_ATTACH_OFFSET: u8 = 0x08;
+/// `MTLRenderPipelineDescriptor.depthAttachmentPixelFormat`, an `MTLPixelFormat`.
+///
+/// A compile-time compatibility declaration rather than an instruction: Metal
+/// requires a pipeline's declared attachment formats to match the render pass it
+/// is used with, so this restates what the pass already carries. See
+/// [`RENDER_PIPELINE_TAGS_BENIGN`] for why this device does not apply it.
+pub const PIPELINE_TAG_DEPTH_ATTACH_FORMAT: u8 = 0x09;
+/// `MTLRenderPipelineDescriptor.stencilAttachmentPixelFormat`, an
+/// `MTLPixelFormat`. The stencil half of [`PIPELINE_TAG_DEPTH_ATTACH_FORMAT`],
+/// and benign for the same reason.
+pub const PIPELINE_TAG_STENCIL_ATTACH_FORMAT: u8 = 0x0a;
+/// The `rasterSampleCount` a descriptor that omits the property is asking for,
+/// and the only count this device rasterizes at.
+///
+/// Every render target the backends allocate is single-sampled, so this is not a
+/// policy choice: a pipeline built at any other count would not be compatible
+/// with the pass it is used in.
+pub const DEFAULT_RASTER_SAMPLE_COUNT: u32 = 1;
 /// Mesh SPI section offset (analog of classic [`PIPELINE_TAG_COLOR_ATTACH_OFFSET`]).
 ///
 /// Live host Metal `-[_MTLDevice serializeMeshRenderPipelineDescriptor:]`
@@ -2182,11 +2224,12 @@ pub fn decode_sampler_descriptor(bytes: &[u8]) -> Result<SamplerDescriptor, Deco
 /// boot's classic pipelines that carry `0x03` — an instrument built to find
 /// unread fields hiding one behind a tag its *other* branch reads. Which tags
 /// count as consumed is a property of the branch taken, so it is chosen there.
-const CLASSIC_PIPELINE_TAGS_CONSUMED: [u8; 4] = [
+const CLASSIC_PIPELINE_TAGS_CONSUMED: [u8; 5] = [
     PIPELINE_TAG_VERTEX_FUNC,
     PIPELINE_TAG_FRAGMENT_FUNC,
     PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET,
     PIPELINE_TAG_COLOR_ATTACH_OFFSET,
+    PIPELINE_TAG_RASTER_SAMPLE_COUNT,
 ];
 
 /// Tags [`decode_render_pipeline_descriptor`] reads on the **mesh** shape.
@@ -2194,11 +2237,12 @@ const CLASSIC_PIPELINE_TAGS_CONSUMED: [u8; 4] = [
 /// Four: the section offset that selected this branch and the three function
 /// refs whose roles it re-maps. See [`CLASSIC_PIPELINE_TAGS_CONSUMED`] for why
 /// the two sets are listed apart.
-const MESH_PIPELINE_TAGS_CONSUMED: [u8; 4] = [
+const MESH_PIPELINE_TAGS_CONSUMED: [u8; 5] = [
     PIPELINE_TAG_MESH_SECTION_OFFSET,
     PIPELINE_TAG_VERTEX_FUNC,
     PIPELINE_TAG_FRAGMENT_FUNC,
     PIPELINE_TAG_MESH_FRAGMENT_FUNC,
+    PIPELINE_TAG_RASTER_SAMPLE_COUNT,
 ];
 
 /// Tags [`decode_compute_pipeline_descriptor`] reads out of a compute
@@ -2247,13 +2291,30 @@ const COMPUTE_PIPELINE_TAG_LABEL: u8 = 0x02;
 ///   the shader itself and takes the threadgroup size from the dispatch record,
 ///   so there is nothing to apply — and the property's own default is the
 ///   conservative arm, so not applying it cannot be the unsafe direction.
+/// * [`PIPELINE_TAG_DEPTH_ATTACH_FORMAT`] and
+///   [`PIPELINE_TAG_STENCIL_ATTACH_FORMAT`] declare the attachment formats the
+///   pipeline is compiled against. They do not *select* an attachment: the
+///   render pass descriptor carries the depth and stencil textures a draw
+///   renders into, and this device takes them from there. Both backends then
+///   pin the host format — Vulkan to `TRANSIENT_DEPTH_FORMAT` or the device's
+///   queried combined format, the Metal arm to `DEPTH32_FLOAT` in
+///   `validate_depth_attachment` — so there is no arm on which the guest's
+///   declared format could change the attachment it gets. Dropping them cannot
+///   change what the guest observes; the attachment it observes is the one its
+///   own pass named.
 ///
-/// **`rasterizationEnabled`, `alphaToCoverageEnabled` and `rasterSampleCount`
-/// are deliberately not here.** They are the three the old doc named as silently
-/// defaulted, they are the reason this refusal exists, and none of them has ever
-/// appeared in this block on a driven boot — see [`PipelineFieldDropped`] for
-/// the shapes. If one arrives it must refuse rather than be waved through.
-const RENDER_PIPELINE_TAGS_BENIGN: [u8; 1] = [RENDER_PIPELINE_TAG_LABEL];
+/// **`rasterizationEnabled` and `alphaToCoverageEnabled` are deliberately not
+/// here.** They are two of the three the old doc named as silently defaulted,
+/// and neither has appeared in this block on a driven boot. If one arrives it
+/// must refuse rather than be waved through. The third,
+/// [`PIPELINE_TAG_RASTER_SAMPLE_COUNT`], is now read — it is consumed on both
+/// shapes and a count this device cannot rasterize at is a named degradation
+/// rather than a silent default. See `note_pipeline_raster_sample_count`.
+const RENDER_PIPELINE_TAGS_BENIGN: [u8; 3] = [
+    RENDER_PIPELINE_TAG_LABEL,
+    PIPELINE_TAG_DEPTH_ATTACH_FORMAT,
+    PIPELINE_TAG_STENCIL_ATTACH_FORMAT,
+];
 /// The compute half of [`RENDER_PIPELINE_TAGS_BENIGN`]; same rule, and listed
 /// apart for the same reason `COMPUTE_PIPELINE_TAGS_CONSUMED` is.
 const COMPUTE_PIPELINE_TAGS_BENIGN: [u8; 2] = [
@@ -2350,13 +2411,25 @@ const COMPUTE_PIPELINE_TAGS_BENIGN: [u8; 2] = [
 /// the class this file exists to stop, and refusing is what a GPU does with a
 /// request it cannot represent.
 ///
-/// The cost of refusing is a lost pipeline, and it is bounded by the zero above:
-/// no tag outside the consumed and benign lists has appeared on any driven boot
-/// of this rig. A firing is therefore a guest doing something this workload does
-/// not, and the answer is to identify the tag — into the consumed list if it is
+/// The cost of refusing is a lost pipeline. The zero above does not bound it,
+/// and reading it as a bound was the mistake: those shapes are one compositing
+/// workload's, and the population they measure is "pipelines this rig's desktop
+/// builds", not "pipelines a guest builds". A map view built three tags this
+/// list had never seen — `0x04`, `0x09`, `0x0a` — and every pipeline carrying one
+/// was refused, which put its whole canvas through the clear-only fallback while
+/// the window chrome around it composited normally. A refusal is the right
+/// answer to a property that cannot be represented; it is the wrong answer to
+/// one nobody had got around to identifying, and only the second kind is
+/// bounded by what a past boot happened to send.
+///
+/// So a firing is a guest doing something the *measured* workload does not, and
+/// the answer is to identify the tag — into the consumed list if it is
 /// load-bearing, into the benign list with an argument if it is not. Widening
 /// the benign list to silence a refusal without that argument is the one move
-/// this instrument is built to prevent.
+/// this instrument is built to prevent. All three of the above are now
+/// identified: see [`PIPELINE_TAG_RASTER_SAMPLE_COUNT`],
+/// [`PIPELINE_TAG_DEPTH_ATTACH_FORMAT`] and
+/// [`PIPELINE_TAG_STENCIL_ATTACH_FORMAT`].
 ///
 /// Deduped per distinct `(tag, len)` rather than per value: what a reader needs
 /// first is which properties arrive, and a per-value latch on a field like a
@@ -2381,6 +2454,52 @@ impl crate::observe::Decline for PipelineFieldDropped {
             ("len", self.len.to_string()),
         ]
     }
+}
+
+/// A pipeline asking to be rasterized at a sample count this device does not
+/// have attachments for. The pipeline is built at
+/// [`DEFAULT_RASTER_SAMPLE_COUNT`] instead.
+///
+/// A **degradation, not a loss**: the draw runs and the guest keeps its
+/// geometry, with edges that alias where the guest asked for them not to. That
+/// is why this reports rather than refusing — a refusal here costs the whole
+/// draw to buy nothing, because every render target both backends allocate is
+/// single-sampled and so a pipeline built at any other count would not be
+/// compatible with the pass it is used in. Widening it is an attachment-path
+/// change, and this line is what would measure the demand for one.
+///
+/// On the fail channel because the reliance has to stay measurable, per this
+/// crate's rule that a repair which succeeded is still worth naming. Deduped on
+/// the requested count, which is the whole of what varies between two guests
+/// asking for this.
+struct PipelineRasterSampleCountDegraded {
+    count: u32,
+}
+
+impl crate::observe::Decline for PipelineRasterSampleCountDegraded {
+    fn slug(&self) -> &'static str {
+        "pipeline_raster_sample_count_degraded"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("count", self.count.to_string()),
+            ("built_at", DEFAULT_RASTER_SAMPLE_COUNT.to_string()),
+        ]
+    }
+}
+
+/// Name a `rasterSampleCount` this device cannot honour. See
+/// [`PipelineRasterSampleCountDegraded`].
+///
+/// Zero and one are the same answer — see
+/// [`RenderPipelineDescriptor::raster_sample_count`] — so only `> 1` reports.
+fn note_pipeline_raster_sample_count(count: u32) {
+    if count <= DEFAULT_RASTER_SAMPLE_COUNT {
+        return;
+    }
+    let drop = PipelineRasterSampleCountDegraded { count };
+    crate::observe::Emit::decline("type7_pipeline", &drop).fail_once(u64::from(count));
 }
 
 /// Report the shape of a type-7 pipeline's own compact-TLV block and every
@@ -2559,6 +2678,12 @@ pub fn decode_render_pipeline_descriptor(
     let tag01 = compact_tlv_u32(&fields, PIPELINE_TAG_VERTEX_FUNC).unwrap_or(0);
     let tag02 = compact_tlv_u32(&fields, PIPELINE_TAG_FRAGMENT_FUNC).unwrap_or(0);
     let tag03 = compact_tlv_u32(&fields, PIPELINE_TAG_MESH_FRAGMENT_FUNC).unwrap_or(0);
+    // A property of the descriptor rather than of either role map, so it is read
+    // before the shape is chosen and both branches carry it. Zero is the absent
+    // case and means single-sampled; see the field's doc.
+    out.raster_sample_count =
+        compact_tlv_u32(&fields, PIPELINE_TAG_RASTER_SAMPLE_COUNT).unwrap_or(0);
+    note_pipeline_raster_sample_count(out.raster_sample_count);
     // Mesh SPI shape: tag 0x14 section offset (host serializeMeshRenderPipelineDescriptor).
     // Classic type-7 uses tag 0x08. Roles for 0x01/0x02/0x03 differ by shape.
     if let Some(off) = compact_tlv_u32(&fields, PIPELINE_TAG_MESH_SECTION_OFFSET) {

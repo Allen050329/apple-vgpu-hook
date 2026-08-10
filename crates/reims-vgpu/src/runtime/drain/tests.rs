@@ -1,79 +1,6 @@
 use super::*;
 use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86, PAGE_SIZE_ARM64E};
 
-/// No child opcode may be handled twice — once by its own `match` arm and again
-/// by an `if packet.opcode ==` inside another arm's body.
-///
-/// `process_child_packet` dispatches on the opcode and then, inside the
-/// bookkeeping family's shared body, branches on it again to separate the five
-/// packets that arm covers. Both shapes are fine on their own. What is not fine
-/// is an inner branch on an opcode the enclosing arm's pattern does not list:
-/// the outer `match` has already claimed it, so the inner branch is
-/// unreachable — and it reads exactly like a handler.
-///
-/// `CHILD_OP_REPLACE_PHYSICAL` was in that state. The reachable arm cleared the
-/// named mapping's page list; the unreachable one also routed the object id
-/// through `texture_to_mapping` and took the mapping's deferred windows. Nothing
-/// in the toolchain saw it — the code compiles, the body is well-formed, and a
-/// coverage sweep reports it as an untaken branch among thousands.
-///
-/// So the invariant is asserted against the source itself. It is a source test
-/// rather than a behavioural one because the failure has no behaviour: the
-/// second handler does nothing, which is indistinguishable at runtime from a
-/// handler whose conditions never held.
-#[test]
-fn no_child_opcode_is_claimed_by_an_arm_and_branched_on_inside_another() {
-    const SRC: &str = include_str!("mod.rs");
-    // The dispatch `match` is the only place in the file at this indentation
-    // whose arms are bare opcode constants, so arms are found by shape.
-    let mut current: Option<Vec<&str>> = None;
-    let mut pending: Vec<&str> = Vec::new();
-    let mut violations: Vec<String> = Vec::new();
-    for line in SRC.lines() {
-        let body = line.trim();
-        let is_arm_indent = line.starts_with("        ") && !line.starts_with("         ");
-        if is_arm_indent && (body.starts_with("CHILD_OP_") || body.starts_with("| ")) {
-            for name in body.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
-                if name.starts_with("CHILD_OP_") {
-                    pending.push(name);
-                }
-            }
-            if body.contains("=>") {
-                current = Some(std::mem::take(&mut pending));
-            }
-            continue;
-        }
-        // Any other arm-indent line ends the arm we were inside.
-        if is_arm_indent && body.ends_with("=> {") {
-            current = Some(std::mem::take(&mut pending));
-            continue;
-        }
-        let Some(patterns) = current.as_ref() else {
-            continue;
-        };
-        let Some(rest) = body.split("packet.opcode ==").nth(1) else {
-            continue;
-        };
-        let Some(named) = rest
-            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .find(|t| t.starts_with("CHILD_OP_"))
-        else {
-            continue;
-        };
-        if !patterns.contains(&named) {
-            violations.push(format!(
-                "{named} is branched on inside an arm matching {patterns:?}, \
-                 which does not list it — the branch is unreachable"
-            ));
-        }
-    }
-    assert!(
-        violations.is_empty(),
-        "unreachable opcode handlers in process_child_packet:\n  {}",
-        violations.join("\n  ")
-    );
-}
-
 /// I2's carve-out, asserted rather than trusted: a partial packet is the
 /// normal state of a ring whose producer is mid-write, so it must not reach
 /// the always-on log. A bad size or a desync must.
@@ -527,7 +454,7 @@ fn clear_only_present_captures_the_surface_the_transaction_names() {
         &mut state,
         &mut host,
         5,
-        &present_packet(CHILD_OP_PRESENT_X86, 2),
+        &present_packet(CHILD_OP_DISPLAY_TRANSACTION2, 2),
     );
 
     assert_eq!(state.present.present_mapping, 2, "guest names mid 2");
@@ -868,7 +795,7 @@ fn composite_named_present_captures_the_named_member_however_far_it_lags() {
     state.present.height = h;
 
     let present_named = |state: &mut DeviceState, host: &mut FakeHost, mid: u32| {
-        process_child_packet(state, host, 5, &present_packet(CHILD_OP_PRESENT_X86, mid));
+        process_child_packet(state, host, 5, &present_packet(CHILD_OP_DISPLAY_TRANSACTION2, mid));
     };
 
     // Healthy alternation: both members publish, the named member is captured.
@@ -1074,7 +1001,7 @@ fn composite_present_sets_frame_flush_boundary() {
     }
     state.note_surface_composite(4);
 
-    let pkt = present_packet(CHILD_OP_PRESENT_X86, 4);
+    let pkt = present_packet(CHILD_OP_DISPLAY_TRANSACTION2, 4);
     process_child_packet(&mut state, &mut host, 5, &pkt);
     assert!(state.present.frame_flush_seen);
     assert_coalesced_paint_action(&host, "composite sets flush boundary");
@@ -1139,7 +1066,7 @@ fn present_x86_op6_paints_surface_id_mapping() {
         &mut state,
         &mut host,
         5,
-        &present_packet(CHILD_OP_PRESENT_X86, 5),
+        &present_packet(CHILD_OP_DISPLAY_TRANSACTION2, 5),
     );
     assert_eq!(state.present.present_mapping, 5);
     assert!(state.present.frame_flush_seen);
@@ -1354,11 +1281,11 @@ fn child_drain_yields_after_present_for_display_consumer() {
     assert!(state.map_surface(4));
     assert!(state.set_mapping_geom(4, 2, 2, MTL_FORMAT_BGRA8_UNORM));
 
-    let mut payload = vec![0u8; display_txn_trailer_len(CHILD_OP_PRESENT_X86)];
-    payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
+    let mut payload = vec![0u8; display_txn_trailer_len(CHILD_OP_DISPLAY_TRANSACTION2)];
+    payload[DISPLAY_TRANSACTION2_SURFACE_ID..DISPLAY_TRANSACTION2_SURFACE_ID + 4]
         .copy_from_slice(&4u32.to_le_bytes());
-    let first = packet_bytes(CHILD_OP_PRESENT_X86, 21, &payload);
-    let second = packet_bytes(CHILD_OP_PRESENT_X86, 22, &payload);
+    let first = packet_bytes(CHILD_OP_DISPLAY_TRANSACTION2, 21, &payload);
+    let second = packet_bytes(CHILD_OP_DISPLAY_TRANSACTION2, 22, &payload);
     let mut ring = first.clone();
     ring.extend_from_slice(&second);
     host.write_gpa(ring_gpa, &ring).unwrap();
@@ -3680,7 +3607,7 @@ fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
     let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let fence = |plen: usize| Packet {
-        opcode: CHILD_OP_FLUSH_CHANNEL_EVENT,
+        opcode: CHILD_OP_NOP,
         stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + plen as u32,
         completion_stamp: 0,
@@ -3688,7 +3615,7 @@ fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
         next_head: 0,
     };
 
-    let n = store_route_count("child_flush_channel_event");
+    let n = store_route_count("child_nop");
     let disposition = process_child_packet(&mut state, &mut host, 4, &fence(0));
     assert_eq!(
         disposition,
@@ -3696,7 +3623,7 @@ fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
         "the stamps must retire, or the guest waits on this fence forever"
     );
     assert_eq!(
-        store_route_count("child_flush_channel_event"),
+        store_route_count("child_nop"),
         n + 1,
         "the command is counted like every other decoded one"
     );
@@ -3704,7 +3631,7 @@ fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
         !state.fails.iter().any(|e| matches!(
             e,
             FailEvent::UnknownChildOpcode {
-                opcode: CHILD_OP_FLUSH_CHANNEL_EVENT,
+                opcode: CHILD_OP_NOP,
                 ..
             }
         )),
@@ -3713,7 +3640,7 @@ fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
 
     // A payload is the one thing that would falsify the stamps-only reading.
     process_child_packet(&mut state, &mut host, 4, &fence(4));
-    assert_eq!(store_route_count("child_flush_channel_event"), n + 2);
+    assert_eq!(store_route_count("child_nop"), n + 2);
 }
 
 /// A display-transaction command longer than its declared trailer must alarm,
@@ -3742,8 +3669,8 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
 
     // Every command at exactly its declared trailer is conformant and silent.
     let quiet = store_route_count("display_txn_payload_overlong");
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, 0x0c));
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_GAMMA_X86, 0x24));
+    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 0x0c));
+    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION3, 0x24));
     note_display_txn_payload(&mut state, 4, &packet(CHILD_OP_DISPLAY_SWAP, 0x0c));
     assert_eq!(
         store_route_count("display_txn_payload_overlong"),
@@ -3754,7 +3681,7 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
 
     // A payload past the trailer is the one thing that falsifies the decode.
     for _ in 0..8 {
-        note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, 64));
+        note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 64));
     }
     assert_eq!(
         store_route_count("display_txn_payload_overlong"),
@@ -3769,7 +3696,7 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
 
     // The gamma variant's trailer is larger, so 0x24 is conformant there while
     // the same length would be overlong for op6 - the sizes are per command.
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, 0x24));
+    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 0x24));
     assert_eq!(
         state.display.txn_payload_samples.len(),
         2,
@@ -3839,7 +3766,7 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
     // op6 does serialize a transaction, so the plane-list reading is its own
     // and must survive. Same alarm, different explanation.
     let cap = crate::observe::FailCapture::start();
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, vec![7u8; 64]));
+    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, vec![7u8; 64]));
     let lines = cap.lines();
     let line = lines
         .iter()
@@ -3857,7 +3784,7 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
     note_display_txn_payload(
         &mut state,
         5,
-        &packet(CHILD_OP_PRESENT_X86, vec![0u8; 4096]),
+        &packet(CHILD_OP_DISPLAY_TRANSACTION2, vec![0u8; 4096]),
     );
     let lines = cap.lines();
     let line = lines
@@ -3886,12 +3813,12 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
 fn display_txn_trailer_slots_follow_the_emitting_command() {
     // command 6: [pipe][surface][task] — surface in slot 1, task in slot 2.
     assert_eq!(
-        display_txn_trailer_slots(CHILD_OP_PRESENT_X86),
+        display_txn_trailer_slots(CHILD_OP_DISPLAY_TRANSACTION2),
         (1, Some(2))
     );
     // command 7: [pipe][task][surface][gamma…] — the two are swapped.
     assert_eq!(
-        display_txn_trailer_slots(CHILD_OP_PRESENT_GAMMA_X86),
+        display_txn_trailer_slots(CHILD_OP_DISPLAY_TRANSACTION3),
         (2, Some(1))
     );
     // command 8 `CmdDisplaySwapMapping` is not a transaction at all: it names
@@ -3904,8 +3831,8 @@ fn display_txn_trailer_slots_follow_the_emitting_command() {
     );
     // The present path reads the same field the census does, for every command.
     for (op, off) in [
-        (CHILD_OP_PRESENT_X86, PRESENT_X86_SURFACE_ID),
-        (CHILD_OP_PRESENT_GAMMA_X86, PRESENT_GAMMA_X86_SURFACE_ID),
+        (CHILD_OP_DISPLAY_TRANSACTION2, DISPLAY_TRANSACTION2_SURFACE_ID),
+        (CHILD_OP_DISPLAY_TRANSACTION3, DISPLAY_TRANSACTION3_SURFACE_ID),
         (CHILD_OP_DISPLAY_SWAP, DISPLAY_SWAP_MAPPING),
     ] {
         let mut p = vec![0u8; display_txn_trailer_len(op)];
@@ -3928,7 +3855,7 @@ fn display_txn_trailer_slots_follow_the_emitting_command() {
     gamma.extend_from_slice(&0x2au32.to_le_bytes()); // surface
     gamma.resize(0x24, 0);
     assert_eq!(
-        present_surface_id(CHILD_OP_PRESENT_GAMMA_X86, &gamma),
+        present_surface_id(CHILD_OP_DISPLAY_TRANSACTION3, &gamma),
         Some(0x2a),
         "gamma's surface is the third word; the second is its task"
     );
@@ -3939,7 +3866,7 @@ fn display_txn_trailer_slots_follow_the_emitting_command() {
     plain.extend_from_slice(&9u32.to_le_bytes()); // task
     plain.resize(0x0c, 0);
     assert_eq!(
-        present_surface_id(CHILD_OP_PRESENT_X86, &plain),
+        present_surface_id(CHILD_OP_DISPLAY_TRANSACTION2, &plain),
         Some(0x2a),
         "the plain command's surface is the second word; the third is its task"
     );
@@ -3953,8 +3880,8 @@ fn display_txn_trailer_slots_follow_the_emitting_command() {
 /// payload that does carry an inline plane list would still look trailer-only.
 #[test]
 fn display_txn_trailer_width_matches_the_emitting_command() {
-    assert_eq!(display_txn_trailer_len(CHILD_OP_PRESENT_X86), 0x0c);
-    assert_eq!(display_txn_trailer_len(CHILD_OP_PRESENT_GAMMA_X86), 0x24);
+    assert_eq!(display_txn_trailer_len(CHILD_OP_DISPLAY_TRANSACTION2), 0x0c);
+    assert_eq!(display_txn_trailer_len(CHILD_OP_DISPLAY_TRANSACTION3), 0x24);
     assert_eq!(display_txn_trailer_len(CHILD_OP_DISPLAY_SWAP), 0x0c);
 }
 
@@ -4298,7 +4225,7 @@ fn every_short_control_packet_names_itself() {
 
     for (opcode, need) in [
         (CHILD_OP_SET_OBJECT_LIST, SET_OBJECT_LIST_LEN),
-        (CHILD_OP_DELETE_OBJECT, 8),
+        (CHILD_OP_DELETE_RESOURCE, 8),
         (CHILD_OP_CURSOR_SHOW, 8),
         (CHILD_OP_SETUP_SHARED_STATE, CHILD_SHARED_STATE_LEN),
         // Both FIFOs carry DEFINE_TASK2 and one function handles both, so the
@@ -4321,7 +4248,10 @@ fn every_short_control_packet_names_itself() {
         "reason=set_object_list_short site=root",
         "reason=define_task2_short site=root",
         "reason=set_object_list_short site=ch4",
-        "reason=delete_object_short site=ch4",
+        // `0x25` is `CmdDeleteResource`. The slug must not say `delete_object`:
+        // that is `0x28`, a different command with a different payload, and a
+        // reader triaging this line would otherwise chase the wrong opcode.
+        "reason=delete_resource_short site=ch4",
         "reason=cursor_show_short site=ch4",
         "reason=setup_shared_state_short site=ch4",
         "reason=define_task2_short site=ch4",
@@ -4809,5 +4739,758 @@ fn a_packets_stamp_records_are_decoded_and_the_payload_starts_after_them() {
         PacketError::BadSize,
         "a stamp count the packet cannot hold is refused before any record is \
          reached, which is what bounds the skip without a constant"
+    );
+}
+
+/// Every command the reference host dispatches names itself when this device
+/// declines it, instead of arriving as an undecodable opcode.
+///
+/// The host's FIFO drain bounds the header opcode at [`CHILD_OP_MAX`] and
+/// indexes one flat table, so each of these numbers reaches a real handler with
+/// a real contract. Landing them in the unknown-opcode arm said the opposite —
+/// that this device could not tell what the guest had asked for — and for
+/// `CmdDeleteObject` it said nothing at all, because that arm was a silent
+/// no-op named for a present it never performed.
+///
+/// The assertion is the pair: the typed record names the command, *and* no
+/// unknown-opcode record is raised for the same packet. Only checking the first
+/// would pass on a device that raised both.
+#[test]
+fn a_dispatched_command_this_device_declines_names_itself() {
+    let mut host = FakeHost::new();
+    // Every packet here is conformant for its own opcode, so what is being
+    // tested is the decline and not the shape. The floor differs by command:
+    // eight bytes for most, twelve for `CmdDeleteObject`, whose payload is a
+    // task id plus a self-describing record that has to reach the decline rather
+    // than being refused for its shape on the way there.
+    let plain = || {
+        let mut payload = vec![0u8; 8];
+        st32(&mut payload[0..], 0x11);
+        st32(&mut payload[4..], 0x22);
+        payload
+    };
+    let conformant_delete_object = || {
+        let mut payload = vec![0u8; 4 + reims_vgpu_wire::ops::destroy::DELETE_TOTAL_LEN as usize];
+        st32(&mut payload[0..], 0x11);
+        st32(
+            &mut payload[4..],
+            reims_vgpu_wire::ops::destroy::OPCODE_DELETE_SAMPLER_STATE,
+        );
+        st32(
+            &mut payload[8..],
+            reims_vgpu_wire::ops::destroy::DELETE_TOTAL_LEN,
+        );
+        st32(&mut payload[12..], 0x20);
+        payload
+    };
+    for (opcode, expected, payload) in [
+        (CHILD_OP_DEBUG, UnimplementedCommand::Debug, plain()),
+        (
+            CHILD_OP_DELETE_OBJECT,
+            UnimplementedCommand::DeleteObject,
+            conformant_delete_object(),
+        ),
+        (
+            CHILD_OP_DISPLAY_SLEEP_STATE,
+            UnimplementedCommand::DisplaySleepState,
+            plain(),
+        ),
+        (
+            CHILD_OP_DISPLAY_SET_PROPERTIES,
+            UnimplementedCommand::DisplaySetProperties,
+            plain(),
+        ),
+        (CHILD_OP_DELAY, UnimplementedCommand::Delay, plain()),
+    ] {
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        let plen = payload.len() as u32;
+        let pkt = Packet {
+            opcode,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + plen,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        };
+        assert_eq!(
+            process_child_packet(&mut state, &mut host, 2, &pkt),
+            ChildPacketDisposition::Complete,
+            "{opcode:#x}: the stamps still retire, or the guest waits forever"
+        );
+        assert!(
+            state.fails.iter().any(|e| matches!(
+                e,
+                FailEvent::UnimplementedChildCommand { command, opcode: op, .. }
+                    if *command == expected && *op == opcode
+            )),
+            "{opcode:#x} must be reported as {} and not swallowed; got {:?}",
+            expected.command(),
+            state.fails
+        );
+        assert!(
+            !state
+                .fails
+                .iter()
+                .any(|e| matches!(e, FailEvent::UnknownChildOpcode { .. })),
+            "{opcode:#x} is a command with a handler in the host's table, so it \
+             must not also read as undecodable"
+        );
+    }
+}
+
+/// A `CmdDeleteObject` packet is bounded before its record is read at all.
+///
+/// The command carries `{u32 task}` then a record that states its own byte
+/// length at offset 8, so a conformant packet is at least twelve bytes and the
+/// record must fit in what follows the id. A packet failing either bound is
+/// corrupt: nothing may be retired on the strength of it, and the record must
+/// not even be parsed — the bound is what stands between a corrupt length and a
+/// read past the payload.
+///
+/// "Was the record reached" is measured by whether any decline from the *record*
+/// path fired. Every exit from that path emits one of the `delete_object_…`
+/// reasons, and the bound sits upstream of all of them, so a packet the bound
+/// should have refused must produce none. Measuring it this way rather than
+/// through a teardown counter is deliberate: this arm retires nothing, so a
+/// counter of retirements reads zero whether the bound held or not, and the gate
+/// would pass on an implementation that had no bound at all.
+#[test]
+fn a_delete_object_record_must_fit_the_payload_that_carries_it() {
+    let mut host = FakeHost::new();
+    let packet = |payload: Vec<u8>| Packet {
+        opcode: CHILD_OP_DELETE_OBJECT,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN + payload.len() as u32,
+        completion_stamp: 0,
+        payload,
+        next_head: 0,
+    };
+    // Every exit from the record path, and only those. The packet-shape
+    // refusals are `delete_object_short` and `delete_object_record_short`, which
+    // share a prefix with these — hence the exact names rather than a prefix
+    // test, which would match the very refusals the bound is supposed to raise.
+    const RECORD_PATH_REASONS: [&str; 3] = [
+        "delete_object_record_malformed",
+        "delete_object_not_a_destroy_record",
+        "delete_object_ref_unreadable",
+    ];
+
+    // One byte under the floor: there is no length word to read at offset 8.
+    let under_floor = vec![0u8; 11];
+    // At the floor, with a record claiming one byte more than the payload can
+    // hold. `9 + 4 = 13 > 12`, so the record overruns by exactly one byte —
+    // the off-by-one a `>=` in place of a `>` would let through.
+    let mut overrun = vec![0u8; 12];
+    st32(&mut overrun[0..], 0x11);
+    st32(&mut overrun[8..], 9);
+    // A `u32` length whose `+ 4` would wrap. The bound must still refuse it
+    // rather than wrapping to a small number and reading the record as valid.
+    let mut wrapping = vec![0u8; 12];
+    st32(&mut wrapping[0..], 0x11);
+    st32(&mut wrapping[8..], u32::MAX);
+
+    for (what, payload) in [
+        ("a payload under the floor", under_floor),
+        ("a record overrunning by one byte", overrun),
+        ("a record length whose bound arithmetic overflows", wrapping),
+    ] {
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        let cap = crate::observe::FailCapture::start();
+        let disposition = process_child_packet(&mut state, &mut host, 3, &packet(payload));
+        let lines = cap.lines();
+        drop(cap);
+        assert_eq!(
+            disposition,
+            ChildPacketDisposition::Complete,
+            "{what}: a malformed packet must still retire its stamps, or the guest waits forever"
+        );
+        assert!(
+            !lines.iter().any(|l| RECORD_PATH_REASONS
+                .iter()
+                .any(|r| l.contains(&format!("reason={r}")))),
+            "{what}: the bound must refuse it before the record is read; got {lines:?}"
+        );
+    }
+
+    // Exactly filling the payload is conformant: `8 + 4 = 12`. This is the
+    // boundary on the accepting side, so a bound written one too tight would
+    // refuse it — and the record path must be reached. The record is an
+    // eight-byte one whose opcode is not a destroy, so the exit is the counter
+    // for a record this arm will not retire on.
+    let mut exact = vec![0u8; 12];
+    st32(&mut exact[0..], 0x11);
+    st32(&mut exact[8..], 8);
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let cap = crate::observe::FailCapture::start();
+    process_child_packet(&mut state, &mut host, 3, &packet(exact));
+    let lines = cap.lines();
+    drop(cap);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("reason=delete_object_not_a_destroy_record")),
+        "a record that exactly fills the payload is well formed and must be read, \
+         then refused for its own opcode rather than for the packet's shape; got {lines:?}"
+    );
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    for reason in [
+        "reason=delete_object_short site=ch3",
+        "reason=delete_object_record_short site=ch3",
+    ] {
+        assert!(
+            log.contains(reason),
+            "a malformed CmdDeleteObject was dropped without naming itself: {reason}"
+        );
+    }
+}
+
+/// `CmdDeleteObject` must not retire an object-table entry, however exactly its
+/// record's ref matches one.
+///
+/// This is the arm's load-bearing safety property, and it is a property about
+/// **namespaces** rather than about arithmetic. The record's ref belongs to the
+/// serializer's per-kind ref space; the object table is keyed by the kernel
+/// object-list ref. Both are small integers allocated from zero, so they collide
+/// constantly, and a collision is the *only* way the object table can be reached
+/// from here — a hit would necessarily be destroying an unrelated object.
+///
+/// The test therefore rigs the collision deliberately: every ref the packets
+/// name is also a live object-table entry under the same task. An implementation
+/// that keys the table with the record's ref passes nothing here; it deletes all
+/// four and fails on the first assertion.
+///
+/// The kinds are exercised across the family — a texture record and a
+/// sampler-state record — because the kind lives in the record's opcode and an
+/// arm that branched on kind could be safe for one and not the other.
+#[test]
+fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
+    use reims_vgpu_wire::ops::destroy::{
+        DELETE_TOTAL_LEN, OPCODE_DELETE_SAMPLER_STATE, OPCODE_DELETE_TEXTURE,
+    };
+    let mut host = FakeHost::new();
+    let destroy_packet = |task: u32, record_opcode: u32, object_ref: u32| {
+        let mut payload = vec![0u8; 4 + DELETE_TOTAL_LEN as usize];
+        st32(&mut payload[0..], task);
+        st32(&mut payload[4..], record_opcode);
+        st32(&mut payload[8..], DELETE_TOTAL_LEN);
+        st32(&mut payload[12..], object_ref);
+        Packet {
+            opcode: CHILD_OP_DELETE_OBJECT,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        }
+    };
+
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    state.define_task(2, 0x2000, 9);
+    assert!(state.set_object_list(2, 3, 64));
+    for ref_ in [10, 11, 12, 14] {
+        assert!(state.insert_object(2, ref_));
+    }
+
+    // Same task, same number, well-formed record: the collision that an arm
+    // keying the object table would act on.
+    assert_eq!(
+        process_child_packet(
+            &mut state,
+            &mut host,
+            4,
+            &destroy_packet(2, OPCODE_DELETE_TEXTURE, 10)
+        ),
+        ChildPacketDisposition::Complete,
+        "the stamps must retire, or the guest waits forever"
+    );
+    assert!(
+        state.objects.contains(&(2, 10)),
+        "the record's ref is a serializer ref; keying the object table with it \
+         destroys an unrelated object that merely shares the integer"
+    );
+
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
+        &destroy_packet(2, OPCODE_DELETE_SAMPLER_STATE, 11),
+    );
+    assert!(
+        state.objects.contains(&(2, 11)),
+        "a second kind must be declined the same way"
+    );
+
+    // The unclaimed number inside the destroy span is refused before the ref is
+    // even read, so it must also leave the table alone.
+    process_child_packet(&mut state, &mut host, 4, &destroy_packet(2, 0x3ec, 14));
+    assert!(
+        state.objects.contains(&(2, 14)),
+        "0x3ec is unclaimed inside the destroy span and names no destroy at all"
+    );
+
+    assert!(
+        state.objects.contains(&(2, 12)),
+        "a ref no packet named must be untouched"
+    );
+}
+
+/// The kind is decoded off the record and counted per kind.
+///
+/// The kind lives in the record's own opcode and nowhere else, so a counter that
+/// did not read it there would be counting the packet rather than the object.
+/// The distribution across kinds is the open question this arm leaves behind —
+/// one merged counter cannot say whether a guest is retiring the one kind this
+/// device holds by ref (fences) or the kinds it holds by content (samplers,
+/// pipeline states) — so the split is the measurement, not decoration.
+#[test]
+fn a_delete_object_counts_the_kind_its_record_names() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_wire::ops::destroy::{
+        DELETE_TOTAL_LEN, OPCODE_DELETE_FENCE, OPCODE_DELETE_SAMPLER_STATE,
+    };
+    let mut host = FakeHost::new();
+    let destroy_packet = |record_opcode: u32| {
+        let mut payload = vec![0u8; 4 + DELETE_TOTAL_LEN as usize];
+        st32(&mut payload[0..], 2);
+        st32(&mut payload[4..], record_opcode);
+        st32(&mut payload[8..], DELETE_TOTAL_LEN);
+        st32(&mut payload[12..], 40);
+        Packet {
+            opcode: CHILD_OP_DELETE_OBJECT,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        }
+    };
+
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    state.define_task(2, 0x2000, 9);
+
+    let sampler_before = store_route_count("child_delete_object_sampler_state");
+    let fence_before = store_route_count("child_delete_object_fence");
+
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
+        &destroy_packet(OPCODE_DELETE_SAMPLER_STATE),
+    );
+    assert_eq!(
+        store_route_count("child_delete_object_sampler_state"),
+        sampler_before + 1,
+        "the sampler-state kind must be counted under its own name"
+    );
+    assert_eq!(
+        store_route_count("child_delete_object_fence"),
+        fence_before,
+        "a sampler-state record must not move another kind's counter"
+    );
+
+    // The one kind this device holds anything by ref for. Its counter reading
+    // above zero on a boot is the signal that would justify a handler.
+    process_child_packet(&mut state, &mut host, 4, &destroy_packet(OPCODE_DELETE_FENCE));
+    assert_eq!(
+        store_route_count("child_delete_object_fence"),
+        fence_before + 1,
+        "the fence kind must be counted apart, since it is the one that could leak"
+    );
+}
+
+/// The host's retired slots are reported as retired, not as undecodable.
+///
+/// Fifteen opcodes share one deprecated handler on the reference host: it
+/// accepts the packet, ignores the payload and retires the stamps. A guest still
+/// emitting one is an old guest, which is a different thing from a guest sending
+/// something this device cannot decode — and the two used to produce the same
+/// record.
+///
+/// Driven off [`CHILD_DEPRECATED_OPS`] rather than a second list, so a slot
+/// added there cannot be left without an arm.
+#[test]
+fn a_retired_slot_is_reported_as_retired_and_not_as_undecodable() {
+    let mut host = FakeHost::new();
+    for opcode in CHILD_DEPRECATED_OPS {
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        let pkt = Packet {
+            opcode,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN,
+            completion_stamp: 0,
+            payload: Vec::new(),
+            next_head: 0,
+        };
+        assert_eq!(
+            process_child_packet(&mut state, &mut host, 2, &pkt),
+            ChildPacketDisposition::Complete
+        );
+        assert!(
+            state.fails.iter().any(|e| matches!(
+                e,
+                FailEvent::UnimplementedChildCommand {
+                    command: UnimplementedCommand::Deprecated,
+                    opcode: op,
+                    ..
+                } if *op == opcode
+            )),
+            "{opcode:#x} is one of the host's retired slots; got {:?}",
+            state.fails
+        );
+        assert!(
+            !state
+                .fails
+                .iter()
+                .any(|e| matches!(e, FailEvent::UnknownChildOpcode { .. })),
+            "{opcode:#x} has a handler on the host, so it is not undecodable"
+        );
+    }
+}
+
+/// `CmdSynchronizeAndDiscardResources` and `CmdDiscardResources` carry the same
+/// record layout as `CmdSynchronizeResources`, and this device reads all three
+/// with one decoder.
+///
+/// The reference host validates the three with byte-for-byte the same check —
+/// `{u32 task, u32 count}` then `count` four-byte object ids — so a payload that
+/// is well-formed for one is well-formed for all of them. The way to prove these
+/// two reach that decoder rather than being waved through is to hand them a
+/// payload that *fails* it: a count the packet has no room for. A swallowed
+/// command would report nothing.
+///
+/// The synchronise half of `0x3e` is not asserted here because it is a no-op
+/// when no writeback is outstanding, which is every unit test; what is asserted
+/// is that the packet went through the arm that performs it.
+#[test]
+fn the_discarding_commands_share_the_synchronize_record_layout() {
+    use crate::runtime::decode::fifo::ResourceListDecodeError;
+    let mut host = FakeHost::new();
+    // One record: header plus a single four-byte object id.
+    let mut good = vec![0u8; 12];
+    st32(&mut good[0..], 7); // task
+    st32(&mut good[4..], 1); // count
+    st32(&mut good[8..], 0x2a); // object id
+    // The same header claiming four records in a packet that holds one.
+    let mut liar = good.clone();
+    st32(&mut liar[4..], 4);
+
+    // The two share a record layout and are declined for *different* reasons:
+    // `0x3f` drops the whole command, while `0x3e`'s synchronise half runs and
+    // only its discard hint is ignored. One slug for both could not say which
+    // fired, which is the defect the split reason exists to prevent.
+    for (opcode, expected) in [
+        (
+            CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES,
+            UnimplementedCommand::SynchronizeAndDiscardResources,
+        ),
+        (
+            CHILD_OP_DISCARD_RESOURCES,
+            UnimplementedCommand::DiscardResources,
+        ),
+    ] {
+        assert_ne!(
+            expected.slug(),
+            if expected == UnimplementedCommand::DiscardResources {
+                UnimplementedCommand::SynchronizeAndDiscardResources.slug()
+            } else {
+                UnimplementedCommand::DiscardResources.slug()
+            },
+            "the two discard declines must not share a slug"
+        );
+        let packet = |payload: &Vec<u8>| Packet {
+            opcode,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload: payload.clone(),
+            next_head: 0,
+        };
+
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        assert_eq!(
+            process_child_packet(&mut state, &mut host, 2, &packet(&good)),
+            ChildPacketDisposition::Complete
+        );
+        assert!(
+            state.fails.iter().any(|e| matches!(
+                e,
+                FailEvent::UnimplementedChildCommand { command, .. } if *command == expected
+            )),
+            "{opcode:#x}: the discard this device does not act on must be visible, \
+             under its own reason and not the other opcode's"
+        );
+        assert!(
+            !state
+                .fails
+                .iter()
+                .any(|e| matches!(e, FailEvent::UnknownChildOpcode { .. })),
+            "{opcode:#x} has a handler on the host and a decoder here"
+        );
+
+        // The malformed one proves the payload reached the decoder.
+        let cap = crate::observe::FailCapture::start();
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        process_child_packet(&mut state, &mut host, 2, &packet(&liar));
+        let line = cap.one("map_family");
+        assert!(
+            line.contains(&format!(
+                "reason={}",
+                crate::observe::Decline::slug(&ResourceListDecodeError::Truncated {
+                    count: 4,
+                    plen: 12,
+                    need: 24,
+                })
+            )),
+            "{opcode:#x}: a record layout the guest and this device disagree on \
+             must name the check that refused; got {line}"
+        );
+    }
+}
+
+/// Each member of the map/lifecycle family is dispatched under its own identity.
+///
+/// Six opcodes share one body, and the member is bound at the dispatch arm
+/// rather than re-read from the packet inside that body. That makes a dead
+/// branch a compile error, but it moves the risk to the binding: an arm naming
+/// the wrong member compiles, and the packet then silently runs another
+/// command's branch. Nothing in the toolchain sees that, so it is asserted here
+/// by the effect each branch has and no other has.
+///
+/// `CmdMapMemory2` and `CmdUnmapMemory` are deliberately absent. They share one
+/// branch and this device does not yet do anything different for the two, so
+/// there is no effect that separates them — asserting one would be asserting the
+/// log string, not the behaviour. The pair's shared branch is covered by
+/// `map_memory2_does_not_flush_gva_host_cache_on_wire` and the view-retire tests.
+#[test]
+fn each_map_family_command_takes_its_own_branch() {
+    use crate::contract::endian::st32;
+    use crate::runtime::decode::fifo::CHILD_INVALIDATE_PAGEON_FLAGS;
+
+    const MAPPING: u32 = 0x2a;
+
+    // `{u32 task, u32 count}` then one 8-byte validity record: the invalidate
+    // layout. The synchronise family reads the same header and 4-byte ids, so
+    // this payload is well-formed for either and the opcode is the only thing
+    // that decides which decoder sees it.
+    let mut invalidate = vec![0u8; 16];
+    st32(&mut invalidate[4..], 1);
+    st32(&mut invalidate[8..], MAPPING);
+    st32(&mut invalidate[12..], CHILD_INVALIDATE_PAGEON_FLAGS);
+    // `{u32 task, u32 count}` then one 4-byte object id.
+    let mut synchronize = vec![0u8; 12];
+    st32(&mut synchronize[4..], 1);
+    st32(&mut synchronize[8..], MAPPING);
+    // `{u32 object_id, u32 task_id}`.
+    let mut delete_backing = vec![0u8; 8];
+    st32(&mut delete_backing[0..], MAPPING);
+
+    // Each row is a payload and the two effects that tell this branch from its
+    // five neighbours: whether the named mapping's content generation moved, and
+    // whether the command reported itself unimplemented.
+    for (opcode, payload, bumps_generation, declined) in [
+        (
+            CHILD_OP_INVALIDATE_RESOURCES,
+            &invalidate,
+            true,
+            None,
+        ),
+        (
+            CHILD_OP_SYNCHRONIZE_RESOURCES,
+            &synchronize,
+            false,
+            None,
+        ),
+        (
+            CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES,
+            &synchronize,
+            false,
+            Some(UnimplementedCommand::SynchronizeAndDiscardResources),
+        ),
+        (
+            CHILD_OP_DELETE_IOSURFACE_BACKING2,
+            &delete_backing,
+            false,
+            None,
+        ),
+    ] {
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.map_surface(MAPPING));
+        state.mappings.get_mut(&MAPPING).unwrap().content_generation = 7;
+
+        assert_eq!(
+            process_child_packet(
+                &mut state,
+                &mut host,
+                4,
+                &Packet {
+                    opcode,
+                    stamp_waits: Vec::new(),
+                    total_size: PACKET_HEADER_LEN + payload.len() as u32,
+                    completion_stamp: 0,
+                    payload: payload.clone(),
+                    next_head: 0,
+                },
+            ),
+            ChildPacketDisposition::Complete,
+            "{opcode:#x}: the guest is waiting on the stamp whatever the branch did"
+        );
+
+        // `CmdInvalidateResources` is the only member that reads validity
+        // records, so the generation bump is its signature. A mis-bound arm
+        // either loses the bump or produces one for a command that never
+        // invalidates anything.
+        let generation = state.mappings.get(&MAPPING).map(|m| m.content_generation);
+        if bumps_generation {
+            assert_eq!(
+                generation,
+                Some(8),
+                "{opcode:#x}: this command clears host validity, so the mapping's \
+                 content generation must move"
+            );
+        } else {
+            assert_ne!(
+                generation,
+                Some(8),
+                "{opcode:#x}: this command does not touch validity, so a bump means \
+                 it ran the invalidate branch"
+            );
+        }
+
+        // `CmdDeleteIOSurfaceBacking2` is the only member that ends a backing's
+        // lifetime, and with no resolved pages there is nothing a stale delete
+        // could hurt, so it unmaps outright. The slot survives — the id can be
+        // reused — so what separates it is the mapped bit, not the entry.
+        assert_eq!(
+            state.mappings[&MAPPING].mapped,
+            opcode != CHILD_OP_DELETE_IOSURFACE_BACKING2,
+            "{opcode:#x}: only the backing delete unmaps the surface"
+        );
+
+        let reported = state.fails.iter().find_map(|e| match e {
+            FailEvent::UnimplementedChildCommand { command, .. } => Some(*command),
+            _ => None,
+        });
+        assert_eq!(
+            reported, declined,
+            "{opcode:#x}: the half of this command that is not implemented must be \
+             named, and a fully-handled one must report nothing"
+        );
+    }
+}
+
+/// An opcode above the host's dispatch ceiling is reported apart from one that
+/// is merely unassigned.
+///
+/// Both leave the guest's work undone, and both raise the unknown-opcode record,
+/// so on their own they read identically. They are not the same event: an
+/// unassigned slot in range is a guest asking for a command this host generation
+/// does not have, while a value the reference host refuses before it indexes its
+/// table means the header itself is wrong — a desynced ring or a corrupt packet,
+/// which is a transport bug and not a missing feature.
+#[test]
+fn an_opcode_past_the_dispatch_ceiling_is_reported_apart_from_an_unassigned_slot() {
+    let mut host = FakeHost::new();
+    let packet = |opcode: u16| Packet {
+        opcode,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN,
+        completion_stamp: 0,
+        payload: Vec::new(),
+        next_head: 0,
+    };
+
+    // 0x0b is inside the ceiling and has no handler on the reference host.
+    let cap = crate::observe::FailCapture::start();
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    process_child_packet(&mut state, &mut host, 2, &packet(0x0b));
+    assert!(
+        state
+            .fails
+            .iter()
+            .any(|e| matches!(e, FailEvent::UnknownChildOpcode { opcode: 0x0b, .. })),
+        "an unassigned in-range slot is still an unknown opcode"
+    );
+    assert!(
+        !cap.lines()
+            .iter()
+            .any(|l| l.starts_with("child_opcode_out_of_range")),
+        "an in-range opcode is not a malformed header; got {:?}",
+        cap.lines()
+    );
+    drop(cap);
+
+    let cap = crate::observe::FailCapture::start();
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    process_child_packet(&mut state, &mut host, 2, &packet(CHILD_OP_MAX + 1));
+    let line = cap.one("child_opcode_out_of_range");
+    assert!(
+        line.contains(&format!("opcode={:#x}", CHILD_OP_MAX + 1))
+            && line.contains(&format!("max={CHILD_OP_MAX:#x}")),
+        "the line has to carry both the value and the ceiling it broke; got {line}"
+    );
+    assert!(
+        state
+            .fails
+            .iter()
+            .any(|e| matches!(e, FailEvent::UnknownChildOpcode { .. })),
+        "the guest's work is still lost, so the record it shares with an \
+         unassigned slot is still raised"
+    );
+}
+
+/// A declined command says its piece once and is counted every time.
+///
+/// A command the guest re-issues every frame would put a line per packet into
+/// the always-on log — and a flood is how the refusals around it stop being
+/// read. The latch is what makes the record survivable; the route counter is
+/// what keeps the rate knowable, because emitters dedupe and counters do not,
+/// and quoting one as the other is the mistake this pair exists to prevent.
+///
+/// Driven off `CmdDelay` rather than off `CmdDeleteObject`, whose per-frame rate
+/// is what made the latch necessary in the first place — a driven boot sends
+/// about 1 990 of those in 25 s. `CmdDelay` reaches the same latch through a
+/// packet whose shape is a single fixed floor, so the test is about the latch
+/// and not about a record layout.
+#[test]
+fn a_declined_command_is_latched_in_the_log_and_counted_in_the_census() {
+    use crate::runtime::drain::store_route_count;
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let mut payload = vec![0u8; 8];
+    st32(&mut payload[0..], 0x11);
+    let pkt = Packet {
+        opcode: CHILD_OP_DELAY,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN + payload.len() as u32,
+        completion_stamp: 0,
+        payload,
+        next_head: 0,
+    };
+
+    let route = UnimplementedCommand::Delay.slug();
+    let before = store_route_count(route);
+    let cap = crate::observe::FailCapture::start();
+    for _ in 0..3 {
+        process_child_packet(&mut state, &mut host, 2, &pkt);
+    }
+    let lines: Vec<String> = cap
+        .lines()
+        .into_iter()
+        .filter(|l| l.contains(&format!("reason={route}")))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "three identical declines are one line, or the guest's frame rate sets \
+         the log's line rate; got {lines:?}"
+    );
+    drop(cap);
+    assert_eq!(
+        store_route_count(route) - before,
+        3,
+        "the census counts every packet, which is the rate the latched line \
+         cannot carry"
     );
 }

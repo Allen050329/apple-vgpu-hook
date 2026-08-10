@@ -11,7 +11,6 @@
 //! happen now: guest runs are gathered by the CPU out of the mapped span, so
 //! there is no import to lose.
 
-use ash::vk;
 
 use super::types::{ResidentReclaim, TargetIdentity};
 use crate::observe::Decline;
@@ -71,9 +70,6 @@ pub enum DrawExecutionDecline {
         resident_height: u32,
         resource_width: u32,
         resource_height: u32,
-    },
-    UnsupportedTrackedLayout {
-        layout: vk::ImageLayout,
     },
     /// A staging write asked for more bytes than the slot it is writing into
     /// holds.
@@ -144,7 +140,6 @@ impl Decline for DrawExecutionDecline {
             Self::SampledResidentGeometryMismatch { .. } => {
                 "vk_draw_exec_sampled_resident_geometry_mismatch"
             }
-            Self::UnsupportedTrackedLayout { .. } => "vk_draw_exec_unsupported_tracked_layout",
             Self::StagingWriteBeyondSlot { .. } => "vk_draw_exec_staging_write_beyond_slot",
             Self::ReadBackBeyondSlot { .. } => "vk_draw_exec_read_back_beyond_slot",
             Self::LeaseBeyondSlot { .. } => "vk_draw_exec_lease_beyond_slot",
@@ -234,9 +229,6 @@ impl Decline for DrawExecutionDecline {
                 ]);
                 fields
             }
-            Self::UnsupportedTrackedLayout { layout } => {
-                vec![("layout", format!("{layout:?}"))]
-            }
             Self::StagingWriteBeyondSlot { size, slot_size } => vec![
                 ("size", size.to_string()),
                 ("slot_size", slot_size.to_string()),
@@ -272,12 +264,14 @@ pub(super) fn identity_fields(identity: &TargetIdentity) -> Vec<(&'static str, S
             width,
             height,
             generation,
+            stencil,
         } => vec![
             ("identity_kind", "texture".into()),
             ("identity_ref", ref_.to_string()),
             ("identity_width", width.to_string()),
             ("identity_height", height.to_string()),
             ("identity_generation", generation.to_string()),
+            ("identity_stencil", u8::from(*stencil).to_string()),
         ],
         TargetIdentity::Gva {
             gva,
@@ -366,9 +360,6 @@ mod tests {
                 resource_width: 64,
                 resource_height: 32,
             },
-            DrawExecutionDecline::UnsupportedTrackedLayout {
-                layout: vk::ImageLayout::UNDEFINED,
-            },
         ]
     }
 
@@ -391,7 +382,13 @@ mod tests {
         // between the runtime's pre-check and the bind", and guest runs are now
         // gathered by the CPU out of the mapped span, so there is no import to
         // lose and no refusal to make.
-        assert_eq!(before, 12, "the draw executor's reason census moved");
+        //
+        // Down again to 11: `*_unsupported_tracked_layout` guarded a hand-written
+        // layout-to-scope table against a layout the registry should never hold.
+        // The registry now holds a `ResidentAccess`, which has no state outside
+        // the four the device puts a resident in, so the refusal has nothing
+        // left to fire on and no arm can reach it.
+        assert_eq!(before, 11, "the draw executor's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-execution slug");
     }
 
@@ -429,6 +426,7 @@ mod tests {
                     width: 80,
                     height: 60,
                     generation: 11,
+                    stencil: false,
                 },
                 "texture",
                 ("identity_ref", "8"),

@@ -2527,6 +2527,39 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
 /// the buffer zero-copy floor and every page walkable into mappable runs.
 /// Deferred stores intersecting the span are landed first, exactly like the
 /// CPU path.
+///
+/// # The span is the rest of the allocation, and narrowing it is closed
+///
+/// `span` is `size - offset`: the bind's offset to the end of the guest
+/// allocation, not the range the draw reads. That is deliberate only in the
+/// sense that it is the widest safe answer — it was never measured against what
+/// a draw can actually reach until a `zcreach_*` census did it, and the census
+/// is gone because it answered on every axis. Do not rebuild it to re-ask; the
+/// answers, from a driven Safari-drag boot moving 2.74 GB/s on this rail:
+///
+/// * **Bound it by the vertex descriptor's stride and the draw's counts.** Only
+///   1.2 % of gathered bytes are bindable that way — but every one of those was
+///   at most 5 % of its span, so where the contract does bound a bind this
+///   gather is twenty times too wide. A small population with a large ratio.
+/// * **Bound it by the shader's declared argument size.** 67.5 % of the bytes
+///   are buffers Metal binds to the vertex stage through
+///   `setVertexBuffer:offset:atIndex:` that the pipeline's vertex descriptor
+///   never names — constant buffers, which no stride bounds. Their reflection
+///   carries `declared_size` but **no `type_name`** for 211 180 binds a boot,
+///   and without the name a `constant T&` (whose declared size is the bound)
+///   cannot be told from a `device T*` (whose declared size is one element the
+///   shader may index far past). Narrowing on the size alone is correct for the
+///   first and silently hands the GPU a short buffer for the second. This is a
+///   translator metadata gap, not a guest-contract fact: carrying the AIR
+///   argument type name is what would reopen ~46.5 GB of a boot's traffic.
+/// * **Bound an indexed draw.** 31.2 % of the bytes. `vertex_count` counts
+///   indices and an index names any vertex in the stream, so it means reading
+///   the index buffer — CPU work on the rail whose point is that the CPU does
+///   not touch these bytes.
+///
+/// The rail's real cost is not its width. 99.2 % of gathers re-copy a span this
+/// device already copied — see `note_gather_key_recurrence` in
+/// `backend::vulkan::engine::exec`.
 fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -5645,11 +5678,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
         }
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Seed);
-        // Color load seed: CLEAR → solid; LOAD → guest/host seed when present.
-        // `seed_order` names what is in those bytes; the engine folds any needed
-        // R/B exchange into its copy into the mapped staging span rather than
-        // making this side materialize a converted frame.
+        // Colour load seed: LOAD → guest/host seed when present. `seed_order`
+        // names what is in those bytes; the engine folds any needed R/B exchange
+        // into its copy into the mapped staging span rather than making this
+        // side materialize a converted frame.
+        //
+        // CLEAR is not a seed. It travels as `target_clear` and the render pass
+        // does it, which is what `MTLLoadActionClear` asks for.
         let mut target_rgba8: Option<std::sync::Arc<Vec<u8>>> = None;
+        let mut target_clear = [0.0f32; 4];
         let mut seed_order = crate::backend::vulkan::engine::SeedOrder::Rgba8;
         let gpu_only_content_allowed =
             crate::backend::vulkan::engine::deferred_gpu_only_content_allowed();
@@ -5812,7 +5849,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // Resident target carries the chain; no CPU seed bytes.
                 }
                 MTL_LOAD_ACTION_CLEAR => {
-                    target_rgba8 = Some(std::sync::Arc::new(solid_rgba8(w, h, &c0.clear_color)));
+                    // The pass clears the attachment. No seed: a seed would
+                    // resolve this pass key to LOAD, which is the opposite of
+                    // what the guest asked for, and would spend an allocation, a
+                    // channel exchange and a staged upload writing one constant
+                    // into every texel.
+                    target_clear = [
+                        c0.clear_color[0] as f32,
+                        c0.clear_color[1] as f32,
+                        c0.clear_color[2] as f32,
+                        c0.clear_color[3] as f32,
+                    ];
                 }
                 MTL_LOAD_ACTION_LOAD => {
                     // Which door this pass took, so a pass that ends with no
@@ -6021,6 +6068,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             .map(|c| c.store_action == MTL_STORE_ACTION_STORE)
             .unwrap_or(true);
         resources.target_rgba8 = target_rgba8;
+        resources.target_clear = target_clear;
         resources.target_seed_order = seed_order;
         // A Store reads back; anything else skips it.
         //
@@ -6249,22 +6297,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 .as_ref()
                                 .map(|d| (d.clear_depth as f32, d.load_action))
                                 .unwrap_or((1.0, MTL_LOAD_ACTION_CLEAR));
-                            // The transient depth buffer supports CLEAR only; a
-                            // guest depth LOAD needs a persistent depth resident
-                            // (deferred). Degrade to CLEAR, fail-visible.
-                            if load_action == MTL_LOAD_ACTION_LOAD
-                                && degrade_log_first(
-                                    req.pipeline_ref,
-                                    "depth_load_unsupported_transient",
-                                )
-                            {
-                                crate::observe::fail(format!(
-                                    "shader_state_degraded reason=depth_load_unsupported_transient \
-                                     pipe={} ds_ref={} {}x{} \
-                                     (transient depth clears; multi-pass depth LOAD not yet resident)",
-                                    req.pipeline_ref, req.depth_stencil_ref, w, h
-                                ));
-                            }
+                            // `MTLLoadActionLoad` is carried through as the
+                            // guest wrote it. Whether it can be *honoured* is
+                            // not decidable here — it needs the depth resident's
+                            // own content state, which only the engine holds —
+                            // so the engine makes that call and names the
+                            // degradation when it cannot. See
+                            // `pools::registry_mark_depth_ready`.
                             // Stencil test: engaged when either face is enabled.
                             // A face that is *not* enabled maps to Metal's
                             // documented `MTLStencilDescriptor` default (compare
@@ -6360,12 +6399,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 None
                             };
                             resources.depth = Some(crate::backend::vulkan::engine::DepthState {
+                                identity: depth_chain_identity(req, stencil.is_some()),
                                 test_enable: true,
                                 write_enable: ds.depth_write_enabled,
                                 compare,
                                 clear_value,
-                                // Transient buffer: always CLEAR (see above).
-                                load: false,
+                                load: load_action == MTL_LOAD_ACTION_LOAD,
                                 stencil,
                             });
                         }
@@ -6648,6 +6687,69 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
 /// type-2/3 targets use the GVA identity below. Unlike deferred writeback, this
 /// lifetime is safe on portability-subset devices because the final record
 /// materializes guest bytes before the packet completes.
+/// The registry resident this draw's **depth** attachment renders into, if the
+/// guest's pass descriptor named a depth texture.
+///
+/// The depth buffer is a guest resource with a guest lifetime. A pass descriptor
+/// binds `MTLRenderPassDepthAttachment.texture`, this device decodes its ref, and
+/// that ref is the identity — so one resident exists per guest depth texture and
+/// survives for as long as the guest keeps the texture, instead of being
+/// allocated and destroyed inside one draw.
+///
+/// # Why the generation is zero
+///
+/// Every other identity carries a generation because its resident holds content
+/// that must not survive the guest reusing the key — a surface's
+/// `map_generation` is the worked example. This one carries none, and the
+/// argument is no longer the one an earlier version of this doc gave.
+///
+/// That version said the contents did not matter because the pass always
+/// CLEARed, and that enabling depth LOAD would need a real per-texture
+/// generation first. The first half was true and is now false: LOAD is honoured
+/// (`DepthState::load` carries the guest's `loadAction`), so the contents are
+/// load-bearing. The second half does not follow, and the reason is Metal's own
+/// contract rather than anything this device arranges.
+///
+/// A texture ref names one live texture. The only way a resident can outlive
+/// what it was created for is the guest destroying that texture and creating
+/// another at the same ref, the same geometry and the same aspect — and a
+/// **newly created `MTLTexture`'s contents are undefined until something writes
+/// them**. So a pass that loads from one is reading undefined data by the
+/// guest's own choice, and handing it a previous texture's depth is a
+/// conformant answer to it. There is no case where a generation would turn a
+/// wrong frame into a right one; it would only replace one undefined value with
+/// a different undefined value.
+///
+/// **What this does not license is extending the same reasoning to colour.** A
+/// colour target's contents are read back to guest pages and presented, so a
+/// stale one is a wrong frame the guest can see rather than a value it declared
+/// it did not care about. That is why the surface rail has a generation and this
+/// one does not, and the difference is the readback, not the depth.
+///
+/// Geometry and aspect changes still recreate the image, through
+/// `ResidentTargetSlot::reusable_for` and the `stencil` field of the key.
+pub(super) fn depth_chain_identity(
+    req: &DrawEncodeRequest,
+    with_stencil: bool,
+) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
+    let depth = req.depth_attach.as_ref()?;
+    if depth.texture_ref == 0 {
+        return None;
+    }
+    let c0 = req.colors.first()?;
+    let (width, height) = (c0.width, c0.height);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(crate::backend::vulkan::engine::TargetIdentity::Texture {
+        ref_: depth.texture_ref,
+        width,
+        height,
+        generation: 0,
+        stencil: with_stencil,
+    })
+}
+
 pub(super) fn render_chain_identity(
     state: &DeviceState,
     req: &DrawEncodeRequest,
@@ -7298,7 +7400,9 @@ pub(crate) fn gva_chain_identity(
 /// Channel order the resident behind a GVA render target must hold: the one the
 /// guest declared for that attachment.
 ///
-/// This is [`TargetIdentity::is_bgra`]'s rule applied to the one namespace that
+/// This is `is_bgra`'s rule, on
+/// [`crate::backend::vulkan::engine::TargetIdentity`], applied to the one
+/// namespace that
 /// has a declaration to follow, and it is a function rather than an expression
 /// at each producer because the two producers key *the same registry slot*. A
 /// primary and a secondary attachment that spelled it differently would render
@@ -7320,29 +7424,36 @@ fn gva_resident_bgra(format: u16) -> bool {
 /// land its pixels. Every failure is fail-visible; the guest keeps its pre-pass
 /// bytes on loss.
 ///
-/// # This is the device's largest single blocking cost, not an abandon path
+/// # Every caller is now a refusal path
 ///
-/// The name and the comment below both used to say "abandoned", and the caller
-/// list is why that reads as rare: `writeback_chain_rgba` and a GVA arm-refusal
-/// fallback are both exceptional. The third caller is not. `M2vDrawSpan::
-/// ResidentGvaStore` — the ordinary Store of a GVA-targeted render — comes
-/// straight here, and on a driven Safari-drag boot that is **13 653 reads, 59 %
-/// of every render Store in the boot** against 9 870 on the GPU-direct surface
-/// rail.
+/// This used to be the ordinary Store of a GVA-targeted render, and the doc here
+/// used to say so — 13 653 reads on a driven boot, 59 % of every render Store,
+/// each one submitting and then blocking on a fence. That is no longer the
+/// shape, and reading it as the hot path sends the next reader at a premise that
+/// has already been fixed.
 ///
-/// Each one submits and then blocks on a fence. At ~750 us apiece those blocks
-/// are most of the 18 s a boot spends waiting — more than twice the entire
-/// sampled resolve. Do not read a change here as touching a cold path.
+/// Both Store rails write the guest's pages from the GPU now. `ResidentGvaStore`
+/// goes to `render_writeback::store_gva_frame` and `ResidentSurfaceStore` to
+/// `store_surface_resident`; this function is what each falls back to when its
+/// arm declines, plus `writeback_chain_rgba`. A driven Safari-drag boot puts
+/// `gva_store_sync` at **3 for the whole boot** against `gva_flush_gpu_direct`
+/// and `render_flush_gpu_direct` carrying the rail. `draw_phase`'s `wait_us` and
+/// `readback_us` are both flat zero across the drag.
 ///
-/// The reason it cannot simply become `copy_target_to_guest_pages` like the
-/// surface rail is format, not plumbing: a buffer→image copy converts nothing,
-/// a GVA resident is RGBA (`TargetIdentity::is_bgra` is true only for
-/// `Surface`), and only 8 of those 13 653 Stores declared a destination format
-/// byte-identical to it — the rest go through `write_gva_rgba8_within`'s
-/// per-row `convert_rgba8_to_row`. The premise worth attacking is that the
-/// resident's format is derived from the identity's *kind* rather than from
-/// what the guest declared for that render target; see `TargetIdentity::is_bgra`
-/// for why that is keyed where it is, and what a change there has to keep true.
+/// So this is genuinely the abandon path, and it is a cost rather than a lost
+/// frame — but it is the expensive one, and the reason to keep it narrow: it
+/// reads the whole framebuffer back across the bus and blocks on a fence to do
+/// it. A change that pushes traffic back onto it will not show up as a refusal,
+/// only as `slot_us` and the fail-visible decline that sent it here.
+///
+/// What made the GPU-direct arm reachable was format. A buffer→image copy
+/// converts nothing, so the resident has to already hold the bytes its
+/// destination stores; the order used to be derived from the identity's *kind*,
+/// which made every GVA resident RGBA and every Store a per-row conversion.
+/// `TargetIdentity::Gva` now carries the order the guest declared for that
+/// render target — see `is_bgra` on
+/// [`crate::backend::vulkan::engine::TargetIdentity`] for why it is keyed on the
+/// identity and what a change there has to keep true.
 pub(crate) fn read_resident_chain(state: &DeviceState, req: &DrawEncodeRequest) -> Option<Vec<u8>> {
     let identity = render_chain_identity(state, req)?;
     match crate::backend::vulkan::engine::read_target(&identity) {

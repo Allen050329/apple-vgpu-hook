@@ -15,8 +15,216 @@
 //! That coalescing was measured and it never occurred. Arms and lands were
 //! equal on every census line of an accumulated driven x86/Vulkan log — 193 458
 //! each across 1 780 lines, not one line differing — because no later Store
-//! ever fully covered a live window. A ratio pinned at 1.0 by the workload is
-//! not coalescing; it is the statement that none was available.
+//! ever fully covered a live window.
+//!
+//! **That 1.0 is a property of the land policy, not of the workload, and this
+//! doc used to read it the other way.** The window landed at the next completion
+//! stamp, and a stamp arrives so much more often than a repeat Store that no
+//! second Store could reach a window still live. A land point that frequent
+//! makes coalescing structurally impossible, so the ratio cannot distinguish "no
+//! coalescing was available" from "none was reachable". The measurement stands;
+//! the conclusion drawn from it does not, and the ablation below is what says so.
+//!
+//! # A second census agrees: this rail is close to one Store per surface
+//!
+//! A later census counted how many *distinct* surfaces a run of Stores names.
+//! Sampling the surface rail in fixed batches of 1 024 Stores over a driven
+//! Safari drag, each batch touched about **six** distinct mapping ids, and the
+//! rail ran at 640 Stores a second (`surface_resident` on a 1 001 ms
+//! `store_routes` window) against a 75.8 Hz median present. That is
+//! 640 / 6.2 / 75.8 ≈ **1.3 full-target Stores into each surface per frame the
+//! user sees** — near the floor of one, and consistent with the paragraph above
+//! rather than against it.
+//!
+//! The arithmetic is worth stating because getting it wrong is easy and it was
+//! got wrong once here: dividing the same six surfaces into `target_reads`
+//! (~1 560/s) instead gives ~3 Stores per surface per frame and reads as a 2:1
+//! redundancy waiting to be collapsed. `target_reads` counts **every** rail's
+//! full-frame copy — this one, the GVA Store, and the present capture — so it is
+//! the wrong denominator for a per-surface-rail ratio by about 2.4x. Use the
+//! route counter for the rail being reasoned about.
+//!
+//! So there is no burst of redundant Stores to collapse *inside* this rail, and
+//! the deferred window would still have nothing to coalesce. What is left is the
+//! rail's own cost at the rate the guest asks for it, and that cost is this
+//! device's largest single item: removing only its copy commands, with every
+//! barrier, flush and stamp left in place, took a driven drag from 76 Hz to
+//! 104 Hz.
+//!
+//! # It is the bytes, not the queue they are submitted to
+//!
+//! The obvious reading of that ablation — that the copies are expensive because
+//! they sit in the graphics queue ahead of the draws — was tested by building
+//! the alternative and measuring it. It is wrong, and
+//! `backend::vulkan::engine::context`'s `dedicated_transfer_family` carries the
+//! four boots that say so: putting the bus-crossing half of this copy on a host
+//! that has an idle copy engine moves the block between three different counters
+//! and leaves the frame rate where it was. A narrower ablation isolates why —
+//! skipping the image read alone, with the bytes still crossing, is worth 4 Hz of
+//! the 30.
+//!
+//! What is expensive is the traffic: this rail and the GVA Store together put
+//! **~5.0 GB/s into guest RAM**, about 21 full-surface writebacks for every frame
+//! the user sees. Six surfaces at ~70 Hz would be a third of that even at one
+//! write each, so the redundancy is real — it is simply not *within* one rail,
+//! which is what the two censuses above were each measuring. Whatever removes it
+//! has to look across the rails and across frames, not at the spacing of Stores
+//! inside one.
+//!
+//! # The contract does not ask for this copy at all
+//!
+//! Nothing in a render Store carries a region, and the search for one is over:
+//! the record has no origin, rect, row range or sequence field, and the guest
+//! driver's own dirty model has no sub-rect at any layer — a texture is dirtied
+//! by *(face, level)* and a buffer by *(start, length)*. The two candidate damage
+//! sources on our side were each measured and each said the same thing: the
+//! pass's stated render-target extent is the attachment restated (99.97 % `full`,
+//! see `exec::report::note_pass_extent_coverage`) and the union of a pass's
+//! scissors covers the attachment 99.92 % of the time
+//! (`draw::vulkan::note_pass_scissor_union`).
+//!
+//! The reason there is no region is that the reference host does not copy here.
+//! It builds the render target's own GPU resource directly over the guest's
+//! surface backing, so a Store makes the pixels guest-visible as a side effect of
+//! rendering, at no bandwidth. The only host-to-guest copy in the contract is a
+//! **whole-resource synchronize the guest asks for**, guarded per resource by a
+//! host-valid flag the guest also owns. This device already decodes both halves —
+//! the validity quad in `runtime::resource_validity`, and the synchronize command
+//! in `runtime::drain`.
+//!
+//! **A driven x86/Vulkan Safari-drag boot issues zero of them.** Not few: no
+//! resource-synchronize and no resource-invalidate command appears in the whole
+//! log. So on this workload the contract asks for no host-to-guest copy at all,
+//! and this device performs about 1 556 a second.
+//!
+//! # What ablating both rails measured
+//!
+//! A probe returned from the entry of each rail before writing anything, so no
+//! guest page was written and no copy was recorded, against the 67.8 Hz baseline
+//! of the same tree and machine that hour:
+//!
+//! | ablated | `present_hz` med | peak |
+//! |---|---|---|
+//! | nothing (shipping) | 67.8 | 71.9 |
+//! | the GVA Store only | 71.9 | 76.8 |
+//! | both rails | **86.0** | **108.3** |
+//!
+//! So ~4 Hz sits in the GVA rail's 928 Stores a second and ~14 Hz in this rail's
+//! 628 — this one is the smaller count and by far the larger cost.
+//!
+//! And the guest still draws. With **no** guest page written at all the desktop
+//! at rest is correct to the eye: menu bar, wallpaper, dock, and Safari's start
+//! page with every favicon. It degrades under a drag — the composite displaces
+//! and regions go black. Read that as "most of this traffic does not feed the
+//! display", not as "none of it does": the probe skipped the write *and* the
+//! bookkeeping a write publishes (`surface_cache::forget`, the residency-window
+//! invalidate, the write footprint), so some of the degradation is the probe's
+//! own and the split is not yet apportioned.
+//!
+//! The lever is therefore not a damage rect and not a different queue — see
+//! `backend::vulkan::engine::context`'s `dedicated_transfer_family` for the rail
+//! that was built to test the queue and measured nothing. It is landing this copy
+//! when something actually reads the bytes, which is what the contract does and
+//! what the deferred window above tried to do with the wrong land point.
+//!
+//! # Who reads these guest pages, counted
+//!
+//! A deferral is only as good as the list of readers it has to land for, so here
+//! is the list with a driven boot's rates beside it. All three are ours to
+//! trigger or the guest's to announce; none of them is an unobservable read.
+//!
+//! * **This device's own colour LOAD seed**, reading an attachment's guest pages
+//!   to seed `MTLLoadActionLoad`. [`SettleSite::LinearTextureSeed`] is where it
+//!   blocks and it is the device's largest wait — 4 701 in one drag, 99.8 % of
+//!   them genuine overlaps. Already elidable through
+//!   [`crate::runtime::gva_store_witness`].
+//! * **The host console**, painting a mapping's bytes into the host window.
+//!   `scanout_paint` fires **six times in a whole boot**; the window presents
+//!   from the resident image, not from guest pages.
+//! * **The guest CPU**, which announces itself. Zero all boot.
+//!
+//! Against 1 556 writebacks a second. The `settle_linear_memo_read` pair says
+//! the same thing from the other side: 3 796 disjointness checks a second, of
+//! which **six** found a read overlapping an outstanding write.
+//!
+//! # What a deferral has to answer, and where the seam is
+//!
+//! Arming instead of writing is the easy half, and a second Store into one
+//! mapping should *replace* the armed copy rather than refuse it — the later
+//! frame is the fresher answer, and that replacement is the coalescing the
+//! stamp-shaped land point made unreachable. The hazards are the four this doc
+//! already lists for the old window: resident drift, pin leaks, page recycling,
+//! and ordering against the guest's own CPU write. The last one has a signal
+//! already decoded — `clear_host_valid` means the guest wrote those bytes, so an
+//! armed copy for that mapping must be **dropped**, not landed.
+//!
+//! **The stamp is not a land point, and that is a contract statement rather than
+//! a risk taken.** A completion stamp says the submission is done; it does not
+//! say the guest may read the resource's bytes. What says that is the host-valid
+//! flag the guest itself sets and clears, and the synchronize it issues before a
+//! CPU read. Landing at the stamp is what makes coalescing unreachable, and the
+//! contract does not ask for it.
+//!
+//! **The seam is the plan, not the call graph.** The obvious shape — land from
+//! [`settle_guest_writes`] — does not fit: that function takes a [`SettleSite`]
+//! and nothing else, no `DeviceState` and no `HostMemory`, and threading both
+//! through its sixteen call sites would be the bulk of the work. It does not have
+//! to. Split [`crate::backend::vulkan::engine::copy_target_to_guest_pages`] at
+//! the point where it stops needing the guest's page tables: everything up to and
+//! including `references_for_runs` is `DeviceState`/`HostMemory` work and stays at
+//! the Store, and what is left — acquire a scratch, plan the regions, record,
+//! submit — needs only the engine, which is a process-global behind its own lock.
+//!
+//! So a Store resolves its plan and parks it; a settle records and submits every
+//! parked plan before it waits. `settle_guest_writes` can reach that with the
+//! signature it already has. The per-Store `vouch` and `resolve` cost (12 and
+//! 17 ms/s) is unchanged, which is fine — they are not what the ablation
+//! measured. The ~5 GB/s is, and it is entirely on the other side of the seam.
+//!
+//! Two consequences to keep in view while building it. Parking a plan holds
+//! resolved host pointers into guest RAM, so [`crate::runtime::guest_ram`]'s bound
+//! and the PTE guard have to be armed at the *arm*, not at the record — earlier
+//! than today, which is the safe direction. And the pin that keeps the resident
+//! alive until the copy executes has to be taken at the arm too, because between
+//! arm and land the reclaim paths would otherwise be free to take the image the
+//! parked plan reads from.
+//!
+//! # How big the cut is, and the one variant that must not take it
+//!
+//! A settle is far rarer than a Store, which is the whole reason this works. One
+//! driven Safari-drag census window:
+//!
+//! ```text
+//! gwdebt_merged           1 529     writebacks that found the debt already set
+//! settle_linear_memo_read     6     settles that actually waited
+//! settle_*                    0     every other site
+//! ```
+//!
+//! Six waits a second against 1 556 writebacks. Parking against about six
+//! distinct surfaces and landing at a settle is therefore of order **36 copies a
+//! second instead of 1 556** — the same territory the ablation measured at 86 Hz,
+//! reached without losing a frame the guest asked for.
+//!
+//! **That factor is only available if the three stamp sites do not land parked
+//! plans**, and it is a contract statement rather than a shortcut. A completion
+//! stamp says a submission finished; it does not say the guest may read the
+//! resource. [`SettleSite::CompletionStamp`], [`SettleSite::RootStamp`] and
+//! [`SettleSite::ChildStamp`] are the three that fire at that cadence, and a
+//! settle from any of them still has to wait what is already *submitted* — it
+//! simply must not turn a parked plan into a submission. Every other variant is a
+//! host toucher of guest bytes and lands everything parked before it reads.
+//!
+//! `engine::write_stamp_after_guest_writes` needs no change for this: it orders
+//! the stamp word behind outstanding copies with a GPU barrier in the same queue
+//! and never calls the settle, so a plan that is still parked is simply not
+//! something it claims anything about.
+//!
+//! One caveat for whoever reads the witness this rail feeds:
+//! `MappingEntry::render_flush`'s doc quotes `render_flush_age_sub_ms` /
+//! `_sub_frame` / `_frame_plus` figures, and **those counters exist nowhere in
+//! the tree but that comment** — they were retired without it. Its conclusion may
+//! still be right; it is simply no longer reproducible from a boot, so do not
+//! read those three numbers as something a fresh log can confirm.
 //!
 //! What the rail did buy is real and is kept: the Store does not read the frame
 //! back off the GPU. [`crate::runtime::mapping_write::write_bgra8_from_resident_gpu`]

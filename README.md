@@ -60,8 +60,7 @@ for bring-up.
 
 1. **Host prep.** You need KVM (`/dev/kvm`), a working NVIDIA (or other) Vulkan stack for the product
    backend, and build deps for the in-tree QEMU (`scripts/qemu-build/qemu-build.sh --target x86_64
-   --backend vulkan`). KVM must ignore unhandled MSRs or macOS will not boot — e.g. a modprobe conf
-   with `options kvm ignore_msrs=1` (reboot or reload the module after).
+   --backend vulkan`).
 
 2. **Generate OpenCore, OVMF, and a guest disk with [OSX-KVM](https://github.com/kholia/OSX-KVM).**
    **macOS 13 is recommended**.Follow that project’s docs to fetch recovery media, build OpenCore,

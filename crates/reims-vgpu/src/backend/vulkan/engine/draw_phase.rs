@@ -278,21 +278,73 @@ const STALL_REPORT_CAP: u64 = 256;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Phase {
     Prep = 0,
-    Pipeline = 1,
-    Stage = 2,
-    StagePass = 3,
-    Acquire = 4,
-    AcquireSampled = 5,
-    SampledUpload = 6,
-    AcquireReadback = 7,
-    Descriptors = 8,
-    Record = 9,
-    Submit = 10,
-    Wait = 11,
-    Readback = 12,
+    /// Claiming the submission ring slot — `begin_entry`, or a batch joiner
+    /// taking the open batch's slot.
+    ///
+    /// Split out of [`Phase::Prep`] because it is the one part of that span
+    /// that **blocks on the GPU**: `begin_entry` advances onto the next slot and
+    /// waits when its fence is still unsignaled. `ring_retire_blocks` counts
+    /// those, and a count cannot rank them — 18 000 blocks of one microsecond
+    /// and 18 000 of four hundred read identically, and only the second says the
+    /// ring is the cap. The comment at the claim site has promised a
+    /// `retire_wait_us` for a long time; this is it.
+    ///
+    /// # It was all of it
+    ///
+    /// First reading, driven Safari drag: `prep_us` **2 525 us/s** against
+    /// `slot_us` **314 491 us/s** over 3 845 draws. So the 111 -> 306 ms/s rise
+    /// in `prep_us` that followed the resident rungs was not preparation getting
+    /// slower by any amount — preparation is free, and the whole column is this
+    /// wait. With `ring_retire_blocks` at 17 863 that is roughly **425 us per
+    /// block**, which is not the jitter a deeper ring absorbs.
+    ///
+    /// What that says about `RING_DEPTH` is: probably not the lever. Eight slots
+    /// against ~2 100 submissions a second (`batch_flushes` 53 451 over the
+    /// boot) gives each submission 3.8 ms to retire, and something is exceeding
+    /// it. Doubling the ring doubles that budget once; halving the submissions
+    /// would do the same and keep the latency.
+    ///
+    /// The submission count was the more promising end, and splitting the join
+    /// rule by refusing term found it: `!samples_own_target` alone forced
+    /// 29.7 % of all draws into their own command buffer, and it was standing
+    /// in for a barrier rather than for a real ordering constraint. Dropping it
+    /// took `batch_flushes` 55 334 -> 33 538 on the same probe.
+    ///
+    /// # What that bought, and what it did not
+    ///
+    /// `slot_us` 6 870 ms -> 5 640 ms and `ring_retire_blocks` 17 533 ->
+    /// 14 565 across the boot, so the ring does block less. The frame rate did
+    /// not move: 63/s before and after, 24 of 24 seconds below 100 Hz.
+    ///
+    /// A 39 % cut in submissions buying an 18 % cut in the blocking and no
+    /// frames says the ring was not queued behind submission *overhead*. In
+    /// the same second the device moves 4.46 GB of guest buffer runs into
+    /// device-local memory and writes 4.33 GB of rendered surface back to
+    /// guest pages — 8.8 GB/s across the bus on a discrete host, against a
+    /// worker that holds the engine lock 671 ms of every second. Look there
+    /// before shortening this span again.
+    Slot = 1,
+    Pipeline = 2,
+    Stage = 3,
+    StagePass = 4,
+    Acquire = 5,
+    AcquireSampled = 6,
+    SampledUpload = 7,
+    AcquireReadback = 8,
+    Descriptors = 9,
+    Record = 10,
+    Submit = 11,
+    Wait = 12,
+    Readback = 13,
 }
 
-const PHASES: usize = 13;
+impl Phase {
+    /// Highest ordinal, so [`PHASES`] is derived from the enum rather than
+    /// hand-counted beside it.
+    const LAST: Phase = Phase::Readback;
+}
+
+const PHASES: usize = Phase::LAST as usize + 1;
 
 /// Nanoseconds, per [`crate::observe::phase_clock`]. `prep_us` and
 /// `pipeline_us` are single-digit microseconds over a whole draw, so the spans
@@ -332,6 +384,8 @@ static STALL_LINES: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DrawPhaseWindow {
     pub prep_us: u64,
+    /// Blocked claiming a ring slot. See [`Phase::Slot`].
+    pub slot_us: u64,
     pub pipeline_us: u64,
     pub stage_us: u64,
     pub stage_pass_us: u64,
@@ -355,6 +409,7 @@ pub fn take_window() -> Option<DrawPhaseWindow> {
     let draws = DRAWS.swap(0, Ordering::Relaxed);
     let w = DrawPhaseWindow {
         prep_us: to_us(ACC[Phase::Prep as usize].swap(0, Ordering::Relaxed)),
+        slot_us: to_us(ACC[Phase::Slot as usize].swap(0, Ordering::Relaxed)),
         pipeline_us: to_us(ACC[Phase::Pipeline as usize].swap(0, Ordering::Relaxed)),
         stage_us: to_us(ACC[Phase::Stage as usize].swap(0, Ordering::Relaxed)),
         stage_pass_us: to_us(ACC[Phase::StagePass as usize].swap(0, Ordering::Relaxed)),
@@ -443,13 +498,14 @@ impl Drop for DrawTimer {
             ""
         };
         crate::observe::off(format!(
-            "draw_stall us={} prep_us={} pipeline_us={} stage_us={} stage_pass_us={} \
+            "draw_stall us={} prep_us={} slot_us={} pipeline_us={} stage_us={} stage_pass_us={} \
              acquire_us={} acquire_sampled_us={} sampled_upload_us={} acquire_readback_us={} \
              descriptors_us={} \
              record_us={} submit_us={} wait_us={} readback_us={} geom={w}x{h} \
              readback_bytes={} exit={:?}{latched}",
             to_us(total),
             to_us(self.ns[Phase::Prep as usize]),
+            to_us(self.ns[Phase::Slot as usize]),
             to_us(self.ns[Phase::Pipeline as usize]),
             to_us(self.ns[Phase::Stage as usize]),
             to_us(self.ns[Phase::StagePass as usize]),
@@ -491,6 +547,54 @@ mod tests {
         // inheriting the tail.
         assert_eq!(w.readback_us, 0);
         assert_eq!(w.submit_us, 0);
+    }
+
+    /// The ring claim is charged apart from the bookkeeping above it.
+    ///
+    /// [`Phase::Slot`] exists because it is the only part of [`Phase::Prep`]
+    /// that blocks on the GPU, and the whole point is that a boot can tell the
+    /// two apart. A `Slot` whose time landed in `prep_us` would read exactly
+    /// like a draw that got more expensive to prepare, and those want opposite
+    /// repairs — a deeper ring against less work per draw.
+    ///
+    /// Walks the ordinals too. They are array indices into [`ACC`], and
+    /// inserting a variant renumbers every one below it; a phase left pointing
+    /// at its old slot would silently add its time to a neighbour's column.
+    #[test]
+    fn the_ring_claim_is_charged_apart_from_preparing_the_draw() {
+        let _ = take_window();
+        {
+            let mut t = DrawTimer::start();
+            t.enter(Phase::Slot);
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            t.enter(Phase::Pipeline);
+        }
+        let w = take_window().expect("a dropped timer counts a draw");
+        assert!(w.slot_us >= 2_000, "{w:?}");
+        assert_eq!(w.prep_us, 0, "the claim's wait may not read as prepare time");
+
+        // Every ordinal distinct and contiguous from zero, so `PHASES` covers
+        // them and no two share an accumulator.
+        let all = [
+            Phase::Prep,
+            Phase::Slot,
+            Phase::Pipeline,
+            Phase::Stage,
+            Phase::StagePass,
+            Phase::Acquire,
+            Phase::AcquireSampled,
+            Phase::SampledUpload,
+            Phase::AcquireReadback,
+            Phase::Descriptors,
+            Phase::Record,
+            Phase::Submit,
+            Phase::Wait,
+            Phase::Readback,
+        ];
+        assert_eq!(all.len(), PHASES);
+        for (want, phase) in all.iter().enumerate() {
+            assert_eq!(*phase as usize, want, "{phase:?} indexes the wrong slot");
+        }
     }
 
     /// Holding the render target and holding the sampled images are separate

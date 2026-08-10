@@ -88,6 +88,87 @@ pub(crate) fn color_subresource_range() -> ash::vk::ImageSubresourceRange {
     }
 }
 
+/// Whether a registry resident of this format is a depth(-stencil) attachment
+/// rather than a colour one.
+///
+/// The two depth formats this device ever creates are
+/// [`crate::backend::vulkan::translate::pixel::TRANSIENT_DEPTH_FORMAT`] and
+/// whichever combined format `DeviceContext::depth_stencil_format` selected, and
+/// that second one is device-queried — so this asks the format's own aspect
+/// rather than comparing against a list a third format would not be on.
+pub(crate) fn format_is_depth(format: ash::vk::Format) -> bool {
+    matches!(
+        format,
+        ash::vk::Format::D16_UNORM
+            | ash::vk::Format::X8_D24_UNORM_PACK32
+            | ash::vk::Format::D32_SFLOAT
+            | ash::vk::Format::D16_UNORM_S8_UINT
+            | ash::vk::Format::D24_UNORM_S8_UINT
+            | ash::vk::Format::D32_SFLOAT_S8_UINT
+    )
+}
+
+/// Whether a format carries a stencil aspect as well as depth.
+pub(crate) fn format_has_stencil(format: ash::vk::Format) -> bool {
+    matches!(
+        format,
+        ash::vk::Format::D16_UNORM_S8_UINT
+            | ash::vk::Format::D24_UNORM_S8_UINT
+            | ash::vk::Format::D32_SFLOAT_S8_UINT
+            | ash::vk::Format::S8_UINT
+    )
+}
+
+/// The subresource range a registry resident's view is created with, derived
+/// from its format. See [`registry_target_usage`] for why these are functions of
+/// the format rather than parameters beside it.
+pub(crate) fn registry_subresource_range(
+    format: ash::vk::Format,
+) -> ash::vk::ImageSubresourceRange {
+    if !format_is_depth(format) {
+        return color_subresource_range();
+    }
+    let mut aspect = ash::vk::ImageAspectFlags::DEPTH;
+    if format_has_stencil(format) {
+        aspect |= ash::vk::ImageAspectFlags::STENCIL;
+    }
+    ash::vk::ImageSubresourceRange {
+        aspect_mask: aspect,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    }
+}
+
+/// The usage set a registry resident's image is created with, derived from its
+/// format.
+///
+/// **A function of the format, deliberately, and not a parameter.** The recycle
+/// free-list buckets displaced images by `(geometry, format)` and hands one back
+/// to the next resident of that bucket, so a bucket whose members disagree about
+/// usage would eventually bind an image to an attachment it was not created for
+/// — invalid, and invalid in the quiet way, because the image is real and the
+/// geometry matches. Deriving usage here makes "same bucket implies same usage"
+/// true by construction, so a fourth creation site cannot get it wrong and
+/// nothing has to scan for one that did.
+pub(crate) fn registry_target_usage(format: ash::vk::Format) -> ash::vk::ImageUsageFlags {
+    if format_is_depth(format) {
+        // A depth resident is only ever attachment N of an ad-hoc framebuffer.
+        // No SAMPLED and no TRANSFER: nothing in this device reads a depth
+        // buffer back or copies one, and asking for usage the host need not
+        // support for a depth format would refuse the image on hosts that
+        // support the attachment alone.
+        ash::vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+    } else {
+        ash::vk::ImageUsageFlags::COLOR_ATTACHMENT
+            | ash::vk::ImageUsageFlags::INPUT_ATTACHMENT
+            | ash::vk::ImageUsageFlags::TRANSFER_SRC
+            | ash::vk::ImageUsageFlags::TRANSFER_DST
+            | ash::vk::ImageUsageFlags::SAMPLED
+    }
+}
+
 /// [`color_subresource_range`] as a copy's subresource selector: colour aspect,
 /// base mip, single layer.
 pub(crate) fn color_subresource_layers() -> ash::vk::ImageSubresourceLayers {
@@ -602,18 +683,28 @@ static GUEST_WRITE_DEBT: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// One destination's page list per armed-and-unsettled writeback, up to
 /// [`RING_DEPTH`] of them. The bound is the submission ring's, because that is
 /// what bounds writebacks in flight: a ninth submission blocks in `begin_entry`
-/// on the oldest fence rather than being recorded. Between the ring retiring and
-/// a settle clearing this the two can drift, so overflow is real and is handled
-/// by giving up naming entirely — [`GuestWriteFootprint::unnamed`] — after which
-/// every reader waits, exactly as it did before this existed. **Never by
-/// dropping an entry**: a footprint missing a page it holds would answer
-/// "disjoint" for a page a copy is landing in, which is a stale frame served as
-/// fresh.
+/// on the oldest fence rather than being recorded.
 ///
-/// A single-entry version of this measured `gwdebt_unnamed` **14 125** against
-/// 16 626 arms on a driven Safari-drag boot, so 85 % of arms found one already
-/// outstanding and gave up. Holding the ring's worth is what makes the naming
-/// usable rather than nominal.
+/// **The two drift, and overflow is routine.** [`GUEST_WRITE_DEBT`] is cleared
+/// only by an actual settle, never by the ring retiring a fence on its own, so
+/// an entry outlives the copy it names for as long as nothing blocks. A single
+/// entry measured `gwdebt_unnamed` 14 125 against 16 626 arms; the ring's worth
+/// still measured **3 499** overflows on a driven Safari-drag boot, and each one
+/// made every subsequent reader settle globally until the next clear —
+/// `settle_linear_memo_read_unnamed` 3 402 of that boot's 4 036 memo waits, at
+/// ~200 ms of blocking per second of drag.
+///
+/// So overflow is a **merge**, not a surrender: the ninth arm folds into the
+/// oldest entry and the ledger keeps naming every page it holds. A union of two
+/// destination page lists is exactly the set of pages both copies land in, so
+/// nothing is lost but the ability to retire one of them individually — and
+/// nothing retires individually, because [`clear_guest_write_pages`] clears all
+/// of them at once.
+///
+/// **Never by dropping an entry**: a footprint missing a page it holds would
+/// answer "disjoint" for a page a copy is landing in, which is a stale frame
+/// served as fresh. Merging is the opposite direction — it can only turn a
+/// `Disjoint` into an `Overlap`, never the reverse.
 ///
 /// # Ordering
 ///
@@ -624,10 +715,7 @@ static GUEST_WRITE_DEBT: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// take only this mutex and never the engine lock — taking that at every guest
 /// read is the cost the flag exists to avoid.
 static GUEST_WRITE_PAGES: std::sync::Mutex<GuestWriteFootprint> =
-    std::sync::Mutex::new(GuestWriteFootprint {
-        armed: Vec::new(),
-        unnamed: false,
-    });
+    std::sync::Mutex::new(GuestWriteFootprint { armed: Vec::new() });
 
 /// The page lists behind [`GUEST_WRITE_PAGES`].
 struct GuestWriteFootprint {
@@ -638,11 +726,15 @@ struct GuestWriteFootprint {
     ///
     /// Kept as separate lists rather than merged into one, so a settle could
     /// retire them individually later without re-deriving which page belonged to
-    /// which copy. Never longer than [`RING_DEPTH`].
+    /// which copy. Never longer than [`RING_DEPTH`]; past that, an arm folds
+    /// into entry zero, which gives up exactly that future retirement and
+    /// nothing else.
+    ///
+    /// There is no "gave up naming" flag beside this any more. It existed for
+    /// the overflow that is now a merge, and the only other way to lose the
+    /// ledger — a poisoned mutex — already answers `Unnamed` at every ask
+    /// without one.
     armed: Vec<Vec<u64>>,
-    /// Set when a writeback armed that could not be recorded, so `armed` no
-    /// longer covers everything outstanding and nothing may be ruled out.
-    unnamed: bool,
 }
 
 /// What the ledger can say about a reader's window.
@@ -664,21 +756,27 @@ pub enum GuestWriteReach {
 /// Called under the engine lock, beside the [`GUEST_WRITE_DEBT`] publish.
 fn arm_guest_write_pages(pages: &[u64]) {
     let Ok(mut f) = GUEST_WRITE_PAGES.lock() else {
+        // A poisoned lock means nothing is recorded, and it stays poisoned, so
+        // `guest_writes_reaching` answers `Unnamed` for the rest of the boot.
+        // That is the safe direction and needs no flag here.
         return;
     };
-    if f.unnamed {
-        return;
-    }
-    if f.armed.len() >= pools::RING_DEPTH {
-        f.unnamed = true;
-        f.armed.clear();
-        f.armed.shrink_to_fit();
-        crate::runtime::drain::note_store_route("gwdebt_unnamed");
-        return;
-    }
     let mut sorted = pages.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
+    // At the entry cap, fold into the oldest rather than give up naming. The
+    // `first_mut` cannot be `None` there — `RING_DEPTH` is non-zero — but the
+    // fallthrough is a push rather than an `expect`, because the only thing a
+    // panic here would protect is a bound this function does not own.
+    if f.armed.len() >= pools::RING_DEPTH {
+        if let Some(oldest) = f.armed.first_mut() {
+            oldest.extend_from_slice(&sorted);
+            oldest.sort_unstable();
+            oldest.dedup();
+            crate::runtime::drain::note_store_route("gwdebt_merged");
+            return;
+        }
+    }
     f.armed.push(sorted);
 }
 
@@ -687,7 +785,6 @@ fn arm_guest_write_pages(pages: &[u64]) {
 fn clear_guest_write_pages() {
     if let Ok(mut f) = GUEST_WRITE_PAGES.lock() {
         f.armed.clear();
-        f.unnamed = false;
     }
 }
 
@@ -703,9 +800,6 @@ pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
     let Ok(f) = GUEST_WRITE_PAGES.lock() else {
         return GuestWriteReach::Unnamed;
     };
-    if f.unnamed {
-        return GuestWriteReach::Unnamed;
-    }
     if f.armed.is_empty() {
         // The flag said something was outstanding and the ledger names nothing:
         // the settle that cleared it raced this ask. Nothing to rule out
@@ -2084,7 +2178,7 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
             target_readback_ops(),
             ReadbackDelivery::Lease,
         )?;
-        pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        pools.registry_note_access(identity, pools::ResidentAccess::TransferRead);
         counters.note_target_read(counters::TargetReadConsumer::GuestWriteback, rb_size);
         Ok(match delivered {
             ReadbackResult::Leased { token, ptr, len } => Some(LeasedFrame {
@@ -2322,7 +2416,7 @@ pub fn copy_target_to_guest_pages(
             .guest_write_regions
             .fetch_add(plan.regions(), Ordering::Relaxed);
         copy_image_level0_to_buffer(ctx, pools, counters, &snap, &plan)?;
-        pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        pools.registry_note_access(identity, pools::ResidentAccess::TransferRead);
         counters.note_target_read(
             counters::TargetReadConsumer::GuestWriteback,
             u64::from(dst.width) * u64::from(dst.height) * 4,
@@ -2844,7 +2938,7 @@ fn resident_read_snapshot(
         image: slot.image,
         width: slot.width,
         height: slot.height,
-        layout: slot.layout,
+        layout: slot.access.layout(),
         bgra: slot.scanout_order(),
     })
 }
@@ -2877,7 +2971,7 @@ fn read_target_inner(
             rb_size,
             target_readback_ops(),
         )?;
-        pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        pools.registry_note_access(identity, pools::ResidentAccess::TransferRead);
         counters.note_target_read(consumer, rb_size);
         Ok(TargetReadback {
             pixels: out,
@@ -3111,7 +3205,7 @@ mod guest_write_footprint_tests {
     /// to any of them is an overlap. The single-entry version of this gave up
     /// naming on 85 % of arms.
     #[test]
-    fn every_writeback_up_to_the_ring_is_named_and_the_next_gives_up() {
+    fn every_writeback_up_to_the_ring_is_named() {
         clear_guest_write_pages();
         for i in 0..pools::RING_DEPTH as u64 {
             arm_guest_write_pages(&[0x1000 * (i + 1)]);
@@ -3125,34 +3219,77 @@ mod guest_write_footprint_tests {
             guest_writes_reaching(&[0x1000 * (pools::RING_DEPTH as u64 + 2)]),
             GuestWriteReach::Disjoint
         );
-        // One past the ring: nothing may be ruled out, including a page none of
-        // them named. Dropping the overflowing entry instead would answer
-        // Disjoint for a page a copy is landing in.
-        arm_guest_write_pages(&[0xdead_0000]);
-        assert_eq!(
-            guest_writes_reaching(&[0x1000 * (pools::RING_DEPTH as u64 + 2)]),
-            GuestWriteReach::Unnamed
-        );
-        assert_eq!(guest_writes_reaching(&[0x1000]), GuestWriteReach::Unnamed);
         clear_guest_write_pages();
     }
 
-    /// A second writeback armed before the first settled means the footprint no
-    /// longer covers everything outstanding, and nothing may be ruled out — not
-    /// even a page neither of them named. Getting this backwards would serve the
-    /// second writeback's pages stale.
+    /// Past the entry cap the ledger keeps naming: the overflowing writeback
+    /// folds into the oldest entry instead of disabling the rail.
+    ///
+    /// Three assertions and each catches a different way to get this wrong.
+    /// **The overflowing page is named** — dropping the entry instead would
+    /// answer `Disjoint` for a page a copy is landing in, which is a stale frame
+    /// served as fresh. **The absorbing entry's own page is still named** — a
+    /// merge that overwrote rather than unioned would lose it just as quietly.
+    /// **A page nobody named is still `Disjoint`** — that is the whole point,
+    /// and it is what the old surrender got wrong 3 499 times on a driven boot,
+    /// each one making every later reader block globally.
     #[test]
-    fn a_settle_restores_naming_after_the_ledger_gave_up() {
+    fn an_arm_past_the_ring_merges_and_still_names_every_page() {
+        clear_guest_write_pages();
+        for i in 0..pools::RING_DEPTH as u64 {
+            arm_guest_write_pages(&[0x1000 * (i + 1)]);
+        }
+        arm_guest_write_pages(&[0xdead_0000]);
+        assert_eq!(
+            guest_writes_reaching(&[0xdead_0000]),
+            GuestWriteReach::Overlap,
+            "the writeback that overflowed the cap must still be named"
+        );
+        assert_eq!(
+            guest_writes_reaching(&[0x1000]),
+            GuestWriteReach::Overlap,
+            "the entry it merged into must keep its own pages"
+        );
+        assert_eq!(
+            guest_writes_reaching(&[0x8000_0000]),
+            GuestWriteReach::Disjoint,
+            "a page no outstanding writeback names must still be let through"
+        );
+        // And it keeps holding past many more, since nothing retires an entry
+        // until a settle clears them all.
+        for i in 0..4 * pools::RING_DEPTH as u64 {
+            arm_guest_write_pages(&[0xbeef_0000 + 0x1000 * i]);
+        }
+        assert_eq!(
+            guest_writes_reaching(&[0xbeef_0000]),
+            GuestWriteReach::Overlap
+        );
+        assert_eq!(guest_writes_reaching(&[0x1000]), GuestWriteReach::Overlap);
+        assert_eq!(
+            guest_writes_reaching(&[0x8000_0000]),
+            GuestWriteReach::Disjoint
+        );
+        clear_guest_write_pages();
+    }
+
+    /// The settle that clears the debt flag clears the ledger with it, so the
+    /// next writeback is named against an empty slate rather than against every
+    /// page the boot has ever written back.
+    #[test]
+    fn a_settle_forgets_every_page_the_ledger_was_holding() {
         clear_guest_write_pages();
         for i in 0..=pools::RING_DEPTH as u64 {
             arm_guest_write_pages(&[0x1000 * (i + 1)]);
         }
-        assert_eq!(guest_writes_reaching(&[0x8000_0000]), GuestWriteReach::Unnamed);
-        // One loss of precision must not disable the rail for the rest of the
-        // boot: the settle that clears the debt clears this too.
+        assert_eq!(guest_writes_reaching(&[0x1000]), GuestWriteReach::Overlap);
         clear_guest_write_pages();
         arm_guest_write_pages(&[0x4000]);
         assert_eq!(guest_writes_reaching(&[0x8000]), GuestWriteReach::Disjoint);
+        assert_eq!(
+            guest_writes_reaching(&[0x1000]),
+            GuestWriteReach::Disjoint,
+            "a page from before the settle is no longer outstanding"
+        );
         clear_guest_write_pages();
     }
 

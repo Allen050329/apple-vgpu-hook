@@ -417,6 +417,17 @@ engine_counters! {
         buffer_guest_gathers,
         buffer_guest_gather_bytes,
         buffer_guest_gather_regions,
+        /// Buffer binds served from a copy the command buffer being recorded
+        /// already holds — see `ResourcePools::cb_bound_buffers`.
+        ///
+        /// Read against `buffer_guest_gathers + buffer_guest_imports` plus
+        /// itself: the three sum to the binds, so this is the share of them
+        /// that cost nothing. It was a per-*draw* map before, and the reuse it
+        /// found then was invisible because it never reached a counter at all;
+        /// a reading of this is only about reuse *across* draws of one command
+        /// buffer if it is taken against a boot's `batch_flush_draws /
+        /// batch_flushes`, which says how many draws there were to reuse over.
+        buffer_bind_reuses,
         sampled_cache_hits,
         sampled_identity_hits,
         sampled_cache_hit_bytes,
@@ -656,6 +667,10 @@ impl EngineCounters {
         self.sampled_gathers.fetch_add(1, Ordering::Relaxed);
         self.sampled_gather_bytes
             .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn note_buffer_bind_reused(&self) {
+        self.buffer_bind_reuses.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn note_buffer_guest_import(&self, bytes: u64) {

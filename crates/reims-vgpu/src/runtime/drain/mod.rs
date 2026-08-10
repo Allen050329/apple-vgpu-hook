@@ -9,7 +9,7 @@ use crate::contract::iosurface_pages::{
     MAPPER_REQUEST_UNMAP,
 };
 use crate::model::*;
-use crate::model::{DeviceState, ExecFault, FailEvent, PacketFault};
+use crate::model::{DeviceState, ExecFault, FailEvent, PacketFault, UnimplementedCommand};
 use crate::observe::Emit;
 use crate::runtime::decode::fifo::{
     display_refresh_hz_1616, display_timing_entry_offset, encode_display_timing_entry,
@@ -119,6 +119,207 @@ fn release_translation_order_holds(state: &mut DeviceState) {
 ///
 /// `site` separates the two rings on the census line the way
 /// [`apply_define_task2`] does, since the same opcode arrives on both.
+/// `CmdNOP` (`0x1e`) arrived carrying a payload.
+///
+/// The command allocates no command-space bytes, so a payload is the one thing
+/// that can falsify this device's reading of it: bytes here mean the command has
+/// grown a form this arm does not decode, and dropping them silently is the
+/// failure the unknown-opcode arm was at least loud about.
+///
+/// Typed rather than a formatted string so the check owns a slug of its own.
+/// This is the same rule that keeps two commands from sharing one decline — a
+/// reader who greps the slug has to be able to tell which check fired.
+pub(crate) struct NopCarriedPayload {
+    pub(crate) channel: u32,
+    pub(crate) plen: usize,
+}
+
+impl crate::observe::Decline for NopCarriedPayload {
+    fn slug(&self) -> &'static str {
+        "cmd_nop_unexpected_payload"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("ch", self.channel.to_string()),
+            ("plen", self.plen.to_string()),
+        ]
+    }
+}
+
+crate::observe::decline_display!(NopCarriedPayload);
+
+/// `CmdDeleteObject` (`0x28`) carried something that is not a destroy record.
+///
+/// The command's payload is a task id and one serializer record naming the
+/// object to retire. Each variant is a distinct way that record can fail to name
+/// one, and each owns its slug: a reader who sees the reason has to be able to
+/// tell a truncated record from a well-formed record of the wrong family, since
+/// only the second means this device is meeting a command shape it has not
+/// decoded.
+pub(crate) enum DeleteObjectDecline {
+    /// The bytes after the task id are not a well-formed record.
+    RecordMalformed { task: u32, plen: usize },
+    /// A well-formed record whose opcode is not one of the destroy family.
+    ///
+    /// Membership is tested against the family, never a range: numbers inside
+    /// the destroy span belong to no destroy selector, and retiring an object on
+    /// one would destroy something the record never named.
+    NotADestroy { task: u32, opcode: u32 },
+    /// A destroy record whose payload is not the single object ref it must be.
+    RefUnreadable { task: u32, opcode: u32 },
+}
+
+impl crate::observe::Decline for DeleteObjectDecline {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::RecordMalformed { .. } => "delete_object_record_malformed",
+            Self::NotADestroy { .. } => "delete_object_not_a_destroy_record",
+            Self::RefUnreadable { .. } => "delete_object_ref_unreadable",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::RecordMalformed { task, plen } => {
+                vec![("task", task.to_string()), ("plen", plen.to_string())]
+            }
+            Self::NotADestroy { task, opcode } | Self::RefUnreadable { task, opcode } => {
+                vec![
+                    ("task", task.to_string()),
+                    ("record_opcode", format!("{opcode:#x}")),
+                ]
+            }
+        }
+    }
+}
+
+crate::observe::decline_display!(DeleteObjectDecline);
+
+/// The object kind a destroy record names, as a route-counter name.
+///
+/// The kind lives in the record's own opcode and nowhere else, so this is the
+/// only place it can be read from. Each kind gets its own counter because the
+/// distribution is the open question this arm leaves behind: which kinds a guest
+/// actually retires this way is what decides whether tracking serializer refs
+/// would be worth anything, and one merged counter cannot answer it.
+///
+/// Spelled against the wire crate's constants rather than against literals, so
+/// a renumbering there fails the build here instead of silently re-labelling a
+/// counter.
+fn delete_object_kind_route(opcode: u32) -> &'static str {
+    use reims_vgpu_wire::ops::destroy as d;
+    match opcode {
+        d::OPCODE_DELETE_BUFFER => "child_delete_object_buffer",
+        d::OPCODE_DELETE_TEXTURE => "child_delete_object_texture",
+        d::OPCODE_DELETE_DEPTH_STENCIL_STATE => "child_delete_object_depth_stencil_state",
+        d::OPCODE_DELETE_SAMPLER_STATE => "child_delete_object_sampler_state",
+        d::OPCODE_DELETE_FUNCTION => "child_delete_object_function",
+        d::OPCODE_DELETE_COMPUTE_PIPELINE_STATE => "child_delete_object_compute_pipeline_state",
+        d::OPCODE_DELETE_RENDER_PIPELINE_STATE => "child_delete_object_render_pipeline_state",
+        d::OPCODE_DELETE_FENCE => "child_delete_object_fence",
+        d::OPCODE_DELETE_HEAP => "child_delete_object_heap",
+        d::OPCODE_DELETE_RASTERIZATION_RATE_MAP => "child_delete_object_rasterization_rate_map",
+        d::OPCODE_DELETE_INDIRECT_COMMAND_BUFFER => "child_delete_object_indirect_command_buffer",
+        // `is_delete` gates every caller, so this is unreachable rather than a
+        // silent bucket. It is named so that if the family ever grows a kind
+        // this table has not learned, the counter says which.
+        _ => "child_delete_object_unnamed_kind",
+    }
+}
+
+/// `CmdDeleteObject` (`0x28`): decode the record, name the kind, retire nothing.
+///
+/// The payload is `{u32 task}` then one serializer destroy record. Every kind in
+/// that family writes the identical twelve-byte body — a single object ref — and
+/// carries the kind in the record's own opcode.
+///
+/// # Why the ref is decoded and then not acted on
+///
+/// The ref is in the **serializer's per-kind ref space**, which this device does
+/// not track. Nothing here is a matter of taste: the object table is keyed by
+/// the *kernel object-list* ref, established by `0x33 CmdSetObjectList` and
+/// populated when a decoded command resolves an entry out of that list, and the
+/// caches holding the kinds this command actually names — samplers and pipeline
+/// states — are keyed by the object's own **state**, not by a ref, so they have
+/// no ref to retire by even in principle.
+///
+/// Keying the object table with a number from the other namespace was measured
+/// and is worse than declining. On a driven boot the guest sent 1 988 of these
+/// in 25 s, every sampled one a sampler-state destroy, and not one named a ref
+/// the object table held — against 112 466 successful lookups on that same
+/// `(task, ref)` key from the resource-table path in the same boot. So the table
+/// was healthy and the namespace was wrong. The two do overlap numerically —
+/// 22 of those refs existed under a *different* task — so the only effect the
+/// call could ever have had is destroying an unrelated object that happened to
+/// share the integer.
+///
+/// This costs the guest nothing. The kinds named are content-keyed and
+/// deduplicated, so there is no per-object allocation to leak; what is lost is
+/// the chance to drop a cache entry slightly earlier, which is why the decline
+/// is a decline and not a loss.
+///
+/// The per-kind counters are what would justify revisiting it: a kind this
+/// device *does* hold by ref appearing here is the finding, and nothing else is.
+/// There is exactly one such kind today. `DeviceState::fence_generations` is
+/// keyed `(task, domain, fence_ref)` and nothing ever removes an entry, so a
+/// `child_delete_object_fence` reading above zero would be both a real leak and
+/// the one place this command has something to retire. The driven boot measured
+/// it at zero — every sampled record was a sampler state — so wiring it now
+/// would be building a handler for traffic no boot has produced. Read that
+/// counter before deciding otherwise.
+fn apply_delete_object(state: &mut DeviceState, channel_id: u32, payload: &[u8], packet: &Packet) {
+    let task_id = ld32(&payload[0..]);
+    let record = &payload[4..];
+    let Ok(op) = reims_vgpu_wire::op::op(record, 0) else {
+        Emit::decline(
+            "child_delete_object",
+            &DeleteObjectDecline::RecordMalformed {
+                task: task_id,
+                plen: record.len(),
+            },
+        )
+        .field("ch", channel_id)
+        .fail();
+        return;
+    };
+    if !reims_vgpu_wire::ops::destroy::is_delete(op.opcode()) {
+        Emit::decline(
+            "child_delete_object",
+            &DeleteObjectDecline::NotADestroy {
+                task: task_id,
+                opcode: op.opcode(),
+            },
+        )
+        .field("ch", channel_id)
+        .fail();
+        return;
+    }
+    let Ok(rec) = reims_vgpu_wire::ops::destroy::delete(&op) else {
+        Emit::decline(
+            "child_delete_object",
+            &DeleteObjectDecline::RefUnreadable {
+                task: task_id,
+                opcode: op.opcode(),
+            },
+        )
+        .field("ch", channel_id)
+        .fail();
+        return;
+    };
+    // Read so the record is proved decodable and the kind is countable. It is
+    // deliberately not used as a key: see this function's doc for the boot that
+    // measured what keying the object table with it would have done.
+    let _object_ref = rec.object_ref.get();
+    note_store_route(delete_object_kind_route(op.opcode()));
+    note_unimplemented(
+        state,
+        channel_id,
+        UnimplementedCommand::DeleteObject,
+        packet,
+    );
+}
+
 fn packet_short(op: &'static str, channel: Option<u32>, have: usize, need: usize) -> bool {
     if have >= need {
         return false;
@@ -346,7 +547,7 @@ fn define_task_length(payload: &[u8]) -> u64 {
 /// resource list: `[pipe][task][surface][gamma…]` for the gamma command,
 /// `[pipe][surface][task]` otherwise.
 fn display_txn_trailer_len(opcode: u16) -> usize {
-    if opcode == CHILD_OP_PRESENT_GAMMA_X86 {
+    if opcode == CHILD_OP_DISPLAY_TRANSACTION3 {
         0x24
     } else {
         0x0c
@@ -359,9 +560,11 @@ fn display_txn_trailer_len(opcode: u16) -> usize {
 /// These are three different FIFO commands, not one shape with variations, so
 /// nothing here may be assumed from one opcode to another:
 ///
-/// - op6 `CmdDisplayTransaction3` — `[pipe][surface][task]`.
-/// - op7, its gamma variant — `[pipe][task][surface][gamma…]`; the first two
-///   words are swapped relative to op6.
+/// - op6 `CmdDisplayTransaction2_DEPRECATED` — `[pipe][surface][task]`.
+/// - op7 `CmdDisplayTransaction3` — `[pipe][task][surface][gamma…]`; the first
+///   two words are swapped relative to op6, and the gamma table follows. The two
+///   are separate commands with separate handlers, not one command with a
+///   variant flag, which is why the trailer differs at all.
 /// - op8 `CmdDisplaySwapMapping` — `[display][_][mapping]`. This one names a
 ///   single mapping instead of serializing a transaction, so its surface word
 ///   is `DISPLAY_SWAP_MAPPING` (0x08), *not* op6's 0x04, and it has no known
@@ -374,9 +577,9 @@ fn display_txn_trailer_len(opcode: u16) -> usize {
 /// differently.
 fn display_txn_trailer_slots(opcode: u16) -> (usize, Option<usize>) {
     match opcode {
-        CHILD_OP_PRESENT_GAMMA_X86 => (PRESENT_GAMMA_X86_SURFACE_ID / 4, Some(1)),
+        CHILD_OP_DISPLAY_TRANSACTION3 => (DISPLAY_TRANSACTION3_SURFACE_ID / 4, Some(1)),
         CHILD_OP_DISPLAY_SWAP => (DISPLAY_SWAP_MAPPING / 4, None),
-        _ => (PRESENT_X86_SURFACE_ID / 4, Some(2)),
+        _ => (DISPLAY_TRANSACTION2_SURFACE_ID / 4, Some(2)),
     }
 }
 
@@ -411,9 +614,10 @@ fn present_surface_id(opcode: u16, payload: &[u8]) -> Option<u32> {
 /// transaction by taking **plane 0's** IOSurface and writing that one id into a
 /// fixed-size command. There is no plane list on the wire, so decoding one
 /// surface is the whole contract rather than a first approximation of it. The
-/// command is 12 bytes for `CmdDisplayTransaction3` and 36 for its gamma
-/// variant, which is what [`display_txn_trailer_len`] returns, and the field
-/// order differs between them exactly as [`display_txn_trailer_slots`] says.
+/// command is 12 bytes for `CmdDisplayTransaction2_DEPRECATED` and 36 for
+/// `CmdDisplayTransaction3`, which is what [`display_txn_trailer_len`] returns,
+/// and the field order differs between them exactly as
+/// [`display_txn_trailer_slots`] says.
 ///
 /// The same reading settles the third word. It is the id of the paravirt task
 /// that owns the presented surface, taken from the display pipe's own resource
@@ -433,8 +637,8 @@ fn present_surface_id(opcode: u16, payload: &[u8]) -> Option<u32> {
 ///
 /// # The plane-list reading is op6/op7's, and only op6/op7's
 ///
-/// Everything above is about `submitTransaction`, which is what op6
-/// `CmdDisplayTransaction3` and its gamma variant op7 emit. **op8
+/// Everything above is about `submitTransaction`, whose two legs emit op6
+/// `CmdDisplayTransaction2_DEPRECATED` and op7 `CmdDisplayTransaction3`. **op8
 /// `CmdDisplaySwapMapping` does not serialize a transaction at all** — it names
 /// a single mapping, as [`display_txn_trailer_slots`] says — so it has no plane
 /// list to grow and "a plane list may have appeared" cannot be true of it.
@@ -758,7 +962,7 @@ fn packet_snapshot_len(header: &[u8], available: u32, ring_capacity: u32) -> u32
 /// **The ten commands that carry one are not a random ten.** They are work
 /// submission (`CHILD_OP_EXEC_INDIRECT2`), explicit synchronisation
 /// (`CHILD_OP_SYNCHRONIZE_RESOURCES`), presentation, and then the teardown
-/// set — `CHILD_OP_DELETE_TASK`, `CHILD_OP_DELETE_OBJECT`,
+/// set — `CHILD_OP_DELETE_TASK`, `CHILD_OP_DELETE_RESOURCE`,
 /// `CHILD_OP_UNMAP_MEMORY`. That is the list of commands whose ordering
 /// *against GPU work* is the thing that matters, and three of them free or
 /// unmap memory the GPU may still be reading. A record on an unmap is either
@@ -804,7 +1008,7 @@ fn packet_snapshot_len(header: &[u8], available: u32, ring_capacity: u32) -> u32
 /// **So skipping them is an ordering bug, and the opcode list above is exactly
 /// its blast radius.** The stamps do eventually get written, so this is not a
 /// hang; it is work running ahead of the work it was ordered behind.
-/// `CHILD_OP_DELETE_TASK`, `CHILD_OP_DELETE_OBJECT` and
+/// `CHILD_OP_DELETE_TASK`, `CHILD_OP_DELETE_RESOURCE` and
 /// `CHILD_OP_UNMAP_MEMORY` tear down memory the GPU may still be sourcing, which
 /// makes ignoring their records a use-after-free of guest pages — the same class
 /// as the completion-stamp ordering [`write_stamp`] already carries a flush for,
@@ -2497,7 +2701,8 @@ fn log_present_page_identity(state: &DeviceState, mapping: u32, w: u32, h: u32) 
     }
 }
 
-/// Present a named mapping to the host console (DisplaySwap / x86 present op6/7).
+/// Present a named mapping to the host console (op8 DisplaySwapMapping, or the
+/// x86 display pipe's op6/op7 transactions).
 fn present_named_mapping<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -2779,6 +2984,371 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     ChildPacketDisposition::Complete
 }
 
+/// The six lifecycle commands that share [`apply_map_family`]'s body.
+///
+/// The body branches on this enum and never on the packet's opcode, which is
+/// what keeps every branch in it reachable. A branch has to name a variant; a
+/// variant is only ever produced at a dispatch arm in `process_child_packet`;
+/// and a second arm for an opcode that already has one is an
+/// `unreachable_patterns` warning, which this crate's gates take as an error —
+/// clippy runs `-D warnings` on every matrix arm and `feature-matrix` expects a
+/// zero warning count. So a handler written here for a command this body is not
+/// dispatched for does not land. Verified by probe, not assumed.
+///
+/// That is worth a type because the failure has no behaviour and no other
+/// instrument sees it. `CHILD_OP_REPLACE_PHYSICAL` was once branched on inside
+/// this body while also owning its own dispatch arm: the outer `match` had
+/// already claimed the opcode, so the inner branch was dead — it read exactly
+/// like a handler, it compiled, and a coverage sweep reported it as one untaken
+/// branch among thousands. The reachable arm cleared the named mapping's page
+/// list and the dead one also took the mapping's deferred windows, so the
+/// difference was guest work.
+///
+/// The residual, stated rather than guarded: a *single*-opcode arm can still
+/// host the same dead branch. There the enclosing pattern is one number a few
+/// lines up rather than six numbers three hundred lines up, so it is visible on
+/// inspection, which is why the structure buys the most here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MapFamily {
+    /// `CmdMapMemory2` (`0x39`).
+    MapMemory2,
+    /// `CmdUnmapMemory` (`0x22`).
+    UnmapMemory,
+    /// `CmdInvalidateResources` (`0x34`).
+    InvalidateResources,
+    /// `CmdSynchronizeResources` (`0x35`).
+    SynchronizeResources,
+    /// `CmdSynchronizeAndDiscardResources` (`0x3e`).
+    SynchronizeAndDiscardResources,
+    /// `CmdDeleteIOSurfaceBacking2` (`0x36`).
+    DeleteIOSurfaceBacking2,
+}
+
+impl MapFamily {
+    /// The command name the fail log spells, one per variant.
+    ///
+    /// Exhaustive with no `_`, so a new member of the family cannot reach the
+    /// log under a placeholder name.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::MapMemory2 => "MapMemory2",
+            Self::UnmapMemory => "UnmapMemory",
+            Self::InvalidateResources => "InvalidateResources",
+            Self::SynchronizeResources => "SynchronizeResources",
+            Self::SynchronizeAndDiscardResources => "SynchronizeAndDiscardResources",
+            Self::DeleteIOSurfaceBacking2 => "DeleteIOSurfaceBacking2",
+        }
+    }
+}
+
+/// The shared body of the six lifecycle commands named by [`MapFamily`].
+fn apply_map_family<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    channel_id: u32,
+    packet: &Packet,
+    family: MapFamily,
+) {
+    // Every branch below stamps the packet complete whatever it did with
+    // it: the guest is waiting on the stamp, and a lifecycle event this
+    // device chose not to act on is still an event the guest performed.
+    //
+    // Live MapMemory2 plen=20 layout lead (not yet contract-final):
+    //   task_id@0 u32, gva@4 u64, length@12 u64  (matches fifo MapMemoryCommand).
+    let plen = packet.payload.len();
+    let name = family.name();
+    if matches!(family, MapFamily::MapMemory2 | MapFamily::UnmapMemory) && plen >= 20 {
+        let task_id = crate::contract::endian::ld32(&packet.payload[0..]);
+        let gva = crate::contract::endian::ld64(&packet.payload[4..]);
+        let length = crate::contract::endian::ld64(&packet.payload[12..]);
+        // Verbose-gated walk probe at map/unmap time. This runs a full
+        // guest page-table walk (`diagnose_gva_walk`) purely to build the
+        // log string, and fired ~9k times/boot on the drain path — a flood
+        // and a real per-map cost. Gate it (and the periodic census) behind
+        // `REIMS_VGPU_DRAW_LOG=1` so a normal boot pays neither; the functional
+        // view-retire below stays always-on. Wire has no PPNs — the probe
+        // asks whether the guest PT is already walkable under wire task_id.
+        if crate::observe::draw_log_enabled() {
+            let walk = crate::runtime::gva_mem::diagnose_gva_walk(
+                host,
+                &state.tasks,
+                task_id,
+                gva,
+                state.page_shift,
+            );
+            crate::observe::line(format!(
+                "map_probe op={name} ch={channel_id} task={task_id} gva={gva:#x} len={length:#x} page_shift={} {walk}",
+                state.page_shift
+            ));
+            // Periodic active-task census (every 32 map/unmap) for boot overview.
+            state.map_family_events = state.map_family_events.saturating_add(1);
+            if state.map_family_events == 1 || state.map_family_events.is_multiple_of(32) {
+                let census = crate::runtime::gva_mem::format_active_tasks(&state.tasks);
+                crate::observe::line(format!(
+                    "map_census n={} last_op={name} task={task_id} {census}",
+                    state.map_family_events
+                ));
+            }
+        }
+        // RE (AppleParavirtMemoryMap): Unmap/Map only mutate the **task
+        // page table** then notify — wire has no PPNs. Guest order is
+        // deallocate/allocate **then** FIFO, so:
+        // - Unmap notify: PTEs already gone → cannot GVA-write; retain
+        //   host_gva_surfaces for sample (wallpaper wipe class).
+        // - Map notify: PTEs already live → flush host_gva encode into
+        //   **new** PFNs (not invent PTEs; not invent geom). Discrete
+        //   type-2/3 content may live only in host_cache until this.
+        // Samples still prefer host_cache GVA key on Load.
+        //
+        // HostOps **views** (gva_host_views) are the opposite of encode
+        // cache: they alias the pages that were in the GPU PT. On Unmap
+        // those pages are no longer mapped for the GPU — drop any host
+        // view covering the range (Apple unmapMemory analogue). On Map
+        // the PFNs may have changed under the same GVA — drop stale
+        // views so the next ensure_gva_view re-walks. Does not invent
+        // PTEs and does not destroy host_gva_surfaces content.
+        if gva != 0 && length != 0 {
+            // Held bind resolutions over this range name pages the guest
+            // has just remapped. Retired by range, which is exactly what
+            // this notify carries.
+            note_bb_retired(
+                "bb_retire_map_range",
+                state.retire_bound_buffers_in_range(task_id, gva, length),
+            );
+            let n = crate::runtime::gva_view::retire_gva_views_overlapping(
+                state, task_id, gva, length,
+            );
+            let op = if family == MapFamily::UnmapMemory {
+                "unmap_memory"
+            } else {
+                "map_memory2"
+            };
+            crate::runtime::gva_view::log_retire(op, task_id, gva, length, n);
+        }
+        // Deferred GVA render-Store windows overlapping the notified
+        // VA range land **cache-only**: on Unmap the PTEs are already
+        // gone; on Map the PFNs are fresh and the map-notify guest
+        // flush is forbidden (PTE-corruption class). The encode cache
+        // preserves the content for samples (wallpaper-retain).
+        // There is deliberately no host_cache→guest GVA flush on
+        // MapMemory2. One existed and was disabled after
+        // serial-20260714-035023: PTE Corruption (freelist-shaped
+        // 0xff100000ff000000) ~135s into boot while it was writing —
+        // one Map of len=0x1c3e000 alone drove 13 GVA rewrites. Samples
+        // use the `host_gva_surfaces` retain on Unmap instead. Any
+        // re-introduction has to be a *narrower* policy than that one
+        // (exact-base only, no multi-key heap maps) and RE-justified, so
+        // the broad implementation is not kept around to be switched
+        // back on. See kb map-memory2 / xnu-pte-corruption-windowserver.
+    } else if family == MapFamily::DeleteIOSurfaceBacking2 && plen >= 8 {
+        // The live Ventura payload agrees with the resource contract:
+        // `{objectID, taskID}`. This is the lifetime
+        // boundary for the host IOSurface backing, not stamp-only
+        // bookkeeping. Keeping page_entries after it lets later id
+        // reuse/clear write pixels into pages the guest has recycled.
+        let object_id = crate::contract::endian::ld32(&packet.payload[0..]);
+        let task_id = crate::contract::endian::ld32(&packet.payload[4..]);
+        // Never write guest pages here — the delete trails the guest's
+        // CPU-side release asynchronously and the pages may already be
+        // recycled (boot-16 PTE-corruption panic: a 14.7 MB delete-time
+        // flush landed pixel bytes in a PTE page). But the id itself
+        // may ALSO already be re-used by a live surface whose paint is
+        // still deferred (~20 ms recycle under scroll — black-band
+        // class), so content state must survive until the next page
+        // resolve proves which incarnation this delete was for
+        // (fingerprint compare in mapper::resolve). A second delete
+        // with no resolve between is genuinely dead: tear down fully.
+        let mode = if state.mapping_backing_condemned(object_id) {
+            let _ = state.unmap_surface(object_id);
+            "dead"
+        } else if state.condemn_surface_backing(object_id) {
+            "condemn"
+        } else {
+            // No resolved pages ⇒ nothing a stale delete could hurt.
+            let _ = state.unmap_surface(object_id);
+            "unmapped"
+        };
+        crate::runtime::mapper::flush_retired_views(state, host);
+        if crate::observe::draw_log_enabled() {
+            crate::observe::line(format!(
+                "map_family op=DeleteIOSurfaceBacking2 ch={channel_id} object={object_id} task={task_id} plen={plen} mode={mode}"
+            ));
+        }
+    } else if family == MapFamily::InvalidateResources {
+        // RE: {task_id, count} + count×{object_id, 4×u8 validity ops}.
+        // Ops (PVG host layout): clr_host, set_host, clr_guest, set_guest.
+        // Pageon hardcodes LE 01 00 00 01 = clr hostValid + set guestValid.
+        //
+        // The same four bytes the EXEC_INDIRECT2 resource table carries,
+        // through the same consumer: this producer's records are 8 bytes
+        // and that one's are 24, but the quad is one contract and must
+        // not acquire two meanings.
+        use crate::runtime::decode::fifo::{
+            decode_invalidate_resources, CHILD_INVALIDATE_PAGEON_FLAGS,
+        };
+        use crate::runtime::resource_validity::{apply, ValiditySite};
+        match decode_invalidate_resources(&packet.payload) {
+            Ok(cmd) => {
+                let mut bumped = 0u32;
+                let mut miss = 0u32;
+                for rec in &cmd.records {
+                    let outcome = apply(
+                        state,
+                        cmd.task_id,
+                        rec.object_id,
+                        rec.ops,
+                        ValiditySite::InvalidateResources,
+                    );
+                    bumped = bumped.saturating_add(outcome.bumped);
+                    if outcome.missed {
+                        miss = miss.saturating_add(1);
+                    }
+                }
+                // One counter here, two on the exec side: `pageBacking`
+                // names mapping ids, so a record this device holds no
+                // mapping for is already the surprising case. The exec
+                // table names task object refs, most of which have no
+                // surface state by construction.
+                note_store_route_n("validity_miss_inv", miss as u64);
+                let rec0 = cmd.records.first();
+                let oid = rec0.map(|r| r.object_id).unwrap_or(0);
+                let flags = rec0.map(|r| r.flags).unwrap_or(0);
+                let ops = rec0.map(|r| r.ops).unwrap_or_default();
+                let pageon = flags == CHILD_INVALIDATE_PAGEON_FLAGS;
+                // ~11k/boot of routine guest cache-coherence ops. The
+                // always-on rate is the `validity_*` family in the
+                // per-second `store_routes` line; gate the per-op decode
+                // detail so it does not bury the curated fail view. The
+                // `decode_fail` and `inv_multi` paths below stay
+                // fail-visible, and the guard also skips the format alloc
+                // on a healthy boot.
+                if crate::observe::draw_log_enabled() {
+                    crate::observe::line(format!(
+                    "map_family op=InvalidateResources opcode={:#x} ch={channel_id} plen={plen} task={} count={} oid={oid:#x} flags={flags:#x} clr_h={} set_h={} clr_g={} set_g={} pageon={pageon} bumped={bumped} miss={miss}",
+                    packet.opcode,
+                    cmd.task_id,
+                    cmd.count,
+                    ops.clear_host_valid,
+                    ops.set_host_valid,
+                    ops.clear_guest_valid,
+                    ops.set_guest_valid
+                ));
+                }
+                if cmd.count > 1 {
+                    let ids: Vec<String> = cmd
+                        .records
+                        .iter()
+                        .map(|r| {
+                            format!(
+                                "{:#x}:clr_h={}/set_g={}",
+                                r.object_id, r.ops.clear_host_valid, r.ops.set_guest_valid
+                            )
+                        })
+                        .collect();
+                    crate::observe::fail(format!(
+                        "inv_multi ch={channel_id} task={} n={} recs=[{}]",
+                        cmd.task_id,
+                        cmd.count,
+                        ids.join(",")
+                    ));
+                }
+            }
+            // A refused Invalidate leaves this device serving
+            // host-cached pixels for a resource the guest has just
+            // CPU-written, so the line has to say which check refused
+            // and not only that one did.
+            Err(e) => note_resource_list_decode_fail(
+                "InvalidateResources",
+                packet.opcode,
+                channel_id,
+                e,
+            ),
+        }
+    } else if matches!(
+        family,
+        MapFamily::SynchronizeResources | MapFamily::SynchronizeAndDiscardResources
+    ) {
+        // Two opcodes, one arm, because the reference host validates
+        // both with byte-for-byte the same check — `{u32 task, u32
+        // count}` then `count` 4-byte object ids — and the synchronise
+        // obligation they name is the same one. `0x3e` adds a discard of
+        // the named resources' contents on top, which this device does
+        // not act on and reports below.
+        //
+        // The command carries `{task, count}` and a list of object ids,
+        // and nothing else — no region, no direction. It is the guest
+        // saying "I am about to touch these resources with the CPU", so
+        // what this device owes is that every guest-page write it has
+        // already submitted has executed, and nothing more. It is not a
+        // request to invent pixels into guest pages.
+        //
+        // **It is also the contract's only host-to-guest copy trigger,
+        // and a driven x86/Vulkan Safari-drag boot issues none at all.**
+        // That is what makes this device's per-Store writeback pure
+        // surplus on that workload; see `runtime::render_writeback`'s
+        // module doc for what the surplus costs and what the reference
+        // host does instead. A boot where this arm starts firing is a
+        // boot where the deferral described there has a real land point,
+        // so the count is worth watching rather than assuming zero.
+        use crate::runtime::decode::fifo::decode_synchronize_resources;
+        match decode_synchronize_resources(&packet.payload) {
+            Ok(cmd) => {
+                crate::runtime::render_writeback::settle_guest_writes(
+                    crate::runtime::render_writeback::SettleSite::ChildStamp,
+                );
+                let oid = cmd.object_ids.first().copied().unwrap_or(0);
+                if crate::observe::draw_log_enabled() {
+                    crate::observe::line(format!(
+                        "map_family op={name} opcode={:#x} ch={channel_id} plen={plen} task={} count={} oid={oid:#x}",
+                        packet.opcode, cmd.task_id, cmd.count
+                    ));
+                }
+                if cmd.count > 1 {
+                    let ids: Vec<String> =
+                        cmd.object_ids.iter().map(|id| format!("{id:#x}")).collect();
+                    crate::observe::fail(format!(
+                        "sync_multi ch={channel_id} task={} n={} oids=[{}]",
+                        cmd.task_id,
+                        cmd.count,
+                        ids.join(",")
+                    ));
+                }
+            }
+            // A refused Synchronize lets the guest CPU-read pages whose
+            // submitted writeback has not executed, which is a stale or
+            // black frame the guest has no way to notice.
+            Err(e) => note_resource_list_decode_fail(name, packet.opcode, channel_id, e),
+        }
+        // The half of `0x3e` that is not the synchronise. Reported after
+        // the synchronise has run, so the record cannot be read as the
+        // whole command having been dropped.
+        if family == MapFamily::SynchronizeAndDiscardResources {
+            note_unimplemented(
+                state,
+                channel_id,
+                UnimplementedCommand::SynchronizeAndDiscardResources,
+                packet,
+            );
+        }
+    } else {
+        let w0 = if plen >= 4 {
+            crate::contract::endian::ld32(&packet.payload[0..])
+        } else {
+            0
+        };
+        let w1 = if plen >= 8 {
+            crate::contract::endian::ld32(&packet.payload[4..])
+        } else {
+            0
+        };
+        crate::observe::off(format!(
+            "map_family op={name} opcode={:#x} ch={channel_id} plen={plen} w0={w0:#x} w1={w1:#x}",
+            packet.opcode
+        ));
+    }
+}
+
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChildPacketDisposition {
     Complete,
@@ -2849,8 +3419,8 @@ fn process_child_packet<H: HostMemory + HostOps>(
         CHILD_OP_SET_OBJECT_LIST => {
             apply_set_object_list(state, &packet.payload, Some(channel_id));
         }
-        CHILD_OP_DELETE_OBJECT => {
-            if !packet_short("delete_object", Some(channel_id), packet.payload.len(), 8) {
+        CHILD_OP_DELETE_RESOURCE => {
+            if !packet_short("delete_resource", Some(channel_id), packet.payload.len(), 8) {
                 let task_id = ld32(&packet.payload[0..]);
                 let id = ld32(&packet.payload[4..]);
                 // Which references resolved through this object is not knowable
@@ -2862,7 +3432,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 // source of re-walks: 54 109 resolutions dropped on one driven
                 // boot, 95% of every bind miss.
                 note_bb_retired(
-                    "bb_retire_delete_object",
+                    "bb_retire_delete_resource",
                     state.retire_bound_buffers_for_ref(task_id, id),
                 );
                 let _ = state.delete_object(task_id, id);
@@ -2906,15 +3476,18 @@ fn process_child_packet<H: HostMemory + HostOps>(
          * - Early boot: front type-11 writebacks paint while !frame_flush_seen
          *   and job W×H matches established console (no mid-switch thrash).
          * - After first boundary: display presents paint (op8 DisplaySwap on
-         *   arm ch4, **or** op6/7 on x86 Ventura/Tahoe display ch5).
-         * - ch2 PRESENT_FRAME 0x28 / FLUSH 0x3b: bookkeeping only (mid-composite).
+         *   arm ch4, **or** the op6/op7 transactions on x86 Ventura/Tahoe
+         *   display ch5).
+         * - Nothing on ch2 paints: 0x28 is CmdDeleteObject and 0x3b is
+         *   CmdGetComputeInfo, and neither is a present however mid-composite
+         *   the moment it arrives in.
          */
         // The three display present commands. op8 `CmdDisplaySwapMapping` is
         // the arm/EFI-era path; x86 Ventura/Tahoe drives the display pipe with
-        // op6 `CmdDisplayTransaction3` and its gamma variant op7. They differ
-        // only in where the surface word sits, which
-        // `display_txn_trailer_slots` owns for all three.
-        opcode @ (CHILD_OP_DISPLAY_SWAP | CHILD_OP_PRESENT_X86 | CHILD_OP_PRESENT_GAMMA_X86) => {
+        // op6 `CmdDisplayTransaction2_DEPRECATED` and op7
+        // `CmdDisplayTransaction3`. They differ only in where the surface word
+        // sits, which `display_txn_trailer_slots` owns for all three.
+        opcode @ (CHILD_OP_DISPLAY_SWAP | CHILD_OP_DISPLAY_TRANSACTION2 | CHILD_OP_DISPLAY_TRANSACTION3) => {
             note_display_txn_payload(state, channel_id, packet);
             let Some(mapping) = present_surface_id(opcode, &packet.payload) else {
                 crate::observe::fail(format!(
@@ -2950,15 +3523,76 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 return ChildPacketDisposition::Deferred;
             }
         }
-        CHILD_OP_PRESENT_FRAME => {
-            // PVG: CmdDeleteObject on some maps; arm misread as present. Never
-            // paint. x86 present is op6/7 on display channel.
-            let _ = packet;
+        // `CmdDeleteObject`, the guest retiring one serializer-allocated object.
+        // This device decodes the record and declines it — and this is *not* the
+        // arm that retires an entry from the object table, which is
+        // `CHILD_OP_DELETE_RESOURCE` two slots down. The two look alike and name
+        // different namespaces; `apply_delete_object`'s doc has the boot that
+        // measured the difference.
+        //
+        // This arm used to be a silent no-op named for a present, on a reading
+        // that had it painting frames. It never painted and it never spoke, so a
+        // real teardown command was arriving and being dropped without a line.
+        CHILD_OP_DELETE_OBJECT => {
+            // The payload is `{u32 task}` then a self-describing record whose
+            // own byte length sits at offset 8. Both bounds are checked before
+            // declining, so a corrupt packet is reported as corrupt rather than
+            // as a command this device merely has not implemented — those are
+            // different problems and only one of them is closed by writing a
+            // handler.
+            let plen = packet.payload.len();
+            if !packet_short("delete_object", Some(channel_id), plen, 12) {
+                let record_len = ld32(&packet.payload[8..]) as usize;
+                // The record starts one word in, so it is `record_len + 4` that
+                // has to fit. Saturating, because the guest's length is an
+                // arbitrary `u32` and the sum is what overflows.
+                if !packet_short(
+                    "delete_object_record",
+                    Some(channel_id),
+                    plen,
+                    record_len.saturating_add(4),
+                ) {
+                    apply_delete_object(state, channel_id, &packet.payload, packet);
+                }
+            }
+        }
+        // `CmdDebug`, a host-side trace marker. Nothing is owed to the guest, but
+        // the payload is what the guest wanted recorded, so the record echoes it
+        // rather than swallowing the command.
+        CHILD_OP_DEBUG => {
+            note_unimplemented(state, channel_id, UnimplementedCommand::Debug, packet);
+        }
+        // The display-state pair. Both carry a payload floor of 8 bytes, and
+        // neither moves anything in this device's display model: sleep state is
+        // not tracked and no display property is applied. A guest that sleeps a
+        // panel and finds it still lit is looking at this arm.
+        CHILD_OP_DISPLAY_SLEEP_STATE => {
+            note_unimplemented(
+                state,
+                channel_id,
+                UnimplementedCommand::DisplaySleepState,
+                packet,
+            );
+        }
+        CHILD_OP_DISPLAY_SET_PROPERTIES => {
+            note_unimplemented(
+                state,
+                channel_id,
+                UnimplementedCommand::DisplaySetProperties,
+                packet,
+            );
+        }
+        // `CmdDelay`: the guest asking the channel to be held before the next
+        // command runs. This device continues immediately. That reorders nothing
+        // — the stamps still retire in submission order — but a guest that used
+        // the delay to let something settle does not get it.
+        CHILD_OP_DELAY => {
+            note_unimplemented(state, channel_id, UnimplementedCommand::Delay, packet);
         }
         // PVG / Monterey: 0x3b = CmdGetComputeInfo (query). Must write reply
         // before stamp or createComputePipeline stalls (texture-ref 29-06-26).
-        // `CHILD_OP_PRESENT_FRAME_FLUSH` is the recovered legacy name for the
-        // same wire opcode.
+        // `present-frame-flush` is the recovered legacy name for the same wire
+        // opcode, and it is wrong.
         CHILD_OP_GET_COMPUTE_INFO => {
             if packet.payload.len() >= 24 {
                 let _ = reply_compute_info(state, host, &packet.payload);
@@ -3048,7 +3682,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 }
             }
         }
-        CHILD_OP_CONFIG_40 => {
+        CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN => {
             let _ = reply_heap_texture_size_and_align(state, host, &packet.payload);
         }
         // The one packet that says a cached page list has gone stale, and the
@@ -3109,335 +3743,111 @@ fn process_child_packet<H: HostMemory + HostOps>(
         // None of them writes a page the guest did not ask for. That restraint
         // is the recurring finding here, stated at each branch: what looks like
         // a missing implementation is usually the device declining to invent.
-        CHILD_OP_UNMAP_MEMORY
-        | CHILD_OP_MAP_MEMORY2
-        | CHILD_OP_INVALIDATE_RESOURCES
-        | CHILD_OP_SYNCHRONIZE_RESOURCES
-        | CHILD_OP_DELETE_IOSURFACE_BACKING2 => {
-            // Every branch below stamps the packet complete whatever it did with
-            // it: the guest is waiting on the stamp, and a lifecycle event this
-            // device chose not to act on is still an event the guest performed.
-            //
-            // Live MapMemory2 plen=20 layout lead (not yet contract-final):
-            //   task_id@0 u32, gva@4 u64, length@12 u64  (matches fifo MapMemoryCommand).
-            let plen = packet.payload.len();
-            let name = match packet.opcode {
-                CHILD_OP_MAP_MEMORY2 => "MapMemory2",
-                CHILD_OP_UNMAP_MEMORY => "UnmapMemory",
-                CHILD_OP_INVALIDATE_RESOURCES => "InvalidateResources",
-                CHILD_OP_SYNCHRONIZE_RESOURCES => "SynchronizeResources",
-                CHILD_OP_DELETE_IOSURFACE_BACKING2 => "DeleteIOSurfaceBacking2",
-                _ => "map_family",
-            };
-            if matches!(packet.opcode, CHILD_OP_MAP_MEMORY2 | CHILD_OP_UNMAP_MEMORY) && plen >= 20 {
-                let task_id = crate::contract::endian::ld32(&packet.payload[0..]);
-                let gva = crate::contract::endian::ld64(&packet.payload[4..]);
-                let length = crate::contract::endian::ld64(&packet.payload[12..]);
-                // Verbose-gated walk probe at map/unmap time. This runs a full
-                // guest page-table walk (`diagnose_gva_walk`) purely to build the
-                // log string, and fired ~9k times/boot on the drain path — a flood
-                // and a real per-map cost. Gate it (and the periodic census) behind
-                // `REIMS_VGPU_DRAW_LOG=1` so a normal boot pays neither; the functional
-                // view-retire below stays always-on. Wire has no PPNs — the probe
-                // asks whether the guest PT is already walkable under wire task_id.
-                if crate::observe::draw_log_enabled() {
-                    let walk = crate::runtime::gva_mem::diagnose_gva_walk(
-                        host,
-                        &state.tasks,
-                        task_id,
-                        gva,
-                        state.page_shift,
-                    );
-                    crate::observe::line(format!(
-                        "map_probe op={name} ch={channel_id} task={task_id} gva={gva:#x} len={length:#x} page_shift={} {walk}",
-                        state.page_shift
-                    ));
-                    // Periodic active-task census (every 32 map/unmap) for boot overview.
-                    state.map_family_events = state.map_family_events.saturating_add(1);
-                    if state.map_family_events == 1 || state.map_family_events.is_multiple_of(32) {
-                        let census = crate::runtime::gva_mem::format_active_tasks(&state.tasks);
-                        crate::observe::line(format!(
-                            "map_census n={} last_op={name} task={task_id} {census}",
-                            state.map_family_events
-                        ));
-                    }
+        CHILD_OP_UNMAP_MEMORY => {
+            apply_map_family(state, host, channel_id, packet, MapFamily::UnmapMemory);
+        }
+        CHILD_OP_MAP_MEMORY2 => {
+            apply_map_family(state, host, channel_id, packet, MapFamily::MapMemory2);
+        }
+        CHILD_OP_INVALIDATE_RESOURCES => {
+            apply_map_family(state, host, channel_id, packet, MapFamily::InvalidateResources);
+        }
+        CHILD_OP_SYNCHRONIZE_RESOURCES => {
+            apply_map_family(state, host, channel_id, packet, MapFamily::SynchronizeResources);
+        }
+        CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES => {
+            apply_map_family(
+                state,
+                host,
+                channel_id,
+                packet,
+                MapFamily::SynchronizeAndDiscardResources,
+            );
+        }
+        CHILD_OP_DELETE_IOSURFACE_BACKING2 => {
+            apply_map_family(
+                state,
+                host,
+                channel_id,
+                packet,
+                MapFamily::DeleteIOSurfaceBacking2,
+            );
+        }
+        // `CmdDiscardResources`: the discard half of `0x3e` on its own, with the
+        // same payload contract, and nothing owed to the guest — a discard this
+        // device ignores costs memory and never correctness.
+        //
+        // The payload is still decoded, with `0x35`'s decoder because the host
+        // validates all three with the same check. A malformed one is worth a
+        // line even though a well-formed one would have been ignored: it says
+        // the guest and this device disagree about the record layout, which the
+        // two commands that *do* act on it share.
+        CHILD_OP_DISCARD_RESOURCES => {
+            use crate::runtime::decode::fifo::decode_synchronize_resources;
+            match decode_synchronize_resources(&packet.payload) {
+                Ok(_) => note_unimplemented(
+                    state,
+                    channel_id,
+                    UnimplementedCommand::DiscardResources,
+                    packet,
+                ),
+                Err(e) => {
+                    note_resource_list_decode_fail("DiscardResources", packet.opcode, channel_id, e)
                 }
-                // RE (AppleParavirtMemoryMap): Unmap/Map only mutate the **task
-                // page table** then notify — wire has no PPNs. Guest order is
-                // deallocate/allocate **then** FIFO, so:
-                // - Unmap notify: PTEs already gone → cannot GVA-write; retain
-                //   host_gva_surfaces for sample (wallpaper wipe class).
-                // - Map notify: PTEs already live → flush host_gva encode into
-                //   **new** PFNs (not invent PTEs; not invent geom). Discrete
-                //   type-2/3 content may live only in host_cache until this.
-                // Samples still prefer host_cache GVA key on Load.
-                //
-                // HostOps **views** (gva_host_views) are the opposite of encode
-                // cache: they alias the pages that were in the GPU PT. On Unmap
-                // those pages are no longer mapped for the GPU — drop any host
-                // view covering the range (Apple unmapMemory analogue). On Map
-                // the PFNs may have changed under the same GVA — drop stale
-                // views so the next ensure_gva_view re-walks. Does not invent
-                // PTEs and does not destroy host_gva_surfaces content.
-                if gva != 0 && length != 0 {
-                    // Held bind resolutions over this range name pages the guest
-                    // has just remapped. Retired by range, which is exactly what
-                    // this notify carries.
-                    note_bb_retired(
-                        "bb_retire_map_range",
-                        state.retire_bound_buffers_in_range(task_id, gva, length),
-                    );
-                    let n = crate::runtime::gva_view::retire_gva_views_overlapping(
-                        state, task_id, gva, length,
-                    );
-                    let op = if packet.opcode == CHILD_OP_UNMAP_MEMORY {
-                        "unmap_memory"
-                    } else {
-                        "map_memory2"
-                    };
-                    crate::runtime::gva_view::log_retire(op, task_id, gva, length, n);
-                }
-                // Deferred GVA render-Store windows overlapping the notified
-                // VA range land **cache-only**: on Unmap the PTEs are already
-                // gone; on Map the PFNs are fresh and the map-notify guest
-                // flush is forbidden (PTE-corruption class). The encode cache
-                // preserves the content for samples (wallpaper-retain).
-                // There is deliberately no host_cache→guest GVA flush on
-                // MapMemory2. One existed and was disabled after
-                // serial-20260714-035023: PTE Corruption (freelist-shaped
-                // 0xff100000ff000000) ~135s into boot while it was writing —
-                // one Map of len=0x1c3e000 alone drove 13 GVA rewrites. Samples
-                // use the `host_gva_surfaces` retain on Unmap instead. Any
-                // re-introduction has to be a *narrower* policy than that one
-                // (exact-base only, no multi-key heap maps) and RE-justified, so
-                // the broad implementation is not kept around to be switched
-                // back on. See kb map-memory2 / xnu-pte-corruption-windowserver.
-            } else if packet.opcode == CHILD_OP_DELETE_IOSURFACE_BACKING2 && plen >= 8 {
-                // The live Ventura payload agrees with the resource contract:
-                // `{objectID, taskID}`. This is the lifetime
-                // boundary for the host IOSurface backing, not stamp-only
-                // bookkeeping. Keeping page_entries after it lets later id
-                // reuse/clear write pixels into pages the guest has recycled.
-                let object_id = crate::contract::endian::ld32(&packet.payload[0..]);
-                let task_id = crate::contract::endian::ld32(&packet.payload[4..]);
-                // Never write guest pages here — the delete trails the guest's
-                // CPU-side release asynchronously and the pages may already be
-                // recycled (boot-16 PTE-corruption panic: a 14.7 MB delete-time
-                // flush landed pixel bytes in a PTE page). But the id itself
-                // may ALSO already be re-used by a live surface whose paint is
-                // still deferred (~20 ms recycle under scroll — black-band
-                // class), so content state must survive until the next page
-                // resolve proves which incarnation this delete was for
-                // (fingerprint compare in mapper::resolve). A second delete
-                // with no resolve between is genuinely dead: tear down fully.
-                let mode = if state.mapping_backing_condemned(object_id) {
-                    let _ = state.unmap_surface(object_id);
-                    "dead"
-                } else if state.condemn_surface_backing(object_id) {
-                    "condemn"
-                } else {
-                    // No resolved pages ⇒ nothing a stale delete could hurt.
-                    let _ = state.unmap_surface(object_id);
-                    "unmapped"
-                };
-                crate::runtime::mapper::flush_retired_views(state, host);
-                if crate::observe::draw_log_enabled() {
-                    crate::observe::line(format!(
-                        "map_family op=DeleteIOSurfaceBacking2 ch={channel_id} object={object_id} task={task_id} plen={plen} mode={mode}"
-                    ));
-                }
-            } else if packet.opcode == CHILD_OP_INVALIDATE_RESOURCES {
-                // RE: {task_id, count} + count×{object_id, 4×u8 validity ops}.
-                // Ops (PVG host layout): clr_host, set_host, clr_guest, set_guest.
-                // Pageon hardcodes LE 01 00 00 01 = clr hostValid + set guestValid.
-                //
-                // The same four bytes the EXEC_INDIRECT2 resource table carries,
-                // through the same consumer: this producer's records are 8 bytes
-                // and that one's are 24, but the quad is one contract and must
-                // not acquire two meanings.
-                use crate::runtime::decode::fifo::{
-                    decode_invalidate_resources, CHILD_INVALIDATE_PAGEON_FLAGS,
-                };
-                use crate::runtime::resource_validity::{apply, ValiditySite};
-                match decode_invalidate_resources(&packet.payload) {
-                    Ok(cmd) => {
-                        let mut bumped = 0u32;
-                        let mut miss = 0u32;
-                        for rec in &cmd.records {
-                            let outcome = apply(
-                                state,
-                                cmd.task_id,
-                                rec.object_id,
-                                rec.ops,
-                                ValiditySite::InvalidateResources,
-                            );
-                            bumped = bumped.saturating_add(outcome.bumped);
-                            if outcome.missed {
-                                miss = miss.saturating_add(1);
-                            }
-                        }
-                        // One counter here, two on the exec side: `pageBacking`
-                        // names mapping ids, so a record this device holds no
-                        // mapping for is already the surprising case. The exec
-                        // table names task object refs, most of which have no
-                        // surface state by construction.
-                        note_store_route_n("validity_miss_inv", miss as u64);
-                        let rec0 = cmd.records.first();
-                        let oid = rec0.map(|r| r.object_id).unwrap_or(0);
-                        let flags = rec0.map(|r| r.flags).unwrap_or(0);
-                        let ops = rec0.map(|r| r.ops).unwrap_or_default();
-                        let pageon = flags == CHILD_INVALIDATE_PAGEON_FLAGS;
-                        // ~11k/boot of routine guest cache-coherence ops. The
-                        // always-on rate is the `validity_*` family in the
-                        // per-second `store_routes` line; gate the per-op decode
-                        // detail so it does not bury the curated fail view. The
-                        // `decode_fail` and `inv_multi` paths below stay
-                        // fail-visible, and the guard also skips the format alloc
-                        // on a healthy boot.
-                        if crate::observe::draw_log_enabled() {
-                            crate::observe::line(format!(
-                            "map_family op=InvalidateResources opcode={:#x} ch={channel_id} plen={plen} task={} count={} oid={oid:#x} flags={flags:#x} clr_h={} set_h={} clr_g={} set_g={} pageon={pageon} bumped={bumped} miss={miss}",
-                            packet.opcode,
-                            cmd.task_id,
-                            cmd.count,
-                            ops.clear_host_valid,
-                            ops.set_host_valid,
-                            ops.clear_guest_valid,
-                            ops.set_guest_valid
-                        ));
-                        }
-                        if cmd.count > 1 {
-                            let ids: Vec<String> = cmd
-                                .records
-                                .iter()
-                                .map(|r| {
-                                    format!(
-                                        "{:#x}:clr_h={}/set_g={}",
-                                        r.object_id, r.ops.clear_host_valid, r.ops.set_guest_valid
-                                    )
-                                })
-                                .collect();
-                            crate::observe::fail(format!(
-                                "inv_multi ch={channel_id} task={} n={} recs=[{}]",
-                                cmd.task_id,
-                                cmd.count,
-                                ids.join(",")
-                            ));
-                        }
-                    }
-                    // A refused Invalidate leaves this device serving
-                    // host-cached pixels for a resource the guest has just
-                    // CPU-written, so the line has to say which check refused
-                    // and not only that one did.
-                    Err(e) => note_resource_list_decode_fail(
-                        "InvalidateResources",
-                        packet.opcode,
-                        channel_id,
-                        e,
-                    ),
-                }
-            } else if packet.opcode == CHILD_OP_SYNCHRONIZE_RESOURCES {
-                // RE synchronizeForUnwire → FIFO 0x35: {task,count}+{oid} only.
-                // Guest contract is finish host GPU use before pageoff — not
-                // "host invents pixels into guest pages." Discrete host_cache→
-                // guest write was product invent (pre-change successful boots
-                // were stamp-only). Keep decode + wait_surface; no guest write.
-                use crate::runtime::decode::fifo::decode_synchronize_resources;
-                match decode_synchronize_resources(&packet.payload) {
-                    Ok(cmd) => {
-                        // The guest is about to CPU-read these resources
-                        // (pageoff/unwire): land every deferred writeback
-                        // (render/compute/linear-alias) into guest pages first
-                        // — the only host-visible choke point for guest CPU
-                        // reads (boot-25 black-wallpaper class).
-                        // The guest is about to CPU-read these mappings, so
-                        // every guest-page write this device submitted has to
-                        // have executed first.
-                        crate::runtime::render_writeback::settle_guest_writes(
-                            crate::runtime::render_writeback::SettleSite::ChildStamp,
-                        );
-                        let flushed = 0u32;
-                        let flush_ok = true;
-                        let oid = cmd.object_ids.first().copied().unwrap_or(0);
-                        // Count into the always-on teardown-churn proxy; the
-                        // per-event census floods to ~49k/session under a
-                        // continuously-animating app, so it moves behind
-                        // REIMS_VGPU_DRAW_LOG below.
-                        // A deferred guest-read flush that did NOT land right
-                        // before the guest CPU-reads these pages is a genuine
-                        // black/stale-content drop — previously buried in the
-                        // off() census (invisible in the curated fail view).
-                        // Promote it to a reason-slugged fail line.
-                        if !flush_ok {
-                            crate::observe::fail(format!(
-                                "map_family op=SynchronizeResources reason=guest_read_flush_incomplete ch={channel_id} task={} oid={oid:#x} deferred_flushed={flushed}",
-                                cmd.task_id
-                            ));
-                        }
-                        if crate::observe::draw_log_enabled() {
-                            crate::observe::line(format!(
-                                "map_family op=SynchronizeResources opcode={:#x} ch={channel_id} plen={plen} task={} count={} oid={oid:#x} deferred_flushed={flushed} flush_ok={flush_ok}",
-                                packet.opcode, cmd.task_id, cmd.count
-                            ));
-                        }
-                        if cmd.count > 1 {
-                            let ids: Vec<String> =
-                                cmd.object_ids.iter().map(|id| format!("{id:#x}")).collect();
-                            crate::observe::fail(format!(
-                                "sync_multi ch={channel_id} task={} n={} oids=[{}]",
-                                cmd.task_id,
-                                cmd.count,
-                                ids.join(",")
-                            ));
-                        }
-                    }
-                    // A refused Synchronize lets the guest CPU-read pages whose
-                    // deferred writeback never landed — the class the accepting
-                    // arm above still names "boot-25 black-wallpaper".
-                    Err(e) => note_resource_list_decode_fail(
-                        "SynchronizeResources",
-                        packet.opcode,
-                        channel_id,
-                        e,
-                    ),
-                }
-            } else {
-                let w0 = if plen >= 4 {
-                    crate::contract::endian::ld32(&packet.payload[0..])
-                } else {
-                    0
-                };
-                let w1 = if plen >= 8 {
-                    crate::contract::endian::ld32(&packet.payload[4..])
-                } else {
-                    0
-                };
-                crate::observe::off(format!(
-                    "map_family op={name} opcode={:#x} ch={channel_id} plen={plen} w0={w0:#x} w1={w1:#x}",
-                    packet.opcode
-                ));
             }
         }
-        // A fence with no payload. The guest emits it from a present's failure
-        // and teardown legs to order work it is abandoning, and retiring its
-        // stamps — which the drain does for every accepted packet — is the whole
-        // contract. Named so it stops being reported as an unknown opcode.
-        CHILD_OP_FLUSH_CHANNEL_EVENT => {
-            crate::runtime::drain::note_store_route("child_flush_channel_event");
+        // `CmdNOP`, a fence with no payload. The guest emits it from a present's
+        // failure and teardown legs to order work it is abandoning, and retiring
+        // its stamps — which the drain does for every accepted packet — is the
+        // whole contract. Named so it stops being reported as an unknown opcode.
+        //
+        // The route is keyed on the command, not on that use. Naming it for the
+        // channel flush the display pipe happens to want is how the constant
+        // itself came to be misnamed, and it leaves a reader grepping the log
+        // for the command with nothing under it.
+        CHILD_OP_NOP => {
+            crate::runtime::drain::note_store_route("child_nop");
             // The command allocates no bytes, so payload is the one thing that
             // can falsify this reading. Bytes here would mean the command grew a
             // form this arm does not decode, and dropping them silently is what
             // the unknown-opcode arm was at least loud about.
             if !packet.payload.is_empty() {
+                crate::observe::Emit::decline(
+                    "child_nop",
+                    &NopCarriedPayload {
+                        channel: channel_id,
+                        plen: packet.payload.len(),
+                    },
+                )
+                .fail();
+            }
+        }
+        // The reference host's retired slots. Its shared handler accepts the
+        // packet, does nothing with the payload and retires the stamps, which is
+        // exactly what this arm does — so matching them is fidelity, and the
+        // record exists only to say a guest is still emitting one.
+        op if is_deprecated_child_opcode(op) => {
+            note_unimplemented(state, channel_id, UnimplementedCommand::Deprecated, packet);
+        }
+        // Everything left is an opcode with no handler at all. Two different
+        // things end up here and the record has to keep them apart: an opcode
+        // inside `CHILD_OP_MAX` is an unassigned slot — a guest asking for a
+        // command this host generation does not have — while one above it is a
+        // value the reference host refuses before it ever reaches a table, so a
+        // packet carrying it is a corrupt header or a desynced ring and not a
+        // missing feature.
+        _ => {
+            if packet.opcode > CHILD_OP_MAX {
                 crate::observe::fail(format!(
-                    "child_flush_channel_event fail reason=unexpected_payload ch={channel_id} \
-                     plen={} (this command carries stamps only; a payload means it has grown \
-                     a form this arm does not decode)",
+                    "child_opcode_out_of_range ch={channel_id} opcode={:#x} max={CHILD_OP_MAX:#x} \
+                     total_size={} stamps={} plen={} (above the dispatch ceiling: this is a \
+                     malformed header or a desynced ring, not an unimplemented command)",
+                    packet.opcode,
+                    packet.total_size,
+                    packet.stamp_count(),
                     packet.payload.len()
                 ));
             }
-        }
-        _ => {
             state.record_fail(FailEvent::UnknownChildOpcode {
                 channel: channel_id,
                 opcode: packet.opcode,
@@ -3448,6 +3858,42 @@ fn process_child_packet<H: HostMemory + HostOps>(
         }
     }
     ChildPacketDisposition::Complete
+}
+
+/// Record a command this device names but does not execute.
+///
+/// One call site per command, and one place the record is built: the fields are
+/// the packet's, so a second spelling would be a second chance to report the
+/// wrong opcode beside the right command name.
+///
+/// **A line once per opcode, and a count every window.** These are not rare
+/// events — `CmdDeleteObject` arrives from the guest's shared-object allocator
+/// mid-composite, so an unlatched line per packet would be a per-frame flood in
+/// the always-on log, and a flood is how a real refusal stops being read. The
+/// latch costs the rate, which is why the route counter goes up first: the
+/// emitter dedupes and the counter does not, and the two answer different
+/// questions.
+fn note_unimplemented(
+    state: &mut DeviceState,
+    channel_id: u32,
+    command: UnimplementedCommand,
+    packet: &Packet,
+) {
+    // Keyed by the command's own slug, so the counter and the `reason=` a reader
+    // greps for are one string rather than two that can drift apart.
+    note_store_route(command.slug());
+    let ev = FailEvent::UnimplementedChildCommand {
+        channel: channel_id,
+        command,
+        opcode: packet.opcode,
+        total_size: packet.total_size,
+        stamp_count: packet.stamp_count(),
+        payload: packet.payload.clone(),
+    };
+    // Per opcode and not per command: the deprecated set is fifteen numbers
+    // behind one command name, and which of them a guest is still emitting is
+    // the whole content of the record.
+    state.record_fail_once(ev, u64::from(packet.opcode));
 }
 
 /// Drain one child channel.
@@ -3588,7 +4034,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
         let peek_opcode = ld16(&header[PACKET_OPCODE..]);
         if matches!(
             peek_opcode,
-            CHILD_OP_DISPLAY_SWAP | CHILD_OP_PRESENT_X86 | CHILD_OP_PRESENT_GAMMA_X86
+            CHILD_OP_DISPLAY_SWAP | CHILD_OP_DISPLAY_TRANSACTION2 | CHILD_OP_DISPLAY_TRANSACTION3
         ) && state.present.unpainted_presents >= MAX_UNPAINTED_PRESENTS
         {
             note_present_backpressure_hold(state, channel_id, head, tail);

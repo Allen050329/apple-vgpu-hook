@@ -1468,6 +1468,111 @@ fn compact_render_pipeline_funcs() {
     assert_eq!(p.object_id, 9);
 }
 
+/// A pipeline that renders through a depth-stencil buffer declares the two
+/// attachment formats it is compiled against, and one asking for multisampling
+/// declares its sample count. All three decode; none of them refuses the
+/// pipeline.
+///
+/// The regression this pins is a whole application's canvas. While `0x04`, `0x09`
+/// and `0x0a` were unidentified, `note_pipeline_tlv_fields` refused every
+/// descriptor carrying one — so a map view, whose pipelines carry the depth and
+/// stencil formats that a desktop compositor's do not, lost every pipeline it
+/// built and fell through to the clear-only path, painting a flat rectangle
+/// inside a window whose chrome composited normally.
+#[test]
+fn a_depth_stencil_pipeline_with_a_sample_count_decodes() {
+    let mut b = vec![0u8; 16 + 1 + 5 * 6];
+    let blen = b.len() as u32;
+    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[4..], blen);
+    st32(&mut b[8..], 20);
+    // Written in the order the guest's serializer emits them: the descriptor's
+    // own properties first, the two function refs last.
+    b[16] = 5;
+    let mut p = 17;
+    for (tag, value) in [
+        (PIPELINE_TAG_RASTER_SAMPLE_COUNT, 4u32),
+        (PIPELINE_TAG_DEPTH_ATTACH_FORMAT, 252),
+        (PIPELINE_TAG_STENCIL_ATTACH_FORMAT, 253),
+        (PIPELINE_TAG_VERTEX_FUNC, 7),
+        (PIPELINE_TAG_FRAGMENT_FUNC, 8),
+    ] {
+        b[p] = tag;
+        b[p + 1] = 4;
+        st32(&mut b[p + 2..], value);
+        p += 6;
+    }
+
+    let d = decode_render_pipeline_descriptor(&b)
+        .expect("a depth-stencil pipeline is decoded, not refused");
+    assert_eq!(d.vertex_func_ref, 7);
+    assert_eq!(d.fragment_func_ref, 8);
+    assert_eq!(
+        d.raster_sample_count, 4,
+        "the guest's requested sample count is read rather than defaulted"
+    );
+}
+
+/// A sample count this device has no attachments for is a named degradation and
+/// not a refusal: the draw still runs, at one sample.
+///
+/// Absence and an explicit single sample are one answer, so neither reports.
+#[test]
+fn an_unrasterizable_sample_count_degrades_rather_than_refusing() {
+    let pipeline = |count: u32| {
+        let mut b = vec![0u8; 16 + 1 + 6];
+        let blen = b.len() as u32;
+        st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+        st32(&mut b[4..], blen);
+        st32(&mut b[8..], 21);
+        b[16] = 1;
+        b[17] = PIPELINE_TAG_VERTEX_FUNC;
+        b[18] = 4;
+        st32(&mut b[19..], 3);
+        if count != 0 {
+            b[16] = 2;
+            b.extend_from_slice(&[PIPELINE_TAG_RASTER_SAMPLE_COUNT, 4, 0, 0, 0, 0]);
+            let blen = b.len() as u32;
+            st32(&mut b[4..], blen);
+            let end = b.len() - 4;
+            st32(&mut b[end..], count);
+        }
+        b
+    };
+
+    // A count no attachment path here can meet: reported, and the descriptor
+    // still decodes so the geometry is kept.
+    let cap = crate::observe::FailCapture::start();
+    let d = decode_render_pipeline_descriptor(&pipeline(8)).expect("decodes");
+    assert_eq!(d.raster_sample_count, 8);
+    let lines = cap.lines();
+    let degraded: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("reason=pipeline_raster_sample_count_degraded"))
+        .collect();
+    assert_eq!(degraded.len(), 1, "one line per distinct count: {lines:?}");
+    assert!(
+        degraded[0].contains("count=8") && degraded[0].contains("built_at=1"),
+        "the line names what was asked for and what was built: {}",
+        degraded[0]
+    );
+
+    // Neither an absent property nor an explicit single sample is a loss.
+    let cap2 = crate::observe::FailCapture::resume();
+    for count in [0, 1] {
+        let d = decode_render_pipeline_descriptor(&pipeline(count)).expect("decodes");
+        assert!(d.raster_sample_count <= 1);
+    }
+    assert!(
+        !cap2
+            .lines()
+            .iter()
+            .any(|l| l.contains("pipeline_raster_sample_count_degraded")),
+        "single-sampling is what this device does: {:?}",
+        cap2.lines()
+    );
+}
+
 /// A property the guest set on a pipeline descriptor that this decoder neither
 /// reads nor has identified **refuses the pipeline**, and the shape line beside
 /// it is what makes a boot with no such tag readable as a measurement rather

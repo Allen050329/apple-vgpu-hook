@@ -26,7 +26,10 @@ struct PreparedStorageImage {
     len: usize,
     width: u32,
     height: u32,
-    initial_layout: vk::ImageLayout,
+    /// What last touched the image this slot holds, before this dispatch —
+    /// [`super::pools::ResidentAccess::Untouched`] for a freshly acquired pooled
+    /// slot, and whatever the compute-storage registry recorded for a resident.
+    initial_access: super::pools::ResidentAccess,
     residency: Option<ComputeStorageResidency>,
 }
 
@@ -36,8 +39,8 @@ struct PreparedSampledImage {
     binding: u32,
     img: StorageImageSlot,
     upload: Option<BufferSlot>,
-    /// Copy-on-sample source `(resident image, its current layout)`.
-    resident_src: Option<(vk::Image, vk::ImageLayout)>,
+    /// Copy-on-sample source `(resident image, what last touched it)`.
+    resident_src: Option<(vk::Image, super::pools::ResidentAccess)>,
     width: u32,
     height: u32,
 }
@@ -316,7 +319,7 @@ pub(crate) unsafe fn execute_compute_inner(
             // The caller skipped the guest read; the placeholder bytes must
             // never reach the GPU. Every mismatch names the check that
             // refused.
-            let Some((src_image, src_key, generation, src_layout)) =
+            let Some((src_image, src_key, generation, src_access)) =
                 pools.compute_resident_snapshot(&bind.identity)
             else {
                 return Err(DrawError::ComputeExecution(
@@ -342,7 +345,7 @@ pub(crate) unsafe fn execute_compute_inner(
             // a shape loss the runtime cannot have produced.
             resident_sample_exact(resource, bind, src_key)?;
             counters.note_compute_sampled_resident_copy(resource.bytes.len() as u64);
-            (None, Some((src_image, src_layout)))
+            (None, Some((src_image, src_access)))
         } else {
             let st = pools.acquire_staging(
                 ctx,
@@ -379,7 +382,7 @@ pub(crate) unsafe fn execute_compute_inner(
             format: resource.format,
             sampled_only: false,
         };
-        let (img, initial_layout, generation_match) = if let Some(residency) = resource.residency {
+        let (img, initial_access, generation_match) = if let Some(residency) = resource.residency {
             let resident = pools.acquire_resident_storage_image(
                 ctx,
                 residency.identity,
@@ -387,11 +390,11 @@ pub(crate) unsafe fn execute_compute_inner(
                 residency.seed_generation,
                 counters,
             )?;
-            (resident.slot, resident.layout, resident.generation_match)
+            (resident.slot, resident.access, resident.generation_match)
         } else {
             (
                 pools.acquire_storage_image(ctx, key, counters)?,
-                vk::ImageLayout::UNDEFINED,
+                super::pools::ResidentAccess::Untouched,
                 false,
             )
         };
@@ -446,7 +449,7 @@ pub(crate) unsafe fn execute_compute_inner(
             len: resource.bytes.len(),
             width: resource.width,
             height: resource.height,
-            initial_layout,
+            initial_access,
             residency: resource.residency,
         });
     }
@@ -578,37 +581,16 @@ pub(crate) unsafe fn execute_compute_inner(
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &copy,
             );
-        } else if let Some((src_image, src_layout)) = prepared.resident_src {
+        } else if let Some((src_image, src_access)) = prepared.resident_src {
             // Copy-on-sample. The resident stays in its registry layout on
-            // exit so the storage-acquire's captured initial_layout (and the
+            // exit so the storage-acquire's captured initial_access (and the
             // storage pre-dispatch barrier, which syncs on TRANSFER when that
             // layout is TRANSFER_SRC_OPTIMAL) remains truthful.
-            // Unconditional, and the scope comes from `resident_read_source_scope`
-            // rather than from `src_layout`. A resident a draw just produced
-            // already sits in TRANSFER_SRC_OPTIMAL — that is the layout a render
-            // pass resolves its primary to — so gating on a transition being
-            // needed skipped the dependency on exactly the content worth
-            // copying. The old source mask compounded it: it named
-            // SHADER_WRITE | TRANSFER_WRITE but not COLOR_ATTACHMENT_WRITE, so
-            // even when it did fire it did not drain the draw that wrote the
-            // pixels this copy is about to read.
-            let (src_stage, src_access) = super::exec::resident_read_source_scope();
-            let to_src = [vk::ImageMemoryBarrier::default()
-                .src_access_mask(src_access)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .old_layout(src_layout)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .image(src_image)
-                .subresource_range(range)];
-            ctx.device.cmd_pipeline_barrier(
-                cb,
-                src_stage,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &to_src,
-            );
+            // Both halves — that the barrier is unconditional and that its scope
+            // names what last *touched* the image rather than where it sits —
+            // are `barrier_resident_for_transfer_read`'s to answer, and this
+            // site had each of them wrong once.
+            super::exec::barrier_resident_for_transfer_read(&ctx.device, cb, src_image, src_access);
             let copy = [vk::ImageCopy::default()
                 .src_subresource(super::color_subresource_layers())
                 .dst_subresource(super::color_subresource_layers())
@@ -625,7 +607,7 @@ pub(crate) unsafe fn execute_compute_inner(
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &copy,
             );
-            if src_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
+            if src_access.layout() != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
                 let restore = [vk::ImageMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::TRANSFER_READ)
                     .dst_access_mask(
@@ -635,7 +617,7 @@ pub(crate) unsafe fn execute_compute_inner(
                             | vk::AccessFlags::TRANSFER_WRITE,
                     )
                     .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                    .new_layout(src_layout)
+                    .new_layout(src_access.layout())
                     .image(src_image)
                     .subresource_range(range)];
                 ctx.device.cmd_pipeline_barrier(
@@ -672,25 +654,12 @@ pub(crate) unsafe fn execute_compute_inner(
     for prepared in &simg_slots {
         let img = &prepared.slot;
         let range = super::color_subresource_range();
-        let (src_stage, src_access) = match prepared.initial_layout {
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL => (
-                vk::PipelineStageFlags::TRANSFER,
-                vk::AccessFlags::TRANSFER_READ,
-            ),
-            vk::ImageLayout::GENERAL => (
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-            ),
-            _ => (
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::AccessFlags::empty(),
-            ),
-        };
+        let (src_stage, src_access) = prepared.initial_access.source_scope();
         if let Some(st) = &prepared.seed {
             let barrier = [vk::ImageMemoryBarrier::default()
                 .src_access_mask(src_access)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .old_layout(prepared.initial_layout)
+                .old_layout(prepared.initial_access.layout())
                 .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                 .image(img.image)
                 .subresource_range(range)];
@@ -721,7 +690,7 @@ pub(crate) unsafe fn execute_compute_inner(
         let old_layout = if prepared.seed.is_some() {
             vk::ImageLayout::TRANSFER_DST_OPTIMAL
         } else {
-            prepared.initial_layout
+            prepared.initial_access.layout()
         };
         let old_access = if prepared.seed.is_some() {
             vk::AccessFlags::TRANSFER_WRITE
@@ -933,11 +902,7 @@ pub(crate) unsafe fn execute_compute_inner(
 
     for prepared in &simg_slots {
         if let Some(residency) = prepared.residency {
-            pools.mark_resident_storage_image(
-                &residency.identity,
-                residency.output_generation,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            );
+            pools.mark_resident_storage_image(&residency.identity, residency.output_generation);
         }
     }
 

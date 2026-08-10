@@ -37,9 +37,9 @@ use super::vk_call::{VkCall, VkOp};
 /// be handed to the staging free list — where it would be reissued as scratch
 /// over the guest's live pages.
 #[derive(Clone, Copy)]
-struct BoundBuffer {
-    buffer: vk::Buffer,
-    offset: vk::DeviceSize,
+pub(super) struct BoundBuffer {
+    pub(super) buffer: vk::Buffer,
+    pub(super) offset: vk::DeviceSize,
 }
 
 impl From<BufferSlot> for BoundBuffer {
@@ -138,7 +138,6 @@ unsafe fn stage_buffer_content(
     content: &BufferContent,
     usage: vk::BufferUsageFlags,
     snapshot_volatile: bool,
-    slots_by_content: &mut std::collections::HashMap<(usize, u64), BoundBuffer>,
     gathers: &mut Vec<PendingGuestGather>,
 ) -> Result<BoundBuffer, DrawError> {
     let key = match content {
@@ -148,8 +147,9 @@ unsafe fn stage_buffer_content(
             src.total_len,
         ),
     };
-    if let Some(bound) = slots_by_content.get(&key) {
-        return Ok(*bound);
+    if let Some(bound) = pools.cb_bound_buffer(key) {
+        counters.note_buffer_bind_reused();
+        return Ok(bound);
     }
     let bound = match content {
         BufferContent::Bytes(b) => {
@@ -205,7 +205,7 @@ unsafe fn stage_buffer_content(
             }
         }
     };
-    slots_by_content.insert(key, bound);
+    pools.note_cb_bound_buffer(key, bound);
     Ok(bound)
 }
 
@@ -274,6 +274,41 @@ unsafe fn import_guest_buffer_window(
 /// three crossings against the CPU gather's one, so it would be *slower* than
 /// the path it replaces. Device-local makes it one crossing and leaves the
 /// draw's own reads in VRAM, which is where the win is.
+///
+/// # Caching this copy across submissions is measured shut
+///
+/// `stage_buffer_content` serves a repeat inside one command buffer from
+/// `cb_bound_buffers`, and `seal_entry` drops that map on every submission —
+/// 83 293 seals a boot, 290 747 entries discarded. Keeping the device-local
+/// buffer instead, keyed on the same `(runs allocation, total_len)`, looks like
+/// the largest saving available on a device whose ceiling is the ~7.9 GB/s it
+/// puts across PCIe, of which this rail is 2.74 GB/s.
+///
+/// It is not, and the two halves of the measurement are why. A census of key
+/// recurrence over a driven Safari-drag boot put **99.2 % of gathers and 99.3 %
+/// of gathered bytes** on a span this device had already copied, so the cache
+/// would be *asked* almost every time. A second census then folded the runs'
+/// bytes on a sampled subset of those repeats and compared each against the
+/// previous gather of the same span:
+///
+/// ```text
+/// gather_bytes_changed   5 504 samples   1 252 958 KB
+/// gather_bytes_same        695 samples     142 947 KB
+/// ```
+///
+/// **Only ~10 % of repeats are the same bytes.** The guest rewrites these spans
+/// between gathers — they are overwhelmingly per-draw constant buffers, which is
+/// what `try_buffer_zero_copy_resolved`'s width census independently found them
+/// to be. A perfect cache with exact invalidation would therefore serve about a
+/// tenth of 2.74 GB/s, some 274 MB/s of a 7.9 GB/s budget, in exchange for
+/// taking on invalidation this rail does not currently need at all: today the
+/// GPU reads guest RAM when the command buffer executes, so a guest CPU write
+/// between two draws is picked up with nothing having to notice it. A missed
+/// invalidation would be a wrong frame rather than a slow one.
+///
+/// The asymmetry is the finding. The recurrence number is enormous, the content
+/// number is small, and only the second one sizes the cache — a repeat count on
+/// its own would have justified building it.
 ///
 /// # Safety
 ///
@@ -486,13 +521,13 @@ enum PreparedSampled {
         identity: super::types::TargetIdentity,
         image: vk::Image,
         view: vk::ImageView,
-        old_layout: vk::ImageLayout,
+        access: super::pools::ResidentAccess,
     },
     Snapshot {
         binding: u32,
         identity: super::types::TargetIdentity,
         source_image: vk::Image,
-        source_old_layout: vk::ImageLayout,
+        source_access: super::pools::ResidentAccess,
         image: SampledSlot,
     },
 }
@@ -1302,6 +1337,127 @@ unsafe fn upload_buffer_to_sampled_image(
     );
 }
 
+/// The ten conditions that decide how a draw reaches the submission ring.
+///
+/// Two questions, one set of fields. `batch_eligible` asks whether this draw
+/// may leave its command buffer in recording state for a successor to append
+/// to; [`Self::refusal`] asks whether *this* draw may be that successor. The
+/// first seven terms answer both, and while they were two hand-written lists a
+/// `debug_assert` was the only thing keeping the shared prefix in step —
+/// which caught a divergence in debug builds and shipped it in release.
+/// Deriving `batch_eligible` from the fields the ladder reads removes the
+/// second spelling instead of checking it.
+///
+/// # Not a term: sampling the target it renders into
+///
+/// It was one, and it refused 29.7 % of all draws — the single largest reason
+/// a draw forced its own submission. The engine handles that case by copying
+/// the resident into a pooled image and binding the copy, and that copy is
+/// recorded into this draw's own command buffer between the previous draw's
+/// `cmd_end_render_pass` and this one's `cmd_begin_render_pass`. Inside an open
+/// batch it therefore captures the target as of this draw's position in the
+/// stream, which is exactly what the draw asked for. What the refusal was
+/// standing in for was the missing dependency in front of that copy; see
+/// [`barrier_resident_for_transfer_read`].
+///
+/// # Not a term: not loading from the target
+///
+/// The same shape, found the same way, and it refused a further 15 % of draws
+/// (16 576 on the boot that retired it). A draw that CLEARs rather than LOADs
+/// discards the attachment through `initialLayout = UNDEFINED`, so joining an
+/// open batch means recording a CLEAR pass after a pass that wrote the same
+/// image — legal, and something the batch already did in the other order.
+///
+/// What made it unsafe was that the clear path's own barrier derived its source
+/// scope from the target's tracked layout, and a resident a render pass just
+/// filled sits in `TRANSFER_SRC_OPTIMAL`. So the clear named a transfer read as
+/// what it was waiting for, while the thing it actually had to wait for was the
+/// previous draw's colour writes — nothing ordered them, and inside one command
+/// buffer with the producing draw a few commands back, that is the short-fuse
+/// version of the same undefined behaviour. `super::pools::ResidentAccess` now
+/// carries what last touched a resident separately from where it sits, so the
+/// clear waits on `COLOR_ATTACHMENT_OUTPUT`/`COLOR_ATTACHMENT_WRITE` and the
+/// term has nothing left to stand in for.
+///
+/// Nothing else consulted it: `BatchTarget` keys on identity and geometry and
+/// not on the load action, an open batch accumulates only per-draw descriptor
+/// sets and sampled admissions, and no completion stamp, epoch publish, pin or
+/// writeback branches on it.
+struct JoinTerms {
+    force_loss: bool,
+    quirk: bool,
+    is_mrt: bool,
+    has_depth: bool,
+    reads_back: bool,
+    has_query: bool,
+    no_identity: bool,
+    cpu_seed: bool,
+    gpu_seed: bool,
+    no_open_batch: bool,
+}
+
+/// What a [`JoinTerms`] rung is a statement about.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum JoinScope {
+    /// A property of this draw alone: it must not defer its submit at all, so
+    /// it may neither open a batch nor join one.
+    Draw,
+    /// A property of how this draw sits against an *already open* batch. It
+    /// says nothing about whether this draw may leave its own command buffer
+    /// recording afterwards, so it bars joining and not opening.
+    Fit,
+}
+
+/// One rung of [`JoinTerms::LADDER`]: the term, what it is a statement about,
+/// and the census name it carries when it is the first to refuse.
+type JoinRefusal = (fn(&JoinTerms) -> bool, JoinScope, &'static str);
+
+impl JoinTerms {
+    /// The refusals in ladder order.
+    ///
+    /// [`Self::batch_eligible`] is this same list filtered to [`JoinScope::Draw`]
+    /// rather than a second copy of its prefix. A rung therefore cannot reach
+    /// one question and miss the other, and cannot be mis-scoped by landing at
+    /// the wrong index — its scope is written beside it, not inferred from
+    /// where it sits.
+    const LADDER: [JoinRefusal; 10] = [
+        (|t| t.force_loss, JoinScope::Draw, "nojoin_force_loss"),
+        (|t| t.quirk, JoinScope::Draw, "nojoin_quirk"),
+        (|t| t.is_mrt, JoinScope::Draw, "nojoin_mrt"),
+        (|t| t.has_depth, JoinScope::Draw, "nojoin_depth"),
+        (|t| t.reads_back, JoinScope::Draw, "nojoin_reads_back"),
+        (|t| t.has_query, JoinScope::Draw, "nojoin_query"),
+        (|t| t.no_identity, JoinScope::Draw, "nojoin_no_identity"),
+        (|t| t.cpu_seed, JoinScope::Fit, "nojoin_cpu_seed"),
+        (|t| t.gpu_seed, JoinScope::Fit, "nojoin_gpu_seed"),
+        (|t| t.no_open_batch, JoinScope::Fit, "nojoin_no_open_batch"),
+    ];
+
+    /// Whether this draw may defer its submit and leave its command buffer
+    /// recording for a successor.
+    fn batch_eligible(&self) -> bool {
+        !Self::LADDER
+            .iter()
+            .any(|(refuses, scope, _)| *scope == JoinScope::Draw && refuses(self))
+    }
+
+    /// Why this draw does not append to the open batch, named by its first
+    /// refusing term, or `None` when it does.
+    ///
+    /// A joiner records into a command buffer an earlier draw left open, so
+    /// everything that bars opening must bar joining. Nothing asserts that:
+    /// this walks every rung and [`Self::batch_eligible`] walks a subset of the
+    /// same rungs, so a `None` here cannot coexist with a refusing
+    /// [`JoinScope::Draw`] rung. The `debug_assert` that used to police two
+    /// hand-written lists is gone with the second list.
+    fn refusal(&self) -> Option<&'static str> {
+        Self::LADDER
+            .iter()
+            .find(|(refuses, _, _)| refuses(self))
+            .map(|(_, _, name)| *name)
+    }
+}
+
 fn draw_has_no_invocations(req: &DrawRequest) -> bool {
     let element_count = req
         .indexed
@@ -1309,6 +1465,132 @@ fn draw_has_no_invocations(req: &DrawRequest) -> bool {
         .map(|i| i.index_count)
         .unwrap_or(req.vertex_count);
     element_count == 0 || req.instance_count == Some(0)
+}
+
+/// A depth image a single draw allocated for itself and must destroy after
+/// submit, because the pass named no guest texture to hold it under.
+///
+/// The registry-resident rail has no equivalent and wants none: its image is
+/// owned by the guest's texture, and a handle to dispose is exactly what must
+/// not exist for it.
+type OwnedDepthImage = (vk::Image, vk::DeviceMemory, vk::ImageView);
+
+/// This draw's depth attachment view, and the image behind it *only if this
+/// draw owns it*.
+///
+/// Two rails, and which one runs is decided by the guest rather than by this
+/// device:
+///
+/// * The pass descriptor bound a depth texture, so the buffer has a guest
+///   identity and a guest lifetime. It resolves to one registry resident per
+///   guest texture, created on first use and reclaimed by age like every other
+///   resident. Nothing is returned to dispose — the resident outlives the draw,
+///   which is the whole point.
+/// * The pass bound none, and there is no key to hold a resident under. A
+///   private buffer is allocated for this draw and handed back for disposal.
+///   `vk_alloc_sites transient_depth` is that rail's count and it is expected to
+///   be near zero; `depth_resident` is the other's.
+///
+/// The framebuffer is this draw's either way and is not this function's to make:
+/// it binds one specific `render_pass` alongside the colour view, and only the
+/// caller knows which.
+struct AcquiredDepth {
+    view: vk::ImageView,
+    /// Set only on the transient rail — the resident rail's image belongs to the
+    /// registry and must not be disposed with the draw.
+    owned: Option<OwnedDepthImage>,
+    /// The identity to mark once the pass has stored into it, so the *next*
+    /// pass's LOAD has something to load. `None` on the transient rail, whose
+    /// buffer is gone by then.
+    identity: Option<super::types::TargetIdentity>,
+    /// Whether the resident already held rendered contents when this draw
+    /// resolved it. Always false on the transient rail: a buffer created for
+    /// this draw has nothing in it, which is why that rail could never honour a
+    /// LOAD and why the decline it used to raise was unconditional.
+    content_ready: bool,
+}
+
+impl AcquiredDepth {
+    /// Whether the render pass may declare `VK_ATTACHMENT_LOAD_OP_LOAD` for this
+    /// draw's depth attachment.
+    ///
+    /// **The only thing `DepthAttachKey::load` may be built from.** The guest
+    /// asking is one of two terms and it is the term that does not decide: a
+    /// LOAD pass also declares `initial_layout` DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    /// and naming a layout an image is not in is undefined behaviour rather than
+    /// a stale read — so an image nothing has rendered into cannot be loaded from
+    /// whatever the guest asked for. The two terms live behind one call because
+    /// they were briefly two expressions at one site, which is the shape where a
+    /// later edit reaches for the guest's flag alone and gets a validation error
+    /// on hosts that check and undefined contents on hosts that do not.
+    fn honours_load(&self, guest_wants_load: bool) -> bool {
+        guest_wants_load && self.content_ready
+    }
+}
+
+unsafe fn acquire_depth_view(
+    ctx: &super::context::DeviceContext,
+    pools: &mut super::pools::ResourcePools,
+    req: &DrawRequest,
+    counters: &EngineCounters,
+) -> Result<AcquiredDepth, DrawError> {
+    let with_stencil = req.depth.as_ref().and_then(|d| d.stencil).is_some();
+    if let Some(identity) = req.depth.as_ref().and_then(|d| d.identity.clone()) {
+        // Asked before `registry_ensure_depth`, because that call creates the
+        // slot when it is absent and a fresh slot is `content_ready == false`.
+        // Asking after would answer about the image this draw just made rather
+        // than about the one the guest expects to load.
+        let content_ready = pools.registry_content_ready(&identity);
+        let (_image, view) = pools.registry_ensure_depth(
+            ctx,
+            identity.clone(),
+            req.width,
+            req.height,
+            with_stencil,
+            counters,
+        )?;
+        // A geometry or aspect change recreates the image inside that call, and
+        // the recreated one holds nothing. Re-asking is what keeps this honest.
+        let content_ready = content_ready && pools.registry_content_ready(&identity);
+        return Ok(AcquiredDepth {
+            view,
+            owned: None,
+            identity: Some(identity),
+            content_ready,
+        });
+    }
+    let (dimg, dmem, dview) =
+        pools.create_transient_depth(ctx, req.width, req.height, with_stencil, counters)?;
+    Ok(AcquiredDepth {
+        view: dview,
+        owned: Some((dimg, dmem, dview)),
+        identity: None,
+        content_ready: false,
+    })
+}
+
+/// A pass asked to load depth this device has nothing to load.
+///
+/// Two ways to reach it, and they are different findings. The pass is the
+/// **first** into a depth texture, so `MTLLoadActionLoad` on undefined contents
+/// is the guest's own undefined behaviour and a CLEAR is a conformant answer.
+/// Or the depth resident was **reclaimed** between two passes that meant to
+/// chain — real lost depth, bounded by `IDLE_TARGET_AGE_MS`, and the reading
+/// that would justify giving depth residents an age of their own.
+///
+/// Latched per geometry-and-aspect rather than per pipeline: what a reader needs
+/// is whether this happens at all and to what shape of attachment, and a
+/// per-pipeline latch on a workload with hundreds of pipelines answers a
+/// different question at a hundred times the volume.
+fn note_depth_load_without_content(width: u32, height: u32, stencil: bool) {
+    let key = (u64::from(width) << 32) ^ (u64::from(height) << 1) ^ u64::from(stencil);
+    if crate::observe::first_sight("depth_load_without_content", key) {
+        crate::observe::fail(format!(
+            "depth_load reason=depth_load_without_content {width}x{height} \
+             stencil={} (pass asked LOAD, resident holds nothing; cleared)",
+            u8::from(stencil)
+        ));
+    }
 }
 
 pub(crate) unsafe fn execute_draw_inner(
@@ -1368,13 +1650,6 @@ pub(crate) unsafe fn execute_draw_inner(
     // and the query result is not readable until the command buffer has
     // completed — so a batched queried draw would return `None` for a count the
     // guest is about to read. The cost lands only on passes that arm a query.
-    let batch_eligible = !force_loss
-        && !ctx.caps.quirks.no_deferred_draw_batching
-        && !is_mrt
-        && req.depth.is_none()
-        && req.skip_readback
-        && req.occlusion_query.is_none()
-        && req.target_identity.is_some();
     let samples_own_target = req.sampled_images.iter().any(|s| {
         matches!(
             (&s.source, req.target_identity.as_ref()),
@@ -1390,19 +1665,117 @@ pub(crate) unsafe fn execute_draw_inner(
         height: req.height,
         bgra: output_bgra,
     });
-    let joins = batch_eligible
-        && req.load_from_target
-        && req.target_rgba8.is_none()
-        && req.seed_from_target.is_none()
-        && !samples_own_target
-        && batch_target
+    // Why this draw does not append to the open batch, named by its first
+    // refusing term.
+    //
+    // A draw that does not join is a `vkQueueSubmit` and a fence, and that is
+    // what `Phase::Slot` measures the worker blocking on. A bare join rate
+    // cannot say which of these terms to attack, and the rule has enough terms
+    // that guessing picks the wrong one — `batch_eligible` alone folds seven
+    // conditions before any of the rest are reached.
+    //
+    // # What it read
+    //
+    // Driven Safari drag, 97 986 draws, and only four of the twelve refusals
+    // ever fired:
+    //
+    //   join_appended                42 652   43.5 %
+    //   nojoin_samples_own_target    29 113   29.7 %
+    //   nojoin_not_load_from_target  14 683   15.0 %
+    //   nojoin_no_open_batch         11 538   11.8 %
+    //
+    // **All seven `batch_eligible` terms read zero.** Nothing here is refused
+    // for a device-lost force, a driver quirk, MRT, a depth attachment, a
+    // readback, an occlusion query or a missing identity — they are real
+    // conditions this workload does not present, and a firing one is news.
+    //
+    // # What it reads now
+    //
+    // Same probe after the self-alias term was dropped, 91 495 draws:
+    //
+    //   join_appended                38 272   41.8 %
+    //   nojoin_no_open_batch         19 836   21.7 %
+    //   join_appended_self_alias     19 685   21.5 %
+    //   nojoin_not_load_from_target  13 702   15.0 %
+    //
+    // Joins 43.5 % -> 63.3 % and `batch_flushes` 55 334 -> 33 538, a 39 %
+    // cut in submissions. `nojoin_no_open_batch` nearly doubled, which is the
+    // expected shape and not a regression: a self-alias draw that used to
+    // stop at its own term now walks to the end of the ladder and is counted
+    // there when the open batch is on another target.
+    //
+    // What that leaves is `nojoin_no_open_batch` as the largest refusal, and
+    // it is a statement about `BatchTarget` rather than about the draw — the
+    // batch is keyed by target identity and geometry, so a run alternating
+    // between two surfaces cannot batch at all even though each draw opens
+    // and ends its own render pass inside the command buffer. Nothing read so
+    // far says that key is load-bearing.
+    //
+    // So the batching ceiling was one term: a draw sampling the target it
+    // renders into, which the GVA resident sampled rung made common. That term
+    // is gone, and the reason it was ever there does not survive reading the
+    // snapshot path. The snapshot is a `cmd_copy_image` recorded into *this*
+    // command buffer, after the previous draw's `cmd_end_render_pass` and
+    // before this draw's `cmd_begin_render_pass`, from the registry-resident
+    // image every batched draw with that identity renders into — so inside an
+    // open batch it already captures the target as of this draw's position in
+    // the stream, which is the property a self-alias draw needs.
+    //
+    // What did have to change is the barrier in front of that copy. It was
+    // skipped whenever the resident already sat in `TRANSFER_SRC_OPTIMAL`,
+    // which is exactly the layout a render pass leaves its primary attachment
+    // in — so a snapshot following a draw into the same image took no
+    // dependency on it. Between two submissions that was merely undefined;
+    // inside one command buffer, with the producing draw a few commands back,
+    // it is the same undefined behaviour with a much shorter fuse.
+    // `barrier_resident_for_transfer_read` now answers it unconditionally.
+    //
+    // The terms are gathered into [`JoinTerms`] rather than spelled out here,
+    // because they answer two questions — may this draw *open* a batch, and may
+    // it *join* the open one — and those were two hand-written lists whose
+    // shared prefix a `debug_assert` had to police. `batch_eligible` is now
+    // derived from the same fields the ladder reads, so an added term cannot
+    // reach one and miss the other.
+    let terms = JoinTerms {
+        force_loss,
+        quirk: ctx.caps.quirks.no_deferred_draw_batching,
+        is_mrt,
+        has_depth: req.depth.is_some(),
+        reads_back: !req.skip_readback,
+        has_query: req.occlusion_query.is_some(),
+        no_identity: req.target_identity.is_none(),
+        cpu_seed: req.target_rgba8.is_some(),
+        gpu_seed: req.seed_from_target.is_some(),
+        // Last because it is the only term that looks anything up. Evaluated
+        // eagerly, which costs one `Option` compare on a draw an earlier term
+        // already refused.
+        no_open_batch: batch_target
             .as_ref()
             .and_then(|t| pools.batch_slot(t))
-            .is_some();
+            .is_none(),
+    };
+    let batch_eligible = terms.batch_eligible();
+    let no_join = terms.refusal();
+    // The join arm splits by self-alias, and the two must sum to the joins.
+    // `nojoin_samples_own_target` was 29.7 % of all draws and is the population
+    // this ladder stopped refusing; without a name of its own on the way *in*,
+    // the only visible effect would be a term that stopped firing, which reads
+    // identically to a workload that stopped presenting one.
+    crate::runtime::drain::note_store_route(no_join.unwrap_or(if samples_own_target {
+        "join_appended_self_alias"
+    } else {
+        "join_appended"
+    }));
+    let joins = no_join.is_none();
     // Claim the next ring slot — BEFORE any pool acquire, so a recycled slot
     // can never alias a still-in-flight CB. Blocks (retire) only when every
     // slot is still in flight; the wait lands in retire_wait_us. A batch
     // joiner reuses the open batch's slot instead (its CB is still recording).
+    // Everything above this point is bookkeeping over the request; the claim
+    // below is the only part of `Prep` that can block on the GPU. Charged apart
+    // so a boot can tell "the CPU is ahead of the ring" from "preparing a draw
+    // got slower", which `prep_us` alone cannot.
+    phase.enter(super::draw_phase::Phase::Slot);
     let (cb, fence) = if joins {
         let target = batch_target.as_ref().expect("joins requires identity");
         pools.batch_slot(target).expect("joins checked batch_slot")
@@ -1498,9 +1871,29 @@ pub(crate) unsafe fn execute_draw_inner(
             super::reason::DrawReason::DepthWithSecondaryAttachments,
         ));
     }
+    // The depth attachment is resolved here rather than beside the framebuffer
+    // below, because the pass key needs an answer this device can only get from
+    // the resident: whether a `MTLLoadActionLoad` can be honoured at all.
+    //
+    // A LOAD pass declares `initial_layout` DEPTH_STENCIL_ATTACHMENT_OPTIMAL. An
+    // image that nothing has rendered into is in UNDEFINED, and naming a layout
+    // an image is not in is undefined behaviour rather than a stale read — so
+    // "the guest asked to load" and "there is something to load" are two
+    // questions and only the second one is about this device.
+    let depth_attachment = req
+        .depth
+        .as_ref()
+        .map(|_| acquire_depth_view(ctx, pools, req, counters))
+        .transpose()?;
     if let Some(d) = &req.depth {
+        let load = depth_attachment
+            .as_ref()
+            .is_some_and(|a: &AcquiredDepth| a.honours_load(d.load));
+        if d.load && !load {
+            note_depth_load_without_content(req.width, req.height, d.stencil.is_some());
+        }
         pass_key.depth = Some(super::caches::DepthAttachKey {
-            load: d.load,
+            load,
             stencil: d.stencil.is_some(),
         });
     }
@@ -1597,14 +1990,16 @@ pub(crate) unsafe fn execute_draw_inner(
         front_face_ccw: req.front_face_ccw,
         fill_mode: req.fill_mode,
         depth_clip: req.depth_clip,
-        depth_test: req.depth.map(|d| d.test_enable).unwrap_or(false),
-        depth_write: req.depth.map(|d| d.write_enable).unwrap_or(false),
+        depth_test: req.depth.as_ref().map(|d| d.test_enable).unwrap_or(false),
+        depth_write: req.depth.as_ref().map(|d| d.write_enable).unwrap_or(false),
         depth_compare: req
             .depth
+            .as_ref()
             .map(|d| d.compare)
             .unwrap_or(super::types::SamplerCompareFunction::Always),
         stencil: req
             .depth
+            .as_ref()
             .and_then(|d| d.stencil)
             .map(|s| super::caches::StencilKey {
                 front: s.front,
@@ -1638,12 +2033,11 @@ pub(crate) unsafe fn execute_draw_inner(
     // Vertex buffers (with Constant step shift), deduplicated by content:
     // several attributes on one interleaved stream share one staging slot.
     let no_vertex_fetch = draw_has_no_invocations(req);
-    let mut slots_by_content: std::collections::HashMap<(usize, u64), BoundBuffer> =
-        std::collections::HashMap::new();
     // Filled by whichever binds below are scattered guest windows, and drained
-    // in the record phase ahead of the render pass. Deduplicated for free:
-    // `slots_by_content` returns an already-planned window's buffer without
-    // reaching the gather again, so a stream bound twice is copied once.
+    // in the record phase ahead of the render pass. Deduplicated for free: the
+    // pool's `cb_bound_buffers` returns an already-planned window's buffer
+    // without reaching the gather again, so a window bound twice anywhere in
+    // this command buffer is copied once.
     let mut guest_gathers: Vec<PendingGuestGather> = Vec::new();
     let mut vertex_bufs = Vec::new();
     for resource in &req.vertex_attributes {
@@ -1703,7 +2097,6 @@ pub(crate) unsafe fn execute_draw_inner(
                 &resource.content,
                 vk::BufferUsageFlags::VERTEX_BUFFER,
                 batch_eligible,
-                &mut slots_by_content,
                 &mut guest_gathers,
             )?
         };
@@ -1740,7 +2133,6 @@ pub(crate) unsafe fn execute_draw_inner(
             &resource.content,
             vk::BufferUsageFlags::STORAGE_BUFFER,
             batch_eligible,
-            &mut slots_by_content,
             &mut guest_gathers,
         )?;
         storage_slots.push((resource.binding, slot));
@@ -1803,13 +2195,18 @@ pub(crate) unsafe fn execute_draw_inner(
     phase.enter(super::draw_phase::Phase::Acquire);
     // (identity, image, tracked-layout-before-this-draw) per secondary — used
     // to barrier prior sampled reads and to mark ready afterward.
-    let mut mrt_secondaries: Vec<(super::types::TargetIdentity, vk::Image, vk::ImageLayout)> =
+    let mut mrt_secondaries: Vec<(
+        super::types::TargetIdentity,
+        vk::Image,
+        super::pools::ResidentAccess,
+    )> =
         Vec::new();
-    // Transient depth attachment (image, memory, view, ad-hoc framebuffer) —
-    // owned for exactly this draw, disposed deferred after submit. `None` on the
-    // 2D path so nothing changes there.
-    let mut transient_depth: Option<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Framebuffer)> =
-        None;
+    // This draw's depth attachment, when it has one. The framebuffer is always
+    // this draw's own and is always disposed after submit; the image behind it
+    // is only owned here when the pass named no guest depth texture to key a
+    // resident on — see `acquire_depth_view`. `None` on the 2D path so nothing
+    // changes there.
+    let mut transient_depth: Option<(Option<OwnedDepthImage>, vk::Framebuffer)> = None;
     // Mark everything this draw is about to read *before* resolving its own
     // target, so a reclaim between here and `prepare_sampled` cannot take one
     // of this draw's own sampled sources.
@@ -1829,7 +2226,7 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.registry_note_sampled_use(identity);
         }
     }
-    let (target_image, target_fb, target_old_layout, target_view) =
+    let (target_image, target_fb, target_access, target_view) =
         if let Some(identity) = &req.target_identity {
             let gen = identity.generation();
             let t = pools.registry_ensure(
@@ -1851,7 +2248,7 @@ pub(crate) unsafe fn execute_draw_inner(
             }
             let primary_image = t.image;
             let primary_view = t.view;
-            let primary_layout = t.layout;
+            let primary_access = t.access;
             let primary_slot_fb = t.framebuffer;
             if is_mrt {
                 // Ensure each secondary resident and collect its view for the MRT
@@ -1860,11 +2257,11 @@ pub(crate) unsafe fn execute_draw_inner(
                 // cannot evict the primary or an earlier secondary in this draw.
                 let mut views = vec![primary_view];
                 for sec in &req.secondary_targets {
-                    let old_layout = pools
+                    let old_access = pools
                         .registry_get(&sec.identity)
-                        .map(|s| s.layout)
-                        .unwrap_or(vk::ImageLayout::UNDEFINED);
-                    let (img, view) = pools.registry_ensure_color(
+                        .map(|s| s.access)
+                        .unwrap_or(super::pools::ResidentAccess::Untouched);
+                    let (img, view) = pools.registry_ensure_attachment(
                         ctx,
                         sec.identity.clone(),
                         sec.width,
@@ -1874,7 +2271,7 @@ pub(crate) unsafe fn execute_draw_inner(
                         counters,
                     )?;
                     views.push(view);
-                    mrt_secondaries.push((sec.identity.clone(), img, old_layout));
+                    mrt_secondaries.push((sec.identity.clone(), img, old_access));
                 }
                 let fb = pools.create_mrt_framebuffer(
                     ctx,
@@ -1884,25 +2281,18 @@ pub(crate) unsafe fn execute_draw_inner(
                     req.height,
                     counters,
                 )?;
-                (primary_image, fb, primary_layout, primary_view)
-            } else if req.depth.is_some() {
-                let (dimg, dmem, dview) = pools.create_transient_depth(
-                    ctx,
-                    req.width,
-                    req.height,
-                    req.depth.and_then(|d| d.stencil).is_some(),
-                    counters,
-                )?;
+                (primary_image, fb, primary_access, primary_view)
+            } else if let Some(d) = depth_attachment.as_ref() {
                 let fb = pools.create_mrt_framebuffer(
                     ctx,
                     render_pass,
-                    &[primary_view, dview],
+                    &[primary_view, d.view],
                     req.width,
                     req.height,
                     counters,
                 )?;
-                transient_depth = Some((dimg, dmem, dview, fb));
-                (primary_image, fb, primary_layout, primary_view)
+                transient_depth = Some((d.owned, fb));
+                (primary_image, fb, primary_access, primary_view)
             } else if req.color_input {
                 // Fetch pass carries an input reference → the slot's cached
                 // color-only framebuffer is incompatible; build an ad-hoc one
@@ -1915,9 +2305,9 @@ pub(crate) unsafe fn execute_draw_inner(
                     req.height,
                     counters,
                 )?;
-                (primary_image, fb, primary_layout, primary_view)
+                (primary_image, fb, primary_access, primary_view)
             } else {
-                (primary_image, primary_slot_fb, primary_layout, primary_view)
+                (primary_image, primary_slot_fb, primary_access, primary_view)
             }
         } else {
             let target_key = TargetKey {
@@ -1930,24 +2320,17 @@ pub(crate) unsafe fn execute_draw_inner(
             // framebuffer [color, depth] under the depth `render_pass`.
             let t = pools.acquire_target(ctx, target_key, primary_pass, counters)?;
             let (pool_image, pool_view, pool_fb) = (t.image, t.view, t.framebuffer);
-            if req.depth.is_some() {
-                let (dimg, dmem, dview) = pools.create_transient_depth(
-                    ctx,
-                    req.width,
-                    req.height,
-                    req.depth.and_then(|d| d.stencil).is_some(),
-                    counters,
-                )?;
+            if let Some(d) = depth_attachment.as_ref() {
                 let fb = pools.create_mrt_framebuffer(
                     ctx,
                     render_pass,
-                    &[pool_view, dview],
+                    &[pool_view, d.view],
                     req.width,
                     req.height,
                     counters,
                 )?;
-                transient_depth = Some((dimg, dmem, dview, fb));
-                (pool_image, fb, vk::ImageLayout::UNDEFINED, pool_view)
+                transient_depth = Some((d.owned, fb));
+                (pool_image, fb, super::pools::ResidentAccess::Untouched, pool_view)
             } else if req.color_input {
                 let fb = pools.create_mrt_framebuffer(
                     ctx,
@@ -1957,16 +2340,16 @@ pub(crate) unsafe fn execute_draw_inner(
                     req.height,
                     counters,
                 )?;
-                (pool_image, fb, vk::ImageLayout::UNDEFINED, pool_view)
+                (pool_image, fb, super::pools::ResidentAccess::Untouched, pool_view)
             } else {
-                (pool_image, pool_fb, vk::ImageLayout::UNDEFINED, pool_view)
+                (pool_image, pool_fb, super::pools::ResidentAccess::Untouched, pool_view)
             }
         };
     // GPU seed source: resolved after registry_ensure (which protects it from
     // the capacity sweep) so the handle cannot be destroyed under this draw.
     // Every rejection is a distinct named error — the runtime pre-checks
     // readiness, so these only fire on a runtime/protocol bug.
-    let seed_from_resolved: Option<(vk::Image, vk::ImageLayout)> =
+    let seed_from_resolved: Option<(vk::Image, super::pools::ResidentAccess)> =
         if let Some(seed_identity) = &req.seed_from_target {
             let slot = pools.registry_get(seed_identity).ok_or_else(|| {
                 DrawError::DrawExecution(DrawExecutionDecline::SeedResidentMissing {
@@ -2000,7 +2383,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     },
                 ));
             }
-            Some((slot.image, slot.layout))
+            Some((slot.image, slot.access))
         } else {
             None
         };
@@ -2056,7 +2439,7 @@ pub(crate) unsafe fn execute_draw_inner(
                             (
                                 slot.image,
                                 slot.view,
-                                slot.layout,
+                                slot.access,
                                 slot.scanout_order(),
                                 slot.content_ready,
                                 slot.width,
@@ -2105,7 +2488,7 @@ pub(crate) unsafe fn execute_draw_inner(
                         binding: resource.binding,
                         identity: identity.clone(),
                         source_image,
-                        source_old_layout: source_layout,
+                        source_access: source_layout,
                         image,
                     });
                 } else {
@@ -2114,7 +2497,7 @@ pub(crate) unsafe fn execute_draw_inner(
                         identity: identity.clone(),
                         image: source_image,
                         view: source_view,
-                        old_layout: source_layout,
+                        access: source_layout,
                     });
                 }
                 counters
@@ -2331,7 +2714,7 @@ pub(crate) unsafe fn execute_draw_inner(
         let PreparedSampled::Snapshot {
             identity,
             source_image,
-            source_old_layout,
+            source_access,
             image,
             ..
         } = sampled_image
@@ -2339,26 +2722,13 @@ pub(crate) unsafe fn execute_draw_inner(
             continue;
         };
         target_snapshotted = true;
-        if snapshotted_targets.insert(identity.clone())
-            && *source_old_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL
-        {
-            let (src_stage, src_access) = layout_source_scope(*source_old_layout)?;
-            let barrier = [vk::ImageMemoryBarrier::default()
-                .src_access_mask(src_access)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .old_layout(*source_old_layout)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .image(*source_image)
-                .subresource_range(super::color_subresource_range())];
-            ctx.device.cmd_pipeline_barrier(
-                cb,
-                src_stage,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &barrier,
-            );
+        // Once per distinct source: duplicate bindings of one target share the
+        // image, so a second barrier for it would order nothing new. The
+        // *first* is unconditional — the source is a registry resident this
+        // draw's own predecessor may have written, and the layout it sits in
+        // says nothing about that.
+        if snapshotted_targets.insert(identity.clone()) {
+            barrier_resident_for_transfer_read(&ctx.device, cb, *source_image, *source_access);
         }
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
@@ -2412,8 +2782,7 @@ pub(crate) unsafe fn execute_draw_inner(
 
     // Seed upload (CPU import).
     if let Some(seed) = &seed_slot {
-        let (src_stage, src_access) =
-            target_write_source_scope(target_snapshotted, target_old_layout)?;
+        let (src_stage, src_access) = target_prior_access(target_snapshotted, target_access).source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -2462,36 +2831,16 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
             &barrier,
         );
-    } else if let Some((seed_image, seed_layout)) = seed_from_resolved {
+    } else if let Some((seed_image, seed_access)) = seed_from_resolved {
         // GPU present-boundary seed: resident front frame → draw target copy,
         // then the pass runs with LOAD.
         //
-        // Unconditional: the source is a resident that a draw just produced, so
-        // it is normally already in TRANSFER_SRC_OPTIMAL and gating on a
-        // transition being needed skipped the dependency on exactly the frames
-        // worth copying. See `resident_read_source_scope` for why the scope
-        // cannot come from the tracked layout.
-        {
-            let (src_stage, src_access) = resident_read_source_scope();
-            let barrier = [vk::ImageMemoryBarrier::default()
-                .src_access_mask(src_access)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .old_layout(seed_layout)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .image(seed_image)
-                .subresource_range(super::color_subresource_range())];
-            ctx.device.cmd_pipeline_barrier(
-                cb,
-                src_stage,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &barrier,
-            );
-        }
+        // The source is a resident that a draw just produced, so it is normally
+        // already in TRANSFER_SRC_OPTIMAL and gating on a transition being
+        // needed skipped the dependency on exactly the frames worth copying.
+        barrier_resident_for_transfer_read(&ctx.device, cb, seed_image, seed_access);
         let (dst_stage, dst_access) =
-            target_write_source_scope(target_snapshotted, target_old_layout)?;
+            target_prior_access(target_snapshotted, target_access).source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(dst_access)
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -2552,18 +2901,14 @@ pub(crate) unsafe fn execute_draw_inner(
     } else if load_uses_gpu_content {
         // A prior direct sample may have left this target shader-readable;
         // transition from the registry's tracked layout back to attachment use.
-        let old_layout = if target_snapshotted {
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
-        } else {
-            target_old_layout
-        };
-        let (src_stage, src_access) = layout_source_scope(old_layout)?;
+        let prior = target_prior_access(target_snapshotted, target_access);
+        let (src_stage, src_access) = prior.source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(
                 vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
             )
-            .old_layout(old_layout)
+            .old_layout(prior.layout())
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
@@ -2576,7 +2921,7 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
             &barrier,
         );
-    } else if target_snapshotted || target_old_layout != vk::ImageLayout::UNDEFINED {
+    } else if target_snapshotted || target_access != super::pools::ResidentAccess::Untouched {
         // The Clear render pass discards prior content via initialLayout
         // UNDEFINED, so nothing here preserves pixels — but its colour writes
         // still have to wait for whoever last read them, and on this path the
@@ -2594,8 +2939,7 @@ pub(crate) unsafe fn execute_draw_inner(
         // A pooled or freshly created target tracks `UNDEFINED` — nothing has
         // touched it, so it is excluded rather than barriered, which keeps this
         // off the pooled path entirely.
-        let (src_stage, src_access) =
-            target_write_source_scope(target_snapshotted, target_old_layout)?;
+        let (src_stage, src_access) = target_prior_access(target_snapshotted, target_access).source_scope();
         let barrier = [vk::MemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
@@ -2617,22 +2961,28 @@ pub(crate) unsafe fn execute_draw_inner(
         let PreparedSampled::Resident {
             identity,
             image,
-            old_layout,
+            access,
             ..
         } = image
         else {
             continue;
         };
+        // A resident whose last touch was already a shader read needs no
+        // barrier: read-after-read is not a hazard, and the layout it wants is
+        // the one it is in. This is the one skip in the family that is sound,
+        // and it is sound because the *access* says so — the identically-shaped
+        // skip keyed on the layout alone is what `ResidentAccess` exists to
+        // stop, since a layout can be reached by a write that shares its name.
         if !transitioned_resident.insert(identity.clone())
-            || *old_layout == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+            || *access == super::pools::ResidentAccess::ShaderRead
         {
             continue;
         }
-        let (src_stage, src_access) = layout_source_scope(*old_layout)?;
+        let (src_stage, src_access) = access.source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .old_layout(*old_layout)
+            .old_layout(access.layout())
             .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .image(*image)
             .subresource_range(super::color_subresource_range())];
@@ -2757,17 +3107,17 @@ pub(crate) unsafe fn execute_draw_inner(
     // prior draw) must transition back to color-attachment use, and the write
     // must wait for that prior read (WAR). A freshly-created secondary tracks
     // UNDEFINED and needs no barrier — the render pass discards on CLEAR.
-    for (_id, image, old_layout) in &mrt_secondaries {
-        if *old_layout == vk::ImageLayout::UNDEFINED {
+    for (_id, image, access) in &mrt_secondaries {
+        if *access == super::pools::ResidentAccess::Untouched {
             continue;
         }
-        let (src_stage, src_access) = layout_source_scope(*old_layout)?;
+        let (src_stage, src_access) = access.source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(
                 vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
             )
-            .old_layout(*old_layout)
+            .old_layout(access.layout())
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .image(*image)
             .subresource_range(super::color_subresource_range())];
@@ -2782,28 +3132,7 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
-    // One clear value per attachment (slot 0 + secondaries), in FB order. Only
-    // CLEAR attachments consult these, but the count must cover all attachments.
-    let mut clear = vec![vk::ClearValue {
-        color: vk::ClearColorValue {
-            float32: [0.0, 0.0, 0.0, 0.0],
-        },
-    }];
-    for sec in &req.secondary_targets {
-        clear.push(vk::ClearValue {
-            color: vk::ClearColorValue { float32: sec.clear },
-        });
-    }
-    // Depth attachment is last (after color + secondaries), matching the pass
-    // attachment order. Only consulted when its load_op is CLEAR.
-    if let Some(d) = &req.depth {
-        clear.push(vk::ClearValue {
-            depth_stencil: vk::ClearDepthStencilValue {
-                depth: d.clear_value,
-                stencil: d.stencil.map(|s| s.clear_value).unwrap_or(0),
-            },
-        });
-    }
+    let clear = clear_values(req);
     let rp_begin = vk::RenderPassBeginInfo::default()
         .render_pass(render_pass)
         .framebuffer(target_fb)
@@ -2908,7 +3237,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // Dynamic stencil reference (Metal `setStencilFrontReferenceValue:back…`)
     // — only bound for stencil pipelines, which list STENCIL_REFERENCE as a
     // dynamic state; front/back set separately to honor Metal's split refs.
-    if let Some(s) = req.depth.and_then(|d| d.stencil) {
+    if let Some(s) = req.depth.as_ref().and_then(|d| d.stencil) {
         ctx.device
             .cmd_set_stencil_reference(cb, vk::StencilFaceFlags::FRONT, s.reference_front);
         ctx.device
@@ -3081,6 +3410,16 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.registry_mark_ready_at(identity, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         }
     }
+    // The depth pass stores unconditionally and settles at
+    // DEPTH_STENCIL_ATTACHMENT_OPTIMAL, so after this draw the resident holds
+    // depth a later pass can load and sits in the layout that pass will name.
+    // Marked here rather than beside the colour target above because the two
+    // are different residents with different reclaim rules — see
+    // `registry_mark_depth_ready` for the sole-copy line that is deliberately
+    // absent from it.
+    if let Some(identity) = depth_attachment.as_ref().and_then(|d| d.identity.as_ref()) {
+        pools.registry_mark_depth_ready(identity);
+    }
     let mut sampled_retains: Vec<super::pools::SampledRetain> = Vec::new();
     for prepared in &sampled {
         match prepared {
@@ -3123,12 +3462,12 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     for image in &sampled {
         if let PreparedSampled::Resident { identity, .. } = image {
-            pools.registry_set_layout(identity, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            pools.registry_note_access(identity, super::pools::ResidentAccess::ShaderRead);
         }
     }
     if seed_from_resolved.is_some() {
         if let Some(seed_identity) = &req.seed_from_target {
-            pools.registry_set_layout(seed_identity, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+            pools.registry_note_access(seed_identity, super::pools::ResidentAccess::TransferRead);
         }
     }
     // Deferred-submit draw: park the per-draw descriptor set and sampled
@@ -3180,16 +3519,22 @@ pub(crate) unsafe fn execute_draw_inner(
             super::pools::DeferredHandle::Framebuffer(target_fb),
         );
     }
-    if let Some((dimg, dmem, dview, dfb)) = transient_depth {
+    if let Some((owned, dfb)) = transient_depth {
         pools.dispose(&ctx.device, super::pools::DeferredHandle::Framebuffer(dfb));
-        pools.dispose(
-            &ctx.device,
-            super::pools::DeferredHandle::Image {
-                image: dimg,
-                view: dview,
-                memory: dmem,
-            },
-        );
+        // Only the unidentified case owns its image. A resident one belongs to
+        // the registry and to the guest texture it is keyed on; disposing it
+        // here would put the rail straight back to one allocation per draw, with
+        // the added defect that the next draw would find a destroyed handle.
+        if let Some((dimg, dmem, dview)) = owned {
+            pools.dispose(
+                &ctx.device,
+                super::pools::DeferredHandle::Image {
+                    image: dimg,
+                    view: dview,
+                    memory: dmem,
+                },
+            );
+        }
     }
 
     // A draw with no pixel readback (resident target, skip_readback) hands
@@ -3303,41 +3648,70 @@ fn read_occlusion_samples(
     Ok(Some(samples[0]))
 }
 
-/// First synchronization scope for a write to *this draw's own colour target*
-/// that the render pass does not order for us — the seed copies that stage
-/// pixels into it through `TRANSFER_DST_OPTIMAL`, and the clear-path colour
-/// writes that begin the pass.
+/// One `VkClearValue` per attachment, in framebuffer order: the primary colour
+/// slot, then the secondaries, then depth.
 ///
-/// None of those writes preserves content. A seed covers every texel, and a
-/// CLEAR pass discards through `initialLayout = UNDEFINED`; both keep the
+/// Only attachments whose `loadOp` is `CLEAR` consult their entry, but the
+/// vector must cover every attachment because Vulkan indexes it positionally —
+/// a short vector silently gives a later attachment an earlier one's colour.
+///
+/// The primary's entry used to be a hard-coded transparent black, and that was
+/// the whole reason `MTLLoadActionClear` could not be honoured directly: the
+/// runtime met it instead by allocating a whole-attachment RGBA8 bitmap of the
+/// requested colour and handing it over as a CPU seed, which also resolved the
+/// pass to LOAD. The clear now travels as
+/// [`super::types::DrawRequest::target_clear`], the same shape the secondaries
+/// have always used.
+fn clear_values(req: &DrawRequest) -> Vec<vk::ClearValue> {
+    let mut clear = vec![vk::ClearValue {
+        color: vk::ClearColorValue {
+            float32: req.target_clear,
+        },
+    }];
+    for sec in &req.secondary_targets {
+        clear.push(vk::ClearValue {
+            color: vk::ClearColorValue { float32: sec.clear },
+        });
+    }
+    if let Some(d) = &req.depth {
+        clear.push(vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: d.clear_value,
+                stencil: d.stencil.map(|s| s.clear_value).unwrap_or(0),
+            },
+        });
+    }
+    clear
+}
+
+/// The access a barrier over *this draw's own colour target* must name as its
+/// source, given what the registry last recorded and what this draw has already
+/// done to it.
+///
+/// `snapshotted` is this draw's own copy-on-sample read of the target, recorded
+/// into this same command buffer *after* the registry's access was read, so it
+/// names the newer touch and wins. Everything else the target could be carrying
+/// is already in [`super::pools::ResidentAccess`].
+///
+/// # Why the write sites need a source scope at all
+///
+/// None of the writes this feeds preserves content: a seed covers every texel,
+/// and a CLEAR pass discards through `initialLayout = UNDEFINED`. Both keep the
 /// discard, because paying a driver decompress to preserve pixels the very next
-/// command overwrites buys nothing. What is not discardable is the *ordering*:
-/// the write must not overtake whatever last read this image.
+/// command overwrites buys nothing. What is not discardable is the *ordering* —
+/// the write must not overtake whatever last touched this image, and nothing
+/// else supplies that. The colour-only render pass declares no external subpass
+/// dependency, and Vulkan's implicit one carries `srcStageMask = TOP_OF_PIPE`
+/// with `srcAccessMask = 0`, which orders against nothing.
 ///
-/// A resident target carries its tracked layout across draws. The primary
-/// attachment resolves to `TRANSFER_SRC_OPTIMAL` at the end of every render
-/// pass, and a draw that sampled it leaves it `SHADER_READ_ONLY_OPTIMAL` — both
-/// are *reads*, and a write that starts before they finish is a
-/// write-after-read hazard on the exact pixels the reader is consuming.
-///
-/// Naming `TOP_OF_PIPE`/no access, as these sites did, makes the barrier a bare
-/// layout transition with no execution dependency at all. Nothing else supplies
-/// one. The colour-only render pass declares no external subpass dependency, and
-/// Vulkan's implicit one is itself `TOP_OF_PIPE`/`0`. A seeded draw never joins
-/// an open batch (`joins` requires `LoadFromTarget` and no seed), so it opens
-/// its own command buffer, and the flush of the previous batch only *submits*
-/// it. Queue submission order starts command buffers in order; it does not
-/// finish them in order. So frame N+1's write could land in an icon that frame
-/// N's window pass was still sampling — one composite reading a half-replaced
-/// texture, which is a defect no population counter can see and that grows more
-/// likely exactly as queue occupancy rises under load.
-///
-/// `snapshotted` is this draw's own snapshot copy of the target, taken after
-/// the tracked layout was read, so it names the newer access and wins.
-/// `UNDEFINED` is a fresh registry slot or a pooled target that nothing has
-/// touched, and is the one case with genuinely nothing to wait for. Any other
-/// layout is a tracking bug and declines by name rather than silently becoming
-/// "no dependency".
+/// Batching does not close it either. A seeded draw never joins an open batch
+/// (`joins` requires `LoadFromTarget` and no seed), so it opens its own command
+/// buffer, and the flush of the previous batch only *submits* it. Queue
+/// submission order starts command buffers in order; it does not finish them in
+/// order. So frame N+1's write could land in an icon that frame N's window pass
+/// was still sampling — one composite reading a half-replaced texture, a defect
+/// no population counter can see, and one that grows more likely exactly as
+/// queue occupancy rises under load.
 ///
 /// # Why the same barrier shape is right elsewhere and wrong here
 ///
@@ -3347,32 +3721,50 @@ fn read_occlusion_samples(
 /// `acquire_sampled` / `acquire_storage_image`, and a slot only re-enters those
 /// free lists through `drain_cleanup`, which `retire_slot` reaches only after
 /// `wait_for_fences` on the submission that last used it. A pooled image
-/// therefore cannot be handed out while any GPU work still reads it, so there
-/// is nothing for a source scope to name.
+/// therefore cannot be handed out while any GPU work still reads it, so there is
+/// nothing for a source scope to name.
 ///
-/// The registry-resident target is the exception, and by design: it is keyed by
-/// [`super::types::TargetIdentity`] and deliberately outlives the draw so its
-/// pixels survive to the next one. No fence stands between one draw's use of it
-/// and the next, which is exactly what makes it useful — and exactly why this
-/// barrier, alone among the four, has to state what it is waiting for.
-/// Source scope for a transfer that *reads* a registry-resident image — a seed
-/// copy, a readback, a present blit, a copy-on-sample.
+/// The registry-resident target is the exception, and by design — see
+/// [`super::pools::ResidentAccess`], which is where that argument now lives in a form the
+/// compiler carries.
+fn target_prior_access(
+    snapshotted: bool,
+    tracked: super::pools::ResidentAccess,
+) -> super::pools::ResidentAccess {
+    if snapshotted {
+        super::pools::ResidentAccess::TransferRead
+    } else {
+        tracked
+    }
+}
+
+/// Record the barrier that makes a registry-resident image readable as a
+/// transfer source, waiting for whatever last touched it.
 ///
-/// Always `ALL_COMMANDS` against the union of writes a resident can carry, and
-/// deliberately not [`layout_source_scope`], because **the tracked layout names
-/// where the image is, not what last touched it**. A render pass moves its
-/// primary attachment to `TRANSFER_SRC_OPTIMAL` through `finalLayout` without
-/// any transfer ever having run, so a resident sitting in that layout was in
-/// fact last written by a colour attachment write. Deriving the scope from the
-/// layout would make the copy wait for transfer reads and leave the colour
-/// writes free to race it — which is the same stale-frame failure as skipping
-/// the barrier outright, only harder to see.
+/// The two questions a call site could get wrong are both answered here rather
+/// than asked: it takes no condition, so the barrier cannot be skipped because
+/// the image already sits in `TRANSFER_SRC_OPTIMAL`, and it takes an
+/// [`super::pools::ResidentAccess`] rather than a layout, so the scope cannot be derived from
+/// where the image sits. Both mistakes were live at the copy-on-sample site, and
+/// both are invisible — a resident has no fence between consecutive users, so a
+/// missing dependency only shows up as a copy that raced the draw producing the
+/// pixels it copied.
 ///
-/// The three writers a resident can have are a draw (`COLOR_ATTACHMENT_WRITE`),
-/// a compute dispatch (`SHADER_WRITE`), and a seed or blit
-/// (`TRANSFER_WRITE`). Naming all three costs nothing a reader can measure and
-/// removes the need for every call site to know which one produced the pixels
-/// it is about to copy.
+/// A barrier whose old and new layouts match performs no transition and still
+/// carries the dependency, which is the case this exists for.
+///
+/// # Nothing else orders these reads
+///
+/// The present blit is the clearest case and the reason this is shared with
+/// `window_present` rather than written twice. The present records into its own
+/// command buffer and submits it separately; queue submission order starts
+/// command buffers in order but does not finish them in order, and is not a
+/// memory dependency. A render pass's implicit final subpass dependency ends at
+/// `dstStageMask = BOTTOM_OF_PIPE` with `dstAccessMask = 0`, so the colour
+/// writes it produced are available and visible to nothing. The failure that
+/// leaves is not wrong pixels but a stale frame: the blit copies the resident as
+/// it stood before the draw, and the screen shows a composite missing what was
+/// just rendered into it until some later redraw publishes it.
 ///
 /// # What the repairs in this family did and did not fix
 ///
@@ -3381,11 +3773,11 @@ fn read_occlusion_samples(
 /// rounds before any of them, 4/14 after the first, 2/14 after all five.** No
 /// effect at this n, and none claimed.
 ///
-/// They stand on their own ground instead. Every one closed a read or write of
-/// a registry-resident image that took no dependency on the work that last
-/// touched it, which is undefined behaviour whatever it does to an icon, and
-/// the shared shape of the mistake is worth remembering because it looked
-/// correct five times in a row: **a barrier was skipped whenever the image was
+/// They stand on their own ground instead. Every one closed a read or write of a
+/// registry-resident image that took no dependency on the work that last touched
+/// it, which is undefined behaviour whatever it does to an icon, and the shared
+/// shape of the mistake is worth remembering because it looked correct five
+/// times in a row: **a barrier was skipped, or narrowed, whenever the image was
 /// already in the layout the operation wanted.** A barrier is a layout
 /// transition *and* a dependency, and for a resident — which by design outlives
 /// the draw, with no fence between consecutive users — the layout is the half
@@ -3395,63 +3787,88 @@ fn read_occlusion_samples(
 /// The pooled census that scored those boots, and why no counter in it can
 /// resolve this class, is recorded on
 /// [`crate::runtime::drain::note_store_route`].
-pub(super) fn resident_read_source_scope() -> (vk::PipelineStageFlags, vk::AccessFlags) {
-    (
-        vk::PipelineStageFlags::ALL_COMMANDS,
-        vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-            | vk::AccessFlags::SHADER_WRITE
-            | vk::AccessFlags::TRANSFER_WRITE,
-    )
-}
-
-fn target_write_source_scope(
-    snapshotted: bool,
-    tracked: vk::ImageLayout,
-) -> Result<(vk::PipelineStageFlags, vk::AccessFlags), DrawError> {
-    if snapshotted {
-        return Ok((
+pub(super) unsafe fn barrier_resident_for_transfer_read(
+    device: &ash::Device,
+    cb: vk::CommandBuffer,
+    image: vk::Image,
+    access: super::pools::ResidentAccess,
+) {
+    let (src_stage, src_access) = access.source_scope();
+    let barrier = [vk::ImageMemoryBarrier::default()
+        .src_access_mask(src_access)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .old_layout(access.layout())
+        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .image(image)
+        .subresource_range(super::color_subresource_range())];
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cb,
+            src_stage,
             vk::PipelineStageFlags::TRANSFER,
-            vk::AccessFlags::TRANSFER_READ,
-        ));
-    }
-    if tracked == vk::ImageLayout::UNDEFINED {
-        return Ok((
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            vk::AccessFlags::empty(),
-        ));
-    }
-    layout_source_scope(tracked)
-}
-
-fn layout_source_scope(
-    layout: vk::ImageLayout,
-) -> Result<(vk::PipelineStageFlags, vk::AccessFlags), DrawError> {
-    match layout {
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL => Ok((
-            vk::PipelineStageFlags::TRANSFER,
-            vk::AccessFlags::TRANSFER_READ,
-        )),
-        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => Ok((
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-        )),
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => Ok((
-            vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::AccessFlags::SHADER_READ,
-        )),
-        other => Err(DrawError::DrawExecution(
-            DrawExecutionDecline::UnsupportedTrackedLayout { layout: other },
-        )),
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barrier,
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::vulkan::engine::pools::ResidentAccess;
     use crate::backend::vulkan::engine::types::{
         GuestRun, GuestRunSource, SampledImageResource, SampledSource,
     };
     use crate::observe::Decline;
+
+    /// Build a `JoinTerms` from a bitmask, one bit per ladder rung in order.
+    fn join_terms(bits: u32) -> JoinTerms {
+        let b = |i: usize| bits & (1 << i) != 0;
+        JoinTerms {
+            force_loss: b(0),
+            quirk: b(1),
+            is_mrt: b(2),
+            has_depth: b(3),
+            reads_back: b(4),
+            has_query: b(5),
+            no_identity: b(6),
+            cpu_seed: b(7),
+            gpu_seed: b(8),
+            no_open_batch: b(9),
+        }
+    }
+
+    /// Every rung must be reachable as a verdict, or the census name below it
+    /// is unattributable and the one above it is over-counted.
+    ///
+    /// The ladder returns its *first* refusing term, so a rung is reachable
+    /// only from the input that refuses at it and nowhere earlier — which is
+    /// exactly the single-bit mask for that rung.
+    #[test]
+    fn every_join_refusal_is_reachable_and_named_once() {
+        let mut seen = std::collections::HashSet::new();
+        for (rung, (_, _, name)) in JoinTerms::LADDER.iter().enumerate() {
+            assert_eq!(
+                join_terms(1 << rung).refusal(),
+                Some(*name),
+                "rung {rung} does not answer with its own name when it is the only term set"
+            );
+            assert!(seen.insert(*name), "two rungs share the census name {name}");
+        }
+        assert_eq!(join_terms(0).refusal(), None, "no term set is a join");
+    }
+
+    // There is deliberately no test that `batch_eligible` and `refusal` agree
+    // about which rungs gate opening a batch. Both read `JoinScope` off the same
+    // ladder entry, so any such test asserts the scope field against itself:
+    // mis-scoping `nojoin_query` to `Fit` — which would let a queried draw defer
+    // its submit and hand the guest a count its command buffer has not produced
+    // — leaves one green. That test was written, run against exactly that
+    // mutation, and deleted. The `debug_assert` it replaced had the same blind
+    // spot and a release-build hole besides. What makes the two agree is that
+    // there is one list.
 
     /// `bufferOffset` has a hard rule in the Vulkan spec, and this rail is the
     /// only thing that ever gives it a nonzero value: every other sampled upload
@@ -3733,149 +4150,184 @@ mod tests {
         }
     }
 
+    /// Every variant a resident can be in, so the tests below enumerate rather
+    /// than sample. A new variant that nothing here mentions fails to compile,
+    /// which is the point: each one is a rail that can leave a resident in a
+    /// state some barrier has to name.
+    const EVERY_ACCESS: [ResidentAccess; 5] = [
+        ResidentAccess::Untouched,
+        ResidentAccess::ColorWrite(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+        ResidentAccess::ColorWrite(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+        ResidentAccess::ShaderRead,
+        ResidentAccess::TransferRead,
+    ];
+
+    /// The invariant the whole type exists for: **where a resident sits does not
+    /// tell you what a barrier over it must wait for.**
+    ///
+    /// A render pass resolves its primary attachment to `TRANSFER_SRC_OPTIMAL`
+    /// through `final_layout` with no transfer having run, so a resident in that
+    /// layout was last written by a colour attachment write — while a resident a
+    /// present blit or readback just read sits in the *same* layout after a
+    /// transfer read. Two different dependencies, one layout.
+    ///
+    /// Anyone who re-derives a source scope from `layout()` — which is the bug
+    /// this replaced, five times over — makes these two agree and fails here.
     #[test]
-    fn unsupported_source_layout_returns_the_typed_execution_reason() {
-        let decline = match layout_source_scope(vk::ImageLayout::UNDEFINED) {
-            Err(DrawError::DrawExecution(decline)) => decline,
-            Err(other) => panic!("expected typed draw execution decline, got {other}"),
-            Ok(_) => panic!("expected unsupported tracked layout"),
-        };
-        assert_eq!(decline.slug(), "vk_draw_exec_unsupported_tracked_layout");
-        assert_eq!(decline.fields(), vec![("layout", "UNDEFINED".into())]);
+    fn one_resident_layout_carries_two_different_dependencies() {
+        let drawn = ResidentAccess::ColorWrite(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        let read_back = ResidentAccess::TransferRead;
+        assert_eq!(
+            drawn.layout(),
+            read_back.layout(),
+            "the premise: a draw and a readback leave a resident in the same layout"
+        );
+        assert_ne!(
+            drawn.source_scope(),
+            read_back.source_scope(),
+            "so a barrier's source scope cannot be a function of the layout"
+        );
+        let (stage, access) = drawn.source_scope();
+        assert!(
+            stage.contains(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                && access.contains(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+            "a resident a draw produced must be waited for as a colour write, got {stage:?}/{access:?}"
+        );
     }
 
-    /// A resident target that a previous draw *sampled* is tracked
-    /// `SHADER_READ_ONLY_OPTIMAL`. Seeding it is a write over pixels a reader
+    /// A resident target that a previous draw *sampled* is left in
+    /// `SHADER_READ_ONLY_OPTIMAL`. Writing it is a write over pixels a reader
     /// may still be consuming, so the barrier's first scope has to name that
-    /// reader. `TOP_OF_PIPE`/no-access — which is what a bare `UNDEFINED`
-    /// source scope produces — orders nothing at all.
+    /// reader. `TOP_OF_PIPE`/no-access orders nothing at all.
     #[test]
-    fn seeding_a_sampled_target_waits_for_the_sampler() {
-        let (stage, access) =
-            target_write_source_scope(false, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .expect("tracked layout is supported");
+    fn writing_a_sampled_target_waits_for_the_sampler() {
+        let (stage, access) = ResidentAccess::ShaderRead.source_scope();
         assert!(
             stage.contains(vk::PipelineStageFlags::FRAGMENT_SHADER),
-            "seed copy must be ordered after the sampling fragment shader, got {stage:?}"
+            "the write must be ordered after the sampling fragment shader, got {stage:?}"
         );
         assert!(!stage.contains(vk::PipelineStageFlags::TOP_OF_PIPE));
         assert_eq!(access, vk::AccessFlags::SHADER_READ);
     }
 
-    /// Every render pass resolves its primary attachment to
-    /// `TRANSFER_SRC_OPTIMAL`, so this is the layout a resident target carries
-    /// between one draw and the next. A readback or present copy reads it there.
+    /// A fresh registry slot and every pooled target are untouched. Nothing has
+    /// happened to the image, so there is genuinely nothing to wait for — and it
+    /// is the *only* state of which that is true, which is what the clear path's
+    /// skip rests on. Enumerating the rest is the check; restating the call
+    /// site's condition would pass whichever way the skip went.
     #[test]
-    fn seeding_a_drawn_target_waits_for_the_transfer_read() {
-        let (stage, access) =
-            target_write_source_scope(false, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .expect("tracked layout is supported");
-        assert_eq!(stage, vk::PipelineStageFlags::TRANSFER);
-        assert_eq!(access, vk::AccessFlags::TRANSFER_READ);
+    fn untouched_is_the_only_state_with_no_prior_access() {
+        for access in EVERY_ACCESS {
+            let (stage, flags) = access.source_scope();
+            if access == ResidentAccess::Untouched {
+                assert_eq!(stage, vk::PipelineStageFlags::TOP_OF_PIPE);
+                assert_eq!(flags, vk::AccessFlags::empty());
+            } else {
+                assert_ne!(
+                    stage,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    "{access:?} names a prior access, so skipping its barrier drops a dependency"
+                );
+                assert!(!flags.is_empty(), "{access:?} has an access to make available");
+            }
+        }
     }
 
-    /// A fresh registry slot and every pooled target track `UNDEFINED`. Nothing
-    /// has touched the image, so there is genuinely nothing to wait for — this
-    /// is the one case the old unconditional `TOP_OF_PIPE` got right.
-    #[test]
-    fn seeding_an_untouched_target_waits_for_nothing() {
-        let (stage, access) = target_write_source_scope(false, vk::ImageLayout::UNDEFINED)
-            .expect("an untouched target is not a tracking bug");
-        assert_eq!(stage, vk::PipelineStageFlags::TOP_OF_PIPE);
-        assert_eq!(access, vk::AccessFlags::empty());
+    /// A secondary colour attachment that clears to `clear`; every other field
+    /// is irrelevant to the clear-value vector and takes a neutral value.
+    fn secondary_with_clear(clear: [f32; 4]) -> super::super::types::SecondaryColorTarget {
+        super::super::types::SecondaryColorTarget {
+            identity: super::super::types::TargetIdentity::Surface {
+                id: 1,
+                width: 16,
+                height: 16,
+                generation: 1,
+            },
+            width: 16,
+            height: 16,
+            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+            clear,
+            load: false,
+            blend: None,
+            color_write_mask: Default::default(),
+        }
     }
 
-    /// This draw's own snapshot is taken after the tracked layout is read, so
-    /// it names the newer access and outranks it.
+    /// A `MTLLoadActionClear` reaches the attachment as the render pass's own
+    /// clear value, not as a bitmap of that colour.
+    ///
+    /// The primary's entry was a hard-coded transparent black, so the only way
+    /// to honour a colour was to allocate a whole-attachment RGBA8 image of it,
+    /// exchange its channels and stage it to the GPU — per draw, for a constant.
+    /// That also set `target_rgba8`, which is what `load_seed` means, so the
+    /// pass resolved to LOAD and a draw asking to discard its attachment loaded
+    /// it instead.
+    ///
+    /// Asserting the primary's slot follows the request is the half that fails
+    /// against the old hard-coded value. Asserting the positions is the other
+    /// half: Vulkan indexes this vector positionally, so a missing or reordered
+    /// entry hands one attachment another's colour with nothing to refuse it.
+    #[test]
+    fn every_attachment_takes_its_own_clear_and_the_primary_takes_the_guests() {
+        let req = DrawRequest {
+            target_clear: [0.25, 0.5, 0.75, 1.0],
+            secondary_targets: vec![
+                secondary_with_clear([1.0, 0.0, 0.0, 1.0]),
+                secondary_with_clear([0.0, 1.0, 0.0, 0.5]),
+            ],
+            depth: Some(super::super::types::DepthState {
+                // No guest depth texture: this synthetic request exercises the
+                // transient rail, which is the one that still owns its image.
+                identity: None,
+                test_enable: true,
+                write_enable: true,
+                compare: super::super::types::SamplerCompareFunction::Less,
+                clear_value: 0.5,
+                load: false,
+                stencil: None,
+            }),
+            ..DrawRequest::default()
+        };
+
+        let clear = clear_values(&req);
+        assert_eq!(
+            clear.len(),
+            4,
+            "one entry per attachment: primary, two secondaries, depth"
+        );
+        unsafe {
+            assert_eq!(
+                clear[0].color.float32,
+                [0.25, 0.5, 0.75, 1.0],
+                "the primary takes the guest's clear colour, not a fixed black"
+            );
+            assert_eq!(clear[1].color.float32, [1.0, 0.0, 0.0, 1.0]);
+            assert_eq!(clear[2].color.float32, [0.0, 1.0, 0.0, 0.5]);
+            assert_eq!(clear[3].depth_stencil.depth, 0.5);
+        }
+    }
+
+    /// A default request still clears to transparent black, which is what every
+    /// draw that names no colour has always got.
+    #[test]
+    fn an_unstated_clear_is_transparent_black() {
+        let clear = clear_values(&DrawRequest::default());
+        assert_eq!(clear.len(), 1, "no secondaries and no depth is one entry");
+        unsafe { assert_eq!(clear[0].color.float32, [0.0; 4]) };
+    }
+
+    /// This draw's own snapshot copy is recorded after the registry's access is
+    /// read, so it names the newer touch and outranks whatever was there.
     #[test]
     fn a_snapshotted_target_waits_for_its_own_snapshot() {
-        for tracked in [
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        ] {
-            let (stage, access) =
-                target_write_source_scope(true, tracked).expect("snapshot needs no tracked layout");
-            assert_eq!(stage, vk::PipelineStageFlags::TRANSFER);
-            assert_eq!(access, vk::AccessFlags::TRANSFER_READ);
-        }
-    }
-
-    /// The clear path skips its barrier on `UNDEFINED` alone, which is only
-    /// sound if `UNDEFINED` is the only tracked layout with nothing to wait
-    /// for. That is the invariant the skip rests on, so assert it over every
-    /// layout the registry can hold rather than restating the call site's
-    /// condition — a tautology would pass no matter which way the skip went.
-    #[test]
-    fn undefined_is_the_only_tracked_layout_with_no_prior_access() {
-        for tracked in [
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        ] {
-            let (stage, _) = target_write_source_scope(false, tracked)
-                .expect("every layout the registry tracks is supported");
-            assert_ne!(
-                stage,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                "{tracked:?} names a prior access, so skipping its barrier would drop a dependency"
+        for tracked in EVERY_ACCESS {
+            assert_eq!(
+                target_prior_access(true, tracked),
+                ResidentAccess::TransferRead,
+                "a snapshot of a {tracked:?} target is still the newest touch"
             );
+            assert_eq!(target_prior_access(false, tracked), tracked);
         }
-        let (stage, access) = target_write_source_scope(false, vk::ImageLayout::UNDEFINED)
-            .expect("an untouched target is not a tracking bug");
-        assert_eq!(stage, vk::PipelineStageFlags::TOP_OF_PIPE);
-        assert_eq!(access, vk::AccessFlags::empty());
-    }
-
-    /// Reading a resident must drain every kind of writer a resident can have,
-    /// not just the one the reader happens to expect. The compute copy-on-sample
-    /// named `SHADER_WRITE | TRANSFER_WRITE` and omitted `COLOR_ATTACHMENT_WRITE`,
-    /// so it did not wait for the draw that produced the pixels it copied — a
-    /// barrier that fires and still lets the race through.
-    #[test]
-    fn reading_a_resident_drains_every_writer_it_can_have() {
-        let (stage, access) = resident_read_source_scope();
-        assert_eq!(stage, vk::PipelineStageFlags::ALL_COMMANDS);
-        for (writer, flag) in [
-            ("a draw", vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
-            ("a compute dispatch", vk::AccessFlags::SHADER_WRITE),
-            ("a seed or blit", vk::AccessFlags::TRANSFER_WRITE),
-        ] {
-            assert!(
-                access.contains(flag),
-                "{writer} can write a resident, so a read of one must drain {flag:?}"
-            );
-        }
-    }
-
-    /// The scope for reading a resident must NOT be derived from its tracked
-    /// layout. A render pass moves its primary to `TRANSFER_SRC_OPTIMAL` via
-    /// `finalLayout` without any transfer running, so that layout's own scope
-    /// names a transfer read while the actual last writer was a colour write.
-    #[test]
-    fn the_tracked_layout_scope_is_too_narrow_to_read_a_resident_with() {
-        let (_, from_layout) = layout_source_scope(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .expect("TRANSFER_SRC_OPTIMAL is a tracked layout");
-        assert!(
-            !from_layout.contains(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
-            "if this ever drains colour writes, the reason resident_read_source_scope \
-             exists has changed and its callers should be revisited"
-        );
-        let (_, for_read) = resident_read_source_scope();
-        assert!(for_read.contains(vk::AccessFlags::COLOR_ATTACHMENT_WRITE));
-    }
-
-    /// A layout the tracker should never hold is a bug in the tracker. It must
-    /// arrive by name rather than degrade into "no dependency", which is the
-    /// failure this whole helper exists to stop being silent.
-    #[test]
-    fn an_untracked_seed_target_layout_declines_by_name() {
-        let decline = match target_write_source_scope(false, vk::ImageLayout::PRESENT_SRC_KHR) {
-            Err(DrawError::DrawExecution(decline)) => decline,
-            Err(other) => panic!("expected typed draw execution decline, got {other}"),
-            Ok(_) => panic!("expected unsupported tracked layout"),
-        };
-        assert_eq!(decline.slug(), "vk_draw_exec_unsupported_tracked_layout");
     }
 
     #[test]
@@ -4172,5 +4624,64 @@ mod tests {
         let bytes = content.cpu_bytes();
         assert_eq!(&bytes[..100], &backing[..100]);
         assert_eq!(&bytes[100..156], &backing[200..256]);
+    }
+}
+
+#[cfg(test)]
+mod depth_load_tests {
+    use super::*;
+
+    fn acquired(content_ready: bool) -> AcquiredDepth {
+        AcquiredDepth {
+            view: vk::ImageView::null(),
+            owned: None,
+            identity: None,
+            content_ready,
+        }
+    }
+
+    /// A depth LOAD needs both the guest asking and a resident with something in
+    /// it, and the second term is the one this device owns.
+    ///
+    /// The asymmetry is the point. Declaring LOAD to Vulkan also declares
+    /// `initial_layout` DEPTH_STENCIL_ATTACHMENT_OPTIMAL, and an image nothing
+    /// has rendered into is in UNDEFINED — so honouring the guest's flag on an
+    /// empty resident is not a stale read but undefined behaviour, caught by a
+    /// validation layer where one runs and silent where none does. A pass that
+    /// does not ask must never be given LOAD either: that would turn a CLEAR the
+    /// guest asked for into a load of last frame's depth.
+    #[test]
+    fn a_depth_load_needs_both_the_guest_asking_and_a_resident_holding_something() {
+        assert!(
+            acquired(true).honours_load(true),
+            "guest asked and the resident holds depth: the one case that loads"
+        );
+        assert!(
+            !acquired(false).honours_load(true),
+            "an empty resident cannot be loaded from whatever the guest asked"
+        );
+        assert!(
+            !acquired(true).honours_load(false),
+            "a guest that asked to clear must clear, resident contents or not"
+        );
+        assert!(!acquired(false).honours_load(false));
+    }
+
+    /// The transient rail can never honour a LOAD, whatever the guest asked.
+    ///
+    /// Its buffer is created for this draw and destroyed after it, so there has
+    /// never been anything in it to load. That is the same conclusion the old
+    /// `depth_load_unsupported_transient` decline reached unconditionally, and it
+    /// still holds for the rail that decline was named for — what changed is that
+    /// the *identified* case is no longer routed through it.
+    #[test]
+    fn the_transient_depth_rail_never_honours_a_load() {
+        let transient = AcquiredDepth {
+            view: vk::ImageView::null(),
+            owned: Some((vk::Image::null(), vk::DeviceMemory::null(), vk::ImageView::null())),
+            identity: None,
+            content_ready: false,
+        };
+        assert!(!transient.honours_load(true));
     }
 }

@@ -543,6 +543,9 @@ fn depth_test_honored_compare_and_clear_wired() {
         });
         req.samplers.push(SamplerResource::normalized_default(64));
         req.depth = Some(DepthState {
+            // Parity fixtures bind no guest depth texture, so they exercise the
+            // transient rail rather than the registry-resident one.
+            identity: None,
             test_enable: true,
             write_enable: true,
             compare,
@@ -667,6 +670,9 @@ fn depth_test_honored_on_resident_target_path() {
         });
         req.samplers.push(SamplerResource::normalized_default(64));
         req.depth = Some(DepthState {
+            // Parity fixtures bind no guest depth texture, so they exercise the
+            // transient rail rather than the registry-resident one.
+            identity: None,
             test_enable: true,
             write_enable: true,
             compare,
@@ -799,6 +805,9 @@ fn stencil_test_honored_compare_ref_and_clear_wired() {
         });
         req.samplers.push(SamplerResource::normalized_default(64));
         req.depth = Some(DepthState {
+            // Parity fixtures bind no guest depth texture, so they exercise the
+            // transient rail rather than the registry-resident one.
+            identity: None,
             test_enable: true,
             write_enable: false,
             compare: SamplerCompareFunction::Always,

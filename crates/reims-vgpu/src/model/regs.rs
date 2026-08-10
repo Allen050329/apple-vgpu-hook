@@ -335,40 +335,177 @@ pub const ROOT_OP_SET_OBJECT_LIST: u16 = 0x33;
 pub const ROOT_OP_DEFINE_TASK2: u16 = 0x38;
 pub const ROOT_OP_DEVICE_INFO_TAHOE: u16 = 0x3a;
 
+/// The highest opcode that names a command.
+///
+/// # Commands that are not FIFO opcodes
+///
+/// Three command names in this protocol are **not** in this space, and each has
+/// been looked for here and does not belong. They are listed so the next reader
+/// does not add a constant for one:
+///
+/// - `CmdOptimizeForGPUAccess` and `CmdOptimizeImageForGPUAccess` are
+///   **blit command-stream** commands, not FIFO packets. They live in the
+///   serialized command-buffer opcode space that
+///   [`crate::runtime::decode::blit`] decodes, where the `Image` form is the
+///   slice/level variant, and this device already decodes both. A FIFO constant
+///   for either would be a second, wrong home for a command that has one.
+/// - `CmdSetProperty` is not a command at all. It is the label the
+///   [`CHILD_OP_DISPLAY_SET_PROPERTIES`] (`0x0a`) handler uses when it reports
+///   an exception forwarding a property to the display nub, so it names a
+///   failure *inside* an opcode this device already has.
+///
+/// The general rule the three share: a `Cmd*` name is not evidence of a FIFO
+/// opcode. This space is exactly the slots below, and it is full.
+///
+/// The reference host bounds the header's 16-bit opcode with `opcode <= 0x40`
+/// before indexing its dispatch table, so `0x41` and above are not commands that
+/// went unimplemented — they are values no handler exists for at all, and a
+/// packet carrying one is malformed rather than merely unsupported. In range,
+/// the slots split three ways: a command (the constants below), the shared
+/// deprecated handler ([`CHILD_DEPRECATED_OPS`]), or an unassigned slot that
+/// reaches the same error path as an out-of-range value.
+///
+/// The drain reports the two cases apart, because they mean different things to
+/// whoever reads the log: an in-range unassigned slot is a guest sending a
+/// command this build of the host does not have, while out-of-range is a corrupt
+/// header or a desynced ring.
+pub const CHILD_OP_MAX: u16 = 0x40;
+
+/// The opcodes the reference host routes to its one shared deprecated handler.
+///
+/// These are real slots with a real handler, not holes: the host accepts the
+/// packet, does nothing with the payload and retires the stamps. They are
+/// listed rather than folded into the unknown arm so a guest that still emits
+/// one is reported as "sent a retired command" and not as "sent something this
+/// device cannot decode" — the first is expected of an older guest and the
+/// second is a gap in this device.
+///
+/// `0x2d` is in this set on the reference host, and is also
+/// [`ROOT_OP_DEVICE_INFO_MONTEREY`]. Both are true: the Monterey-era device-info
+/// command was retired in favour of [`ROOT_OP_DEVICE_INFO_TAHOE`] (`0x3a`), and
+/// this device still answers it for a guest old enough to ask. The root arm runs
+/// first, so the deprecated arm never sees it on the root channel.
+pub const CHILD_DEPRECATED_OPS: [u16; 15] = [
+    0x03, 0x1f, 0x21, 0x23, 0x24, 0x26, 0x27, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x32,
+];
+
+/// True for the opcodes in [`CHILD_DEPRECATED_OPS`].
+///
+/// A function rather than a match arm because a `match` cannot pattern on an
+/// array's contents, and spelling the fifteen numbers a second time in a pattern
+/// is exactly the duplicated-constant mistake `no_two_child_opcodes_share_a_number`
+/// exists to catch.
+#[must_use]
+pub const fn is_deprecated_child_opcode(opcode: u16) -> bool {
+    let mut i = 0;
+    while i < CHILD_DEPRECATED_OPS.len() {
+        if CHILD_DEPRECATED_OPS[i] == opcode {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// `CmdDebug`, a host-side trace marker. Carries whatever the guest wants
+/// logged; nothing in the device model moves.
+pub const CHILD_OP_DEBUG: u16 = 0x00;
 pub const CHILD_OP_SETUP_SHARED_STATE: u16 = 0x01;
 pub const CHILD_OP_ONLINE_ACK: u16 = 0x02;
 pub const CHILD_OP_CURSOR_GLYPH: u16 = 0x04;
 pub const CHILD_OP_CURSOR_SHOW: u16 = 0x05;
-/// x86 Ventura/Tahoe display-pipe present (ch5): 12B `[disp][surface_id][stamp]`.
-pub const CHILD_OP_PRESENT_X86: u16 = 0x06;
-/// x86 present-with-gamma (surface_id typically @+8).
-pub const CHILD_OP_PRESENT_GAMMA_X86: u16 = 0x07;
+/// `CmdDisplayTransaction2_DEPRECATED` — the older of the display pipe's two
+/// transaction forms, and still what an x86 Ventura/Tahoe guest submits from one
+/// leg of `submitTransaction`. 12B trailer `[pipe][surface_id][task]`.
+///
+/// The `_DEPRECATED` in Apple's name is about the *form*, not the slot: this is
+/// a live handler, not one of [`CHILD_DEPRECATED_OPS`].
+pub const CHILD_OP_DISPLAY_TRANSACTION2: u16 = 0x06;
+/// `CmdDisplayTransaction3` — the current transaction form, submitted from the
+/// other leg of the same guest call. Its trailer carries the gamma table
+/// alongside the surface, so its surface word sits one slot later than op 6's.
+pub const CHILD_OP_DISPLAY_TRANSACTION3: u16 = 0x07;
 pub const CHILD_OP_DISPLAY_SWAP: u16 = 0x08;
+/// `CmdDisplaySleepState`, payload floor 8 bytes. The guest telling the host a
+/// display is entering or leaving sleep.
+pub const CHILD_OP_DISPLAY_SLEEP_STATE: u16 = 0x09;
+/// `CmdDisplaySetProperties`, payload floor 8 bytes. The host handler forwards
+/// it to the display nub's `setProperty:value:wordCount:`, so the payload is a
+/// property key, a value and a word count rather than a fixed record.
+pub const CHILD_OP_DISPLAY_SET_PROPERTIES: u16 = 0x0a;
+/// `CmdNOP`: a fence carrying **stamps and no payload**.
+///
+/// The guest's display pipe emits this from the failure and teardown legs of a
+/// present, on the pipe's own channel, to fence work it is about to abandon —
+/// which is why this device first met it as a channel flush. Alone among the
+/// commands it allocates no command bytes at all, so its packet is header plus
+/// stamps and a non-empty payload would be a contract violation rather than a
+/// longer form.
+///
+/// There is nothing to execute — retiring the stamps *is* the whole obligation,
+/// and the drain does that for every accepted packet.
+pub const CHILD_OP_NOP: u16 = 0x1e;
 /// PVG `CmdDeleteTask` (same opcode as root [`ROOT_OP_DELETE_TASK`]).
 pub const CHILD_OP_DELETE_TASK: u16 = 0x20;
 /// PVG `CmdUnmapMemory` (not map — [`CHILD_OP_MAP_MEMORY2`] is `0x39`).
 pub const CHILD_OP_UNMAP_MEMORY: u16 = 0x22;
-/// Display-channel flush: a fence carrying **stamps and no payload**.
+/// `CmdDeleteResource`, payload `{u32 task_id, u32 object_id}`.
 ///
-/// The guest's display pipe emits this from the failure and teardown legs of a
-/// present, on the pipe's own channel, to fence work it is about to abandon.
-/// Alone among the child commands it allocates no command bytes at all, so its
-/// packet is header plus stamps and a non-empty payload would be a contract
-/// violation rather than a longer form.
+/// This is the command whose handler retires an entry from this device's object
+/// table, and it is **not** [`CHILD_OP_DELETE_OBJECT`]: the two are separate
+/// commands two slots apart, and this device used to carry the names the other
+/// way round.
+pub const CHILD_OP_DELETE_RESOURCE: u16 = 0x25;
+/// `CmdDeleteObject`, the guest's shared-object teardown.
 ///
-/// There is nothing for this device to execute — retiring the stamps *is* the
-/// whole obligation, and the drain does that for every accepted packet. It is
-/// named here only so it stops reading as an unknown opcode: it was landing in
-/// the `UnknownChildOpcode` arm, which reports a real Apple command as a device
-/// defect, on the display channel, exactly when the present path is already in
-/// trouble and the log is being read.
-pub const CHILD_OP_FLUSH_CHANNEL_EVENT: u16 = 0x1e;
-pub const CHILD_OP_DELETE_OBJECT: u16 = 0x25;
-pub const CHILD_OP_PRESENT_FRAME: u16 = 0x28;
+/// Distinct from [`CHILD_OP_DELETE_RESOURCE`] (`0x25`) — the guest's shared
+/// object allocator emits this one, and the resource layer emits that one.
+///
+/// The payload is a `u32` task id followed by a variable-length serialized
+/// argument record: the guest writes the id into four bytes of command space and
+/// then copies the record in after it. No fixed length is declared here because
+/// the record carries its own, but the shape is not open-ended:
+///
+/// ```text
+/// 0..4    u32  task id      — must name a live task
+/// 4..     the serialized argument record, `payload_len - 4` bytes, of which
+/// 8..12   u32  record byte length, and `length + 4` must not exceed the payload
+/// ```
+///
+/// So the payload floor is **12**, and the length word at offset 8 is the
+/// record's own size — the record is self-describing, and offset 8 is its second
+/// word rather than a field of the command. A record claiming more than the
+/// payload holds is malformed, not merely long, and both bounds are checked
+/// before the command is declined so a corrupt one is not reported as an
+/// unimplemented command.
+///
+/// The record is one **object-destroy record**: an 8-byte header of
+/// `{u32 opcode, u32 length}` then the object ref, twelve bytes in all. The
+/// opcode names the object *kind* and every kind writes the identical body, so
+/// the ref is read from one place whatever the kind is. The observed 16-byte
+/// packet decodes exactly under this: task 1, a sampler-state destroy record
+/// whose length word reads 12, naming ref 32.
+///
+/// The ref is decoded and the kind is counted; the object is **not** retired.
+/// That ref is in the serializer's per-kind ref space, which this device does
+/// not track, and it is a different namespace from the kernel object-list ref
+/// the object table is keyed by — the two overlap numerically, so acting on it
+/// could only ever have destroyed an unrelated object that shared the integer.
+/// A driven x86 Safari-drag boot sends about 1 990 of these in 25 s, none of
+/// which named a ref the object table held, against 112 466 successful lookups
+/// on that same key in the same boot. `runtime::drain::apply_delete_object` has
+/// the full reading.
+///
+/// Membership in the destroy family is tested against the family and never
+/// against a range: numbers inside the span belong to no destroy kind, and
+/// treating one as a delete would act on a record whose meaning is unmeasured.
+pub const CHILD_OP_DELETE_OBJECT: u16 = 0x28;
 pub const CHILD_OP_SET_OBJECT_LIST: u16 = 0x33;
-/// PVG CmdInvalidateResources.
+/// PVG `CmdInvalidateResources`: `{u32 task_id, u32 count}` then `count`
+/// **8-byte** records, so the payload floor is `8 + 8 * count`.
 pub const CHILD_OP_INVALIDATE_RESOURCES: u16 = 0x34;
-/// PVG CmdSynchronizeResources.
+/// PVG `CmdSynchronizeResources`: `{u32 task_id, u32 count}` then `count`
+/// **4-byte** object ids, so the payload floor is `8 + 4 * count`.
 pub const CHILD_OP_SYNCHRONIZE_RESOURCES: u16 = 0x35;
 /// PVG CmdDeleteIOSurfaceBacking2.
 pub const CHILD_OP_DELETE_IOSURFACE_BACKING2: u16 = 0x36;
@@ -383,20 +520,102 @@ pub const CHILD_OP_GET_COMPUTE_INFO: u16 = 0x3b;
 /// Live fail log: ch2 op 0x3c total_size=20 (header+payload). Stamp-complete;
 /// full rebind RE is open — accept so guest is not blocked on UnknownChildOpcode.
 pub const CHILD_OP_REPLACE_PHYSICAL: u16 = 0x3c;
-/// The guest asking what a heap texture would cost: its handler decodes a
-/// `heap_query` request and writes size and alignment back through the reply
-/// GVA the request names. A query rather than a state change — nothing in the
-/// device model moves — but the guest blocks on the reply, so a refusal is a
-/// stall and not a dropped command.
-pub const CHILD_OP_CONFIG_40: u16 = 0x40;
+/// `CmdDelay`, the guest asking the host to hold the channel before continuing.
+pub const CHILD_OP_DELAY: u16 = 0x3d;
+/// `CmdSynchronizeAndDiscardResources`: the same payload contract as
+/// [`CHILD_OP_SYNCHRONIZE_RESOURCES`] — `{u32 task_id, u32 count}` then `count`
+/// 4-byte object ids — with a discard of the named resources' contents added to
+/// the synchronise.
+///
+/// The synchronise half is the one that can lose guest work, and it is the same
+/// obligation as `0x35`: the guest is about to CPU-read these resources, so
+/// every guest-page write already submitted has to have executed. The discard
+/// half is a hint that the contents are no longer needed, and this device does
+/// not act on it.
+pub const CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES: u16 = 0x3e;
+/// `CmdDiscardResources`: the discard half of
+/// [`CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES`] on its own, and the same
+/// payload contract. Nothing here is owed to the guest — a discard this device
+/// ignores costs memory, not correctness.
+pub const CHILD_OP_DISCARD_RESOURCES: u16 = 0x3f;
+/// `CmdHeapTextureSizeAndAlign`, payload floor 24 bytes: the guest asking what a
+/// heap texture would cost. Its handler decodes a `heap_query` request and
+/// writes size and alignment back through the reply GVA the request names. A
+/// query rather than a state change — nothing in the device model moves — but
+/// the guest blocks on the reply, so a refusal is a stall and not a dropped
+/// command.
+pub const CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN: u16 = 0x40;
 
-/// `CmdDisplayTransaction3` (op 6) trailer `[pipe][surface][task]`: surface id
-/// offset. `CmdDisplaySwapMapping` (op 8) is a different command with a
-/// different payload — see `DISPLAY_SWAP_MAPPING`, which is not this offset.
-pub const PRESENT_X86_SURFACE_ID: usize = 0x04;
-/// The gamma variant (op 7) trailer is `[pipe][task][surface][gamma…]`, so its
-/// surface and task words are swapped relative to op 6's.
-pub const PRESENT_GAMMA_X86_SURFACE_ID: usize = 0x08;
+/// `CmdDisplayTransaction2_DEPRECATED` (op 6) trailer `[pipe][surface][task]`:
+/// surface id offset. `CmdDisplaySwapMapping` (op 8) is a different command with
+/// a different payload — see `DISPLAY_SWAP_MAPPING`, which is not this offset.
+pub const DISPLAY_TRANSACTION2_SURFACE_ID: usize = 0x04;
+/// `CmdDisplayTransaction3` (op 7) trailer is `[pipe][task][surface][gamma…]`,
+/// so its surface and task words are swapped relative to op 6's.
+pub const DISPLAY_TRANSACTION3_SURFACE_ID: usize = 0x08;
+
+/// Every command opcode is inside the dispatch ceiling, and no command opcode is
+/// also a deprecated slot.
+///
+/// [`CHILD_OP_MAX`] and the constants above were read off the same dispatch
+/// table but transcribed separately, and the two ways to get that wrong both
+/// cost guest work in the same direction. A command above the ceiling would be
+/// declared here and unreachable in the host, so this device would answer a
+/// packet no real host accepts. A command that is also in
+/// [`CHILD_DEPRECATED_OPS`] would give one number two arms in the drain, and the
+/// deprecated one would swallow a live command.
+const _: () = {
+    let ops = [
+        CHILD_OP_DEBUG,
+        CHILD_OP_SETUP_SHARED_STATE,
+        CHILD_OP_ONLINE_ACK,
+        CHILD_OP_CURSOR_GLYPH,
+        CHILD_OP_CURSOR_SHOW,
+        CHILD_OP_DISPLAY_TRANSACTION2,
+        CHILD_OP_DISPLAY_TRANSACTION3,
+        CHILD_OP_DISPLAY_SWAP,
+        CHILD_OP_DISPLAY_SLEEP_STATE,
+        CHILD_OP_DISPLAY_SET_PROPERTIES,
+        CHILD_OP_NOP,
+        CHILD_OP_DELETE_TASK,
+        CHILD_OP_UNMAP_MEMORY,
+        CHILD_OP_DELETE_RESOURCE,
+        CHILD_OP_DELETE_OBJECT,
+        CHILD_OP_SET_OBJECT_LIST,
+        CHILD_OP_INVALIDATE_RESOURCES,
+        CHILD_OP_SYNCHRONIZE_RESOURCES,
+        CHILD_OP_DELETE_IOSURFACE_BACKING2,
+        CHILD_OP_EXEC_INDIRECT2,
+        CHILD_OP_DEFINE_TASK2,
+        CHILD_OP_MAP_MEMORY2,
+        CHILD_OP_GET_COMPUTE_INFO,
+        CHILD_OP_REPLACE_PHYSICAL,
+        CHILD_OP_DELAY,
+        CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES,
+        CHILD_OP_DISCARD_RESOURCES,
+        CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN,
+    ];
+    let mut i = 0;
+    while i < ops.len() {
+        assert!(
+            ops[i] <= CHILD_OP_MAX,
+            "a command opcode sits above the host's dispatch ceiling"
+        );
+        assert!(
+            !is_deprecated_child_opcode(ops[i]),
+            "a command opcode is also listed as a deprecated slot"
+        );
+        i += 1;
+    }
+    let mut j = 0;
+    while j < CHILD_DEPRECATED_OPS.len() {
+        assert!(
+            CHILD_DEPRECATED_OPS[j] <= CHILD_OP_MAX,
+            "a deprecated slot sits above the host's dispatch ceiling"
+        );
+        j += 1;
+    }
+};
 
 pub const CHILD_REG_BLOCK_OFFSET: u64 = 0x400;
 pub const CHILD_REG_BLOCK_STRIDE: u64 = 0x14;
@@ -1534,18 +1753,21 @@ mod tests {
     #[test]
     fn no_two_child_opcodes_share_a_number() {
         let table = [
+            ("DEBUG", CHILD_OP_DEBUG),
             ("SETUP_SHARED_STATE", CHILD_OP_SETUP_SHARED_STATE),
             ("ONLINE_ACK", CHILD_OP_ONLINE_ACK),
             ("CURSOR_GLYPH", CHILD_OP_CURSOR_GLYPH),
             ("CURSOR_SHOW", CHILD_OP_CURSOR_SHOW),
-            ("PRESENT_X86", CHILD_OP_PRESENT_X86),
-            ("PRESENT_GAMMA_X86", CHILD_OP_PRESENT_GAMMA_X86),
+            ("DISPLAY_TRANSACTION2", CHILD_OP_DISPLAY_TRANSACTION2),
+            ("DISPLAY_TRANSACTION3", CHILD_OP_DISPLAY_TRANSACTION3),
             ("DISPLAY_SWAP", CHILD_OP_DISPLAY_SWAP),
-            ("FLUSH_CHANNEL_EVENT", CHILD_OP_FLUSH_CHANNEL_EVENT),
+            ("DISPLAY_SLEEP_STATE", CHILD_OP_DISPLAY_SLEEP_STATE),
+            ("DISPLAY_SET_PROPERTIES", CHILD_OP_DISPLAY_SET_PROPERTIES),
+            ("NOP", CHILD_OP_NOP),
             ("DELETE_TASK", CHILD_OP_DELETE_TASK),
             ("UNMAP_MEMORY", CHILD_OP_UNMAP_MEMORY),
+            ("DELETE_RESOURCE", CHILD_OP_DELETE_RESOURCE),
             ("DELETE_OBJECT", CHILD_OP_DELETE_OBJECT),
-            ("PRESENT_FRAME", CHILD_OP_PRESENT_FRAME),
             ("SET_OBJECT_LIST", CHILD_OP_SET_OBJECT_LIST),
             ("INVALIDATE_RESOURCES", CHILD_OP_INVALIDATE_RESOURCES),
             ("SYNCHRONIZE_RESOURCES", CHILD_OP_SYNCHRONIZE_RESOURCES),
@@ -1558,7 +1780,16 @@ mod tests {
             ("MAP_MEMORY2", CHILD_OP_MAP_MEMORY2),
             ("GET_COMPUTE_INFO", CHILD_OP_GET_COMPUTE_INFO),
             ("REPLACE_PHYSICAL", CHILD_OP_REPLACE_PHYSICAL),
-            ("CONFIG_40", CHILD_OP_CONFIG_40),
+            ("DELAY", CHILD_OP_DELAY),
+            (
+                "SYNCHRONIZE_AND_DISCARD_RESOURCES",
+                CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES,
+            ),
+            ("DISCARD_RESOURCES", CHILD_OP_DISCARD_RESOURCES),
+            (
+                "HEAP_TEXTURE_SIZE_AND_ALIGN",
+                CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN,
+            ),
         ];
         for (i, (name, op)) in table.iter().enumerate() {
             for (other, other_op) in &table[i + 1..] {
