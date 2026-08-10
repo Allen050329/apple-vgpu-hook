@@ -271,6 +271,14 @@ mod writer {
             // `redirect_logs_for_tests`); the writer owns the file handles.
             let fail_path = fail_log_path().to_string();
             let draw_path = draw_log_path().to_string();
+            // Linux caps `comm` at 15 bytes and Rust truncates to fit, so this
+            // thread shows up in a profile as `reims-vgpu-draw`. That reads like
+            // the drain worker and is not it — this thread only writes the log.
+            // The drain worker has no name of its own: `reims-vgpu-pci.c` asks
+            // for `reims-vgpu-pci-drain` at 20 bytes, and `qemu_thread_set_name`
+            // hands that to `pthread_setname_np` unmodified and discards the
+            // ERANGE, leaving its `comm` as `qemu-system-x86`. Split a profile
+            // by TID; comm cannot separate these two.
             let _ = std::thread::Builder::new()
                 .name("reims-vgpu-drawlog".to_string())
                 .spawn(move || writer_loop(rx, fail_path, draw_path));
