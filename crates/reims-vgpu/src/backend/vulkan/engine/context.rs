@@ -555,9 +555,6 @@ impl DeviceContext {
             features.storage_image_write_without_format_bgra();
         let sampled_r32f_linear_filter = features.sampled_r32f_linear_filter;
         let has16 = features.storage16;
-        let has8 = features.storage8;
-        let has_float16 = features.float16;
-        let has_int8 = features.int8;
         // Defined bounds-clamped behavior for out-of-range shader buffer access
         // is among these — the ONE feature the Vulkan spec requires every
         // implementation to support, so enabling it is portability-clean and
@@ -659,11 +656,12 @@ impl DeviceContext {
         // Only the `Supported` rung names `VK_EXT_external_memory_host`, so a
         // host without it gets a device rather than a failed `vkCreateDevice`.
         enabled_device_extensions.extend(host_pointer.rung.required_extensions());
-        // These three are built in `caps` too. They are bound to locals here
-        // only because `push_next` borrows them for the lifetime of `dci`.
+        // Built in `caps` too. Bound to a local here only because `push_next`
+        // borrows it for the lifetime of `dci`. 8-bit storage and float16/int8
+        // have no local because they ride `enabled_vulkan12` — see
+        // `caps::device_features::DeviceFeatures::enabled_vulkan12` for why they
+        // may not be chained separately.
         let mut en16 = features.enabled_16bit_storage();
-        let mut en8 = features.enabled_8bit_storage();
-        let mut enfi = features.enabled_float16_int8();
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_features(&enabled)
@@ -674,12 +672,6 @@ impl DeviceContext {
         }
         if has16 {
             dci = dci.push_next(&mut en16);
-        }
-        if has8 {
-            dci = dci.push_next(&mut en8);
-        }
-        if has_float16 || has_int8 {
-            dci = dci.push_next(&mut enfi);
         }
         let device = instance
             .create_device(pd, &dci, None)

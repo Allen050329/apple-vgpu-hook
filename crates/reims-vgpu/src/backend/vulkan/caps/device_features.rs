@@ -144,6 +144,15 @@ pub struct DeviceFeatures {
     pub storage8: bool,
     pub float16: bool,
     pub int8: bool,
+    /// 64-bit integers in shaders.
+    ///
+    /// Translated AIR reaches SPIR-V's `Int64` capability, and a module
+    /// declaring a capability whose feature is not enabled is undefined
+    /// behavior rather than a load error
+    /// (`VUID-VkShaderModuleCreateInfo-pCode-08740`). Unlike the storage
+    /// features beside it this one is `VkPhysicalDeviceFeatures` core, so it is
+    /// requested there and not through any version struct.
+    pub shader_int64: bool,
     pub shader_output_viewport_index: bool,
     /// `VkPhysicalDeviceVulkan12Features::timelineSemaphore` — whether a
     /// submission can signal a monotonic counter that a *second* thread may
@@ -240,6 +249,7 @@ impl DeviceFeatures {
             .robust_buffer_access(self.robust_buffer_access)
             .sampler_anisotropy(self.sampler_anisotropy)
             .shader_int16(self.shader_int16)
+            .shader_int64(self.shader_int64)
             .shader_storage_image_extended_formats(self.storage_image_extended_formats)
             .shader_storage_image_write_without_format(self.storage_image_write_without_format)
             .dual_src_blend(self.dual_src_blend)
@@ -255,29 +265,33 @@ impl DeviceFeatures {
     /// rung; on [`MirrorClampToEdge::KhrExtension`] the extension string carries
     /// it instead, and on [`MirrorClampToEdge::Unsupported`] nothing is
     /// requested and the sampler path declines.
+    ///
+    /// 8-bit storage access and `shaderFloat16` / `shaderInt8` — the latter two
+    /// being what AIR uses for half and char types — are requested through this
+    /// struct rather than their own. Vulkan 1.2 promoted all three into it, and
+    /// `VkDeviceCreateInfo` forbids chaining a promoted struct beside the version
+    /// struct that absorbed it (`VUID-VkDeviceCreateInfo-pNext-02830`); doing so
+    /// is what the validation layer reports and what `vkCreateDevice` is entitled
+    /// to reject.
     pub fn enabled_vulkan12(&self) -> vk::PhysicalDeviceVulkan12Features<'static> {
         vk::PhysicalDeviceVulkan12Features::default()
             .shader_output_viewport_index(self.shader_output_viewport_index)
             .timeline_semaphore(self.timeline_semaphore)
             .sampler_mirror_clamp_to_edge(self.mirror_clamp_to_edge == MirrorClampToEdge::Core12)
+            .storage_buffer8_bit_access(self.storage8)
+            .shader_float16(self.float16)
+            .shader_int8(self.int8)
     }
 
     /// 16-bit storage-buffer access, for shaders that pack half-precision data.
+    ///
+    /// This one keeps its own struct. The version struct that absorbed it is
+    /// `VkPhysicalDeviceVulkan11Features`, which nothing here chains, so the
+    /// prohibition that moved 8-bit storage into [`Self::enabled_vulkan12`] does
+    /// not reach it.
     pub fn enabled_16bit_storage(&self) -> vk::PhysicalDevice16BitStorageFeatures<'static> {
         vk::PhysicalDevice16BitStorageFeatures::default()
             .storage_buffer16_bit_access(self.storage16)
-    }
-
-    /// 8-bit storage-buffer access.
-    pub fn enabled_8bit_storage(&self) -> vk::PhysicalDevice8BitStorageFeatures<'static> {
-        vk::PhysicalDevice8BitStorageFeatures::default().storage_buffer8_bit_access(self.storage8)
-    }
-
-    /// `shaderFloat16` / `shaderInt8`, which AIR uses for half and char types.
-    pub fn enabled_float16_int8(&self) -> vk::PhysicalDeviceShaderFloat16Int8Features<'static> {
-        vk::PhysicalDeviceShaderFloat16Int8Features::default()
-            .shader_float16(self.float16)
-            .shader_int8(self.int8)
     }
 
     /// Device extension names this feature set requires, beyond the ones the
@@ -405,6 +419,7 @@ pub unsafe fn query(
         max_sample_count,
         d24_unorm_s8_attachment,
         shader_int16: supported.shader_int16 == vk::TRUE,
+        shader_int64: supported.shader_int64 == vk::TRUE,
         storage_image_extended_formats: supported.shader_storage_image_extended_formats == vk::TRUE,
         storage_image_write_without_format: supported.shader_storage_image_write_without_format
             == vk::TRUE,
@@ -438,6 +453,7 @@ mod tests {
             max_sample_count: 8,
             d24_unorm_s8_attachment: true,
             shader_int16: true,
+            shader_int64: true,
             storage_image_extended_formats: true,
             storage_image_write_without_format: true,
             bgra8_storage: true,
