@@ -20,6 +20,25 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
+/// Host bytes a test hands the engine as guest memory, standing in for a QEMU
+/// RAMBlock.
+///
+/// The engine imports the host pointer and holds that import until teardown, so
+/// the pages must stay mapped for the engine's whole life — which for QEMU is
+/// free, because a RAMBlock lives as long as the VM. A test-local `Vec` does
+/// not, and the resulting failure lands nowhere near its cause: glibc returns a
+/// large allocation with `munmap`, the pages leave the address space under a
+/// registered userptr BO, and the next submission *any later test* makes is
+/// rejected with `EFAULT` and surfaces as `VK_ERROR_DEVICE_LOST`. Whether the
+/// allocator unmaps or recycles the block decides whether it happens at all, so
+/// the same binary passes or fails on arena state alone.
+///
+/// Leaking is the whole fix. The engine is process-global and has no teardown a
+/// test can hook, so nothing here can free the backing at the right time.
+fn ramblock_backing(len: usize, fill: u8) -> &'static mut [u8] {
+    Box::leak(vec![fill; len].into_boxed_slice())
+}
+
 fn engine_test_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| {
@@ -329,6 +348,10 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
     };
 
     let before = engine::counter_snapshot();
+    // Owned, not `ramblock_backing`: the `drop` below is this test's assertion.
+    // The engine must snapshot these runs at record time, so the bytes going
+    // away before the flush has to be survivable — which is the opposite of the
+    // import rail's contract, and why this one backing may not be leaked.
     let backing = vec![7u8; 64];
     let mut opener = batch_req(&vert, &frag, &identity, false, half_scissor(true));
     opener.storage_buffers.push(StorageBufferResource {
@@ -604,7 +627,7 @@ fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stre
     // and the alignment the driver will actually accept for the import.
     const STRETCH: u64 = 256;
     let block_len = align * 4;
-    let backing = vec![0xA5u8; (block_len + align) as usize];
+    let backing = ramblock_backing((block_len + align) as usize, 0xA5);
     let base = (backing.as_ptr() as u64).next_multiple_of(align);
     let import = std::sync::Arc::new(
         GuestRamImport::new(
@@ -812,7 +835,7 @@ void main() {{
     // the device published — the bound `GuestRamImport` enforces and the
     // alignment the driver will accept for the import.
     let block_len = align * 4;
-    let mut backing = vec![0xA5u8; (block_len + align) as usize];
+    let backing = ramblock_backing((block_len + align) as usize, 0xA5);
     let pad = (backing.as_ptr() as u64).next_multiple_of(align) - backing.as_ptr() as u64;
     let base = backing.as_ptr() as u64 + pad;
 
@@ -987,7 +1010,7 @@ void main() {{
     // One granule per stretch, so every run is its own bind range and the count
     // the bound sees is the count this test asked for.
     let block_len = align * (RUNS + 1);
-    let mut backing = vec![0xA5u8; (block_len + align) as usize];
+    let backing = ramblock_backing((block_len + align) as usize, 0xA5);
     let pad = (backing.as_ptr() as u64).next_multiple_of(align) - backing.as_ptr() as u64;
     let base = backing.as_ptr() as u64 + pad;
 
@@ -1155,7 +1178,7 @@ void main() {{
     };
 
     let block_len = align * 4;
-    let mut backing = vec![0xA5u8; (block_len + align) as usize];
+    let backing = ramblock_backing((block_len + align) as usize, 0xA5);
     let pad = (backing.as_ptr() as u64).next_multiple_of(align) - backing.as_ptr() as u64;
     let base = backing.as_ptr() as u64 + pad;
 
